@@ -1,3 +1,8 @@
 /atlas
 *.test
 *.out
+
+# Harness-internal state for background workflow agents' git worktrees —
+# not part of the project, and touching it while agents are running would
+# interfere with them.
+/.claude/
