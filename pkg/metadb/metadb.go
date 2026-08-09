@@ -5,11 +5,15 @@
 // is written against the real design's data model. Swapping in FDB later
 // means replacing this package's internals, not its callers.
 //
-// This build only needs the `immutable` consistency class (DESIGN.md
-// §8), which requires no leases, no dirver bumps, and no locking — so
-// none of those keyspace regions from §6 are implemented here. What's
-// here is dentries, inode records, and locators, which is what §5-§7
-// actually require to publish and read back a tree.
+// A repo's consistency class (DESIGN.md §8) is stored once, at creation,
+// and never changes for that repo's lifetime — this build's honest
+// simplification of "per-subtree" down to "per-repo", since there is no
+// subtree-boundary tracking here (one repo, one mount, one class). The
+// `posix` class (real locking, blocking recall, O_APPEND) is not
+// implemented; that needs a remote-holder recall protocol this
+// single-process build has no second holder to exercise (see
+// pkg/coherence's doc comment). `immutable`, `relaxed`, and `session`
+// are.
 package metadb
 
 import (
@@ -101,6 +105,28 @@ func Open(path string) (*DB, error) {
 }
 
 func (db *DB) Close() error { return db.bolt.Close() }
+
+var metaKeyClass = []byte("class")
+
+// EnsureClass persists class as the repo's consistency class if none is
+// stored yet (a brand-new repo), or returns whatever class was already
+// persisted otherwise — a repo's class is fixed at creation and this is
+// the one place that can be true even when a caller passes a different
+// default, so reopening an existing `relaxed` repo via a plain Open()
+// call (which internally hints "immutable") still returns "relaxed".
+func (db *DB) EnsureClass(class string) (string, error) {
+	var result string
+	err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		if v := b.Get(metaKeyClass); v != nil {
+			result = string(v)
+			return nil
+		}
+		result = class
+		return b.Put(metaKeyClass, []byte(class))
+	})
+	return result, err
+}
 
 func (db *DB) ensureRoot() error {
 	_, err := db.GetInode(RootInode)
@@ -209,6 +235,45 @@ func (db *DB) CreateDentry(dir InodeID, name string, child InodeID) error {
 		var v [8]byte
 		binary.BigEndian.PutUint64(v[:], uint64(child))
 		return b.Put(k, v[:])
+	})
+}
+
+// SetDentry binds name -> child within dir, overwriting any existing
+// binding. This is the mutable-class counterpart to CreateDentry
+// (DESIGN.md §16.1's write path, and rename-over-existing semantics):
+// callers on the immutable path use CreateDentry and get ErrExists on a
+// collision; callers on a mutable-class write path use SetDentry and
+// get upsert semantics instead. Same not-a-directory check as
+// CreateDentry.
+func (db *DB) SetDentry(dir InodeID, name string, child InodeID) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		rec, err := getInodeTx(tx, dir)
+		if err != nil {
+			return err
+		}
+		if !rec.IsDir {
+			return ErrNotDir
+		}
+		var v [8]byte
+		binary.BigEndian.PutUint64(v[:], uint64(child))
+		return tx.Bucket(bucketDentry).Put(dentryKey(dir, name), v[:])
+	})
+}
+
+// RemoveDentry unbinds name within dir. Returns ErrNotFound if no such
+// binding exists. Does not touch the target inode record — this build
+// has no reference-counted GC (DESIGN.md §19 is a later phase), so an
+// unlinked inode's record and chunks simply become unreachable rather
+// than being reclaimed; that is a real, stated gap, not a leak this
+// build hides.
+func (db *DB) RemoveDentry(dir InodeID, name string) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketDentry)
+		k := dentryKey(dir, name)
+		if b.Get(k) == nil {
+			return ErrNotFound
+		}
+		return b.Delete(k)
 	})
 }
 

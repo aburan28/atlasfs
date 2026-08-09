@@ -45,7 +45,11 @@ func cmdMount(ctx context.Context, args []string) error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	onMounted := func(server *fuse.Server) {
-		fmt.Printf("atlasfs mounted read-only: %s -> %s (Ctrl-C to unmount)\n", repoDir, mountpoint)
+		mode := "read-only"
+		if r.Class.Mutable() {
+			mode = fmt.Sprintf("read-write (%s class)", r.Class)
+		}
+		fmt.Printf("atlasfs mounted %s: %s -> %s (Ctrl-C to unmount)\n", mode, repoDir, mountpoint)
 		go func() {
 			<-sigCh
 			_ = server.Unmount()

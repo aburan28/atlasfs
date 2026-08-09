@@ -1,8 +1,9 @@
-// Package repo ties chunk/manifest/pack/metadb together into the
-// publish and read paths for one `immutable`-class subtree (DESIGN.md
-// §8, §16). A Repo is a single-node, single-region AtlasFS repository:
-// a metadb.DB for dentries/inodes/locators and a store.Backend for
-// sealed container and manifest objects.
+// Package repo ties chunk/manifest/pack/metadb/coherence together into
+// the publish, read, and (for mutable classes) write paths for one repo
+// (DESIGN.md §8, §16). A Repo is a single-node, single-region AtlasFS
+// repository: a metadb.DB for dentries/inodes/locators, a store.Backend
+// for sealed container and manifest objects, and — for every class but
+// `immutable` — a coherence.Manager wired into every mutation.
 package repo
 
 import (
@@ -17,8 +18,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
+	"github.com/aburan28/atlasfs/pkg/coherence"
 	"github.com/aburan28/atlasfs/pkg/manifest"
 	"github.com/aburan28/atlasfs/pkg/metadb"
 	"github.com/aburan28/atlasfs/pkg/pack"
@@ -32,11 +35,48 @@ import (
 // than changing the format.
 const DefaultRegion = "local"
 
+// Class is a repo's consistency class (DESIGN.md §8), fixed for the
+// repo's lifetime once persisted by EnsureClass. `posix` is deliberately
+// absent — see pkg/metadb's and pkg/coherence's package docs for why.
+type Class string
+
+const (
+	ClassImmutable Class = "immutable"
+	ClassRelaxed   Class = "relaxed"
+	ClassSession   Class = "session"
+)
+
+// leaseDuration returns DESIGN.md §8's stated default lease duration
+// for each class. ClassImmutable has none — nothing is ever invalidated
+// because nothing ever changes once published, so no Manager is needed.
+func (c Class) leaseDuration() time.Duration {
+	switch c {
+	case ClassSession:
+		return 5 * time.Second
+	case ClassRelaxed:
+		return 30 * time.Second
+	default:
+		return 0
+	}
+}
+
+// Mutable reports whether this class permits Create/Write/Unlink/Mkdir
+// after initial publish. Only ClassImmutable is not.
+func (c Class) Mutable() bool { return c != ClassImmutable && c != "" }
+
 type Repo struct {
 	Dir     string
 	DB      *metadb.DB
 	Backend store.Backend
 	Region  string
+	Class   Class
+
+	// Coherence is nil for ClassImmutable (nothing to invalidate — see
+	// Class.leaseDuration) and non-nil for every mutable class, wired
+	// into the write path (bumps on mutation) and available to readers
+	// (fuseserver) to cache attrs/dentries without re-hitting metadb on
+	// every call while a lease is still valid.
+	Coherence *coherence.Manager
 
 	ChunkSize int
 	packer    *pack.Packer
@@ -51,9 +91,11 @@ type Repo struct {
 
 // Open opens (or initializes) a repo rooted at dir: dir/meta.db for
 // metadata, dir/objects/ as the local backend's container/manifest
-// object store. This is the local-backend convenience path; OpenRemote
-// takes any store.Backend (DESIGN.md §24's pluggability — S3, GCS,
-// Azure, or a test double all satisfy the same interface).
+// object store. This is the local-backend, immutable-class convenience
+// path — the one every pre-existing caller in this codebase used before
+// classes existed, and its behavior is unchanged: a fresh dir becomes an
+// `immutable` repo, and an existing repo opens as whatever class it was
+// created with (EnsureClass — see OpenWithClass).
 func Open(dir string) (*Repo, error) {
 	backend, err := local.New(filepath.Join(dir, "objects"))
 	if err != nil {
@@ -66,8 +108,19 @@ func Open(dir string) (*Repo, error) {
 // a caller-supplied Backend and region, instead of the local-disk
 // default. Use this to point a repo at S3/GCS/Azure while keeping
 // metadata local — the single-node metadb stand-in doesn't need to move
-// for the backend to become real cloud storage.
+// for the backend to become real cloud storage. Defaults to the
+// immutable class; see OpenWithClass to create a mutable repo.
 func OpenRemote(dir string, backend store.Backend, region string) (*Repo, error) {
+	return OpenWithClass(dir, backend, region, ClassImmutable)
+}
+
+// OpenWithClass is the general repo constructor. class is only a hint
+// used when dir holds no repo yet — DESIGN.md §8's classes are fixed at
+// creation, so reopening an existing repo silently returns whatever
+// class EnsureClass finds already persisted, regardless of what the
+// caller asked for here. That is what lets Open(dir), which always
+// hints ClassImmutable, correctly reopen a `relaxed` repo as `relaxed`.
+func OpenWithClass(dir string, backend store.Backend, region string, class Class) (*Repo, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -75,13 +128,24 @@ func OpenRemote(dir string, backend store.Backend, region string) (*Repo, error)
 	if err != nil {
 		return nil, err
 	}
+	persisted, err := db.EnsureClass(string(class))
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	actualClass := Class(persisted)
+
 	r := &Repo{
 		Dir:                   dir,
 		DB:                    db,
 		Backend:               backend,
 		Region:                region,
+		Class:                 actualClass,
 		ChunkSize:             chunk.DefaultSize,
 		SingleObjectThreshold: pack.SingleObjectThreshold,
+	}
+	if d := actualClass.leaseDuration(); d > 0 {
+		r.Coherence = coherence.New(coherence.RealClock{}, d)
 	}
 	r.packer = pack.NewPacker(backend, r.Region, pack.DefaultSealSize)
 	return r, nil
@@ -233,43 +297,67 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 		return 0, err
 	}
 
-	if size == 0 {
-		rec := metadb.InodeRecord{Mode: 0o644, Size: 0, MTime: info.ModTime(), NLink: 1}
-		if err := r.DB.PutInode(id, rec); err != nil {
-			return 0, err
-		}
-		return 0, r.createDentryAllowExists(dir, name, id)
-	}
-
-	useSingleObject := size >= r.SingleObjectThreshold
-	chunks, err := chunk.SplitAll(f, r.ChunkSize)
+	content, err := r.storeContent(ctx, f, size)
 	if err != nil {
 		return 0, err
 	}
-
-	for _, c := range chunks {
-		if err := r.storeChunk(ctx, c, useSingleObject); err != nil {
-			return 0, err
-		}
-	}
-
-	rec := metadb.InodeRecord{Mode: 0o644, Size: uint64(size), MTime: info.ModTime(), NLink: 1}
-	if len(chunks) == 1 && !useSingleObject {
-		rec.HasInline = true
-		rec.InlineChunk = chunks[0].ID
-	} else {
-		m := manifest.New(chunks, r.ChunkSize)
-		mid, err := r.putManifest(ctx, m)
-		if err != nil {
-			return 0, err
-		}
-		rec.HasManifest = true
-		rec.ManifestID = mid
-	}
+	rec := metadb.InodeRecord{Mode: 0o644, MTime: info.ModTime(), NLink: 1}
+	content.apply(&rec)
 	if err := r.DB.PutInode(id, rec); err != nil {
 		return 0, err
 	}
 	return size, r.createDentryAllowExists(dir, name, id)
+}
+
+// contentRef is the chunk/manifest-shaped part of an InodeRecord, the
+// piece both the bulk publish path (publishFile) and the single-file
+// mutable write path (WriteHandle.Commit, DESIGN.md §16.1) produce
+// identically — chunk, dedup-check, pack-or-single-object, inline a lone
+// chunk or build a manifest. Only what happens to the *dentry* afterward
+// differs between the two paths.
+type contentRef struct {
+	size        uint64
+	hasInline   bool
+	inlineChunk chunk.ID
+	hasManifest bool
+	manifestID  manifest.ID
+}
+
+func (c contentRef) apply(rec *metadb.InodeRecord) {
+	rec.Size = c.size
+	rec.HasInline = c.hasInline
+	rec.InlineChunk = c.inlineChunk
+	rec.HasManifest = c.hasManifest
+	rec.ManifestID = c.manifestID
+}
+
+// storeContent chunks rd (size bytes), storing each chunk via the
+// write-path dedup check (§16.1) and either inlining a lone chunk or
+// building and storing a manifest (§5.3), exactly as publishFile always
+// did — factored out so the mutable write path doesn't reimplement it.
+func (r *Repo) storeContent(ctx context.Context, rd io.Reader, size int64) (contentRef, error) {
+	if size == 0 {
+		return contentRef{}, nil
+	}
+	useSingleObject := size >= r.SingleObjectThreshold
+	chunks, err := chunk.SplitAll(rd, r.ChunkSize)
+	if err != nil {
+		return contentRef{}, err
+	}
+	for _, c := range chunks {
+		if err := r.storeChunk(ctx, c, useSingleObject); err != nil {
+			return contentRef{}, err
+		}
+	}
+	if len(chunks) == 1 && !useSingleObject {
+		return contentRef{size: uint64(size), hasInline: true, inlineChunk: chunks[0].ID}, nil
+	}
+	m := manifest.New(chunks, r.ChunkSize)
+	mid, err := r.putManifest(ctx, m)
+	if err != nil {
+		return contentRef{}, err
+	}
+	return contentRef{size: uint64(size), hasManifest: true, manifestID: mid}, nil
 }
 
 func (r *Repo) createDentryAllowExists(dir metadb.InodeID, name string, id metadb.InodeID) error {

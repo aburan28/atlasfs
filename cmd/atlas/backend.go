@@ -19,6 +19,7 @@ type backendFlags struct {
 	s3Endpoint string
 	s3Prefix   string
 	region     string
+	class      string
 }
 
 func addBackendFlags(fs *flag.FlagSet, bf *backendFlags) {
@@ -28,6 +29,8 @@ func addBackendFlags(fs *flag.FlagSet, bf *backendFlags) {
 	fs.StringVar(&bf.s3Endpoint, "s3-endpoint", "", "S3-compatible endpoint override, e.g. http://localhost:9000 (--backend=s3)")
 	fs.StringVar(&bf.s3Prefix, "s3-prefix", "", "key prefix within the bucket (--backend=s3)")
 	fs.StringVar(&bf.region, "region", repo.DefaultRegion, "AtlasFS region label for chunk locators (DESIGN.md §7.5) — not the AWS region")
+	fs.StringVar(&bf.class, "class", string(repo.ClassImmutable),
+		"consistency class for a brand-new repo (DESIGN.md §8): immutable|relaxed|session. Ignored when repo-dir already holds a repo — its persisted class always wins.")
 }
 
 // openRepo opens repoDir's metadata locally and points its object
@@ -43,5 +46,6 @@ func openRepo(ctx context.Context, repoDir string, bf backendFlags) (*repo.Repo,
 		S3Endpoint: bf.s3Endpoint,
 		S3Prefix:   bf.s3Prefix,
 		Region:     bf.region,
+		Class:      bf.class,
 	})
 }

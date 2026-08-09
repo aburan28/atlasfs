@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aburan28/atlasfs/pkg/pack"
+	"github.com/aburan28/atlasfs/pkg/store/local"
 )
 
 func writeFile(t *testing.T, dir, name string, data []byte) string {
@@ -321,6 +322,71 @@ func TestSingleObjectThresholdPath(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatal("single-object-path file content mismatch on read-back")
+	}
+}
+
+func TestOpenDefaultsToImmutable(t *testing.T) {
+	r, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if r.Class != ClassImmutable {
+		t.Fatalf("got class %q, want %q", r.Class, ClassImmutable)
+	}
+	if r.Coherence != nil {
+		t.Fatal("an immutable repo should not have a coherence manager — nothing to invalidate")
+	}
+}
+
+func TestOpenWithClassPersistsAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	backend, err := local.New(filepath.Join(dir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, err := OpenWithClass(dir, backend, DefaultRegion, ClassRelaxed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.Class != ClassRelaxed {
+		t.Fatalf("got class %q, want %q", r1.Class, ClassRelaxed)
+	}
+	if r1.Coherence == nil {
+		t.Fatal("a relaxed repo should have a coherence manager")
+	}
+	r1.Close()
+
+	// Reopening via the plain Open() convenience path, which internally
+	// hints ClassImmutable, must still return the persisted class —
+	// DESIGN.md §8: a repo's class is fixed at creation, not at every
+	// open call.
+	r2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+	if r2.Class != ClassRelaxed {
+		t.Fatalf("reopen lost the persisted class: got %q, want %q", r2.Class, ClassRelaxed)
+	}
+	if r2.Coherence == nil {
+		t.Fatal("reopened relaxed repo should still have a coherence manager")
+	}
+}
+
+func TestSessionClassGetsShorterLeaseThanRelaxed(t *testing.T) {
+	if ClassSession.leaseDuration() >= ClassRelaxed.leaseDuration() {
+		t.Fatalf("DESIGN.md §8: session (%s) must be leased shorter than relaxed (%s)",
+			ClassSession.leaseDuration(), ClassRelaxed.leaseDuration())
+	}
+}
+
+func TestClassMutability(t *testing.T) {
+	if ClassImmutable.Mutable() {
+		t.Fatal("immutable must not be mutable")
+	}
+	if !ClassRelaxed.Mutable() || !ClassSession.Mutable() {
+		t.Fatal("relaxed and session must both be mutable")
 	}
 }
 

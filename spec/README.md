@@ -4,6 +4,16 @@ Phase 0 deliverable per §10.8 — checked before the FUSE mount was built,
 because the coherence protocol is where the design bugs live, not the
 metadata transactions themselves (those come from FDB for free).
 
+**This model now has a real implementation.** `pkg/coherence` in this
+repo implements the same shape checked here — per-holder leases on a
+monotonic clock, directory-version-gated negative caching, a
+best-effort/bounded push registry — and is wired into `pkg/fuseserver`
+as the actual read-path cache for `relaxed`/`session` mounts. What this
+file checks below is what that package is supposed to guarantee; see the
+root README for how it's wired in and what it doesn't cover yet (the
+`posix` class's blocking recall, §10.6, isn't implemented in Go — see
+`pkg/coherence`'s package doc for why).
+
 ## What's modeled
 
 `coherence.qnt` models:

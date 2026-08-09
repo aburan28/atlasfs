@@ -1,7 +1,7 @@
-// Command atlas is the AtlasFS CLI for the Phase-1 vertical slice: a
-// single-node, single-region, `immutable`-class repo (DESIGN.md §28
-// Phase 1). It can publish a directory tree into content-addressed
-// storage and mount it read-only over FUSE.
+// Command atlas is the AtlasFS CLI: a single-node, single-region repo
+// (DESIGN.md §28 Phases 1-2). It can publish a directory tree into
+// content-addressed storage and mount it over FUSE — read-only for the
+// `immutable` class, read-write for `relaxed`/`session`.
 package main
 
 import (
@@ -43,29 +43,32 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `atlas — AtlasFS single-node repo tool (Phase 1: immutable class only)
+	fmt.Fprint(os.Stderr, `atlas — AtlasFS single-node repo tool
 
 Usage:
   atlas publish [flags] <repo-dir> <src-dir> [dest-path]   ingest a directory tree, content-addressed
   atlas ls      [flags] <repo-dir> [path]                  list a directory
   atlas cat     [flags] <repo-dir> <path>                  print a file's content to stdout
   atlas stat    [flags] <repo-dir> <path>                  print an inode's metadata
-  atlas mount   [flags] <repo-dir> <mountpoint>             read-only FUSE mount (foreground)
+  atlas mount   [flags] <repo-dir> <mountpoint>             FUSE mount (foreground; read-write iff -class isn't immutable)
 
 repo-dir is created on first publish; metadata always lives there locally
 (DESIGN.md §24.5's single-node metadb stand-in for per-region FDB).
 
-Flags (every subcommand, DESIGN.md §24 pluggable backends):
+Flags (every subcommand, DESIGN.md §24 pluggable backends and §8 classes):
   -backend local|s3      object storage backend (default local)
   -s3-bucket NAME         S3 bucket (required for -backend=s3)
   -s3-region REGION       AWS region for the S3 client (default us-east-1)
   -s3-endpoint URL        S3-compatible endpoint override, e.g. MinIO
   -s3-prefix PREFIX       key prefix within the bucket
   -region NAME            AtlasFS locator region label (default local)
+  -class immutable|relaxed|session
+                          consistency class for a brand-new repo (default immutable);
+                          ignored on reopen — the repo's persisted class always wins
 
 AWS credentials for -backend=s3 follow the SDK's normal chain (env vars,
 shared config, IMDS) — never passed as a flag.
 
-See DESIGN.md §5/§16 for the on-disk format.
+See DESIGN.md §5/§16 for the on-disk format, §8 for consistency classes.
 `)
 }

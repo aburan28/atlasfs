@@ -1,18 +1,28 @@
-// Package fuseserver mounts a repo.Repo read-only over FUSE. This is the
-// `immutable`-class-only read path from DESIGN.md §21/§8: because the
-// subtree is immutable, there is no lease protocol to implement here —
-// every dentry and inode is fetched straight from metadb and is correct
-// for the life of the mount by construction.
+// Package fuseserver mounts a repo.Repo over FUSE — read-only for the
+// `immutable` class (DESIGN.md §8), read-write for `relaxed`/`session`
+// (DESIGN.md §16.1, §22.2's non-ROX row). For `immutable`, there is no
+// lease protocol to implement: every dentry and inode is fetched
+// straight from metadb and is correct for the life of the mount by
+// construction. For a mutable class, this package is the one real
+// consumer this build has of pkg/coherence's per-holder leases and
+// negative cache — every Node caches its own metadb.InodeRecord and
+// negative-lookup results in memory, using a fixed holder ID ("local")
+// because a single mount is this build's only holder (see
+// pkg/coherence's package doc for why there is no second one yet).
 //
 // This is a plain go-fuse mount (splice/passthrough tuning from
 // DESIGN.md §21.2 is not implemented here — that is a later-phase
 // performance pass, not a correctness requirement for the vertical
-// slice).
+// slice). The mutable write model is buffer-then-commit-on-close
+// (§16.1), not in-place random-access writes — see pkg/repo/write.go's
+// package doc for the exact scope cut.
 package fuseserver
 
 import (
 	"context"
+	"errors"
 	"io"
+	"sync"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -22,12 +32,44 @@ import (
 	"github.com/aburan28/atlasfs/pkg/repo"
 )
 
-// Node is one FUSE inode, backed by an AtlasFS inode in a Repo.
+// coherenceHolder is the single local holder ID this in-process mount
+// registers as with a repo's coherence.Manager.
+const coherenceHolder = "local"
+
+// Node is one FUSE inode, backed by an AtlasFS inode in a Repo. parent
+// and name are needed to commit an overwrite (writing to an existing
+// file opened without O_CREATE) back through repo.CreateFile, which
+// takes a (dir, name) pair, not an inode ID — the root node is the only
+// one with no parent, and it is never opened for write (it's always a
+// directory).
+//
+// cachedRec/stale/mu implement the coherence-aware read side: a Getattr
+// (or anything else needing current attrs) trusts cachedRec while the
+// repo's coherence.Manager still grants this holder a lease on the
+// inode's key, refreshes from metadb on expiry, and refreshes
+// immediately if markStale was called by a best-effort push (fired
+// synchronously, in-process, by a Commit/Unlink/Mkdir/Rmdir elsewhere in
+// this same process — see pkg/coherence's Bump doc comment on what
+// "best-effort" means across a real network, which this single-process
+// build doesn't have).
 type Node struct {
 	fs.Inode
-	repo *repo.Repo
-	ino  metadb.InodeID
-	rec  metadb.InodeRecord
+	repo   *repo.Repo
+	ino    metadb.InodeID
+	parent metadb.InodeID
+	name   string
+
+	mu        sync.Mutex
+	cachedRec metadb.InodeRecord
+	stale     bool
+	// activeWrite is the currently-open write handle for this node, if
+	// any. Setattr needs it: go-fuse/the kernel does not reliably pass
+	// the already-open handle as Setattr's fs.FileHandle parameter for
+	// the O_TRUNC-on-open and ftruncate(fd) cases (observed empirically:
+	// f arrives nil), so Setattr looks here instead of trusting f. See
+	// Setattr's doc comment for why resizing the wrong buffer corrupts
+	// data.
+	activeWrite *writeFileHandle
 }
 
 var (
@@ -36,31 +78,98 @@ var (
 	_ fs.NodeGetattrer  = (*Node)(nil)
 	_ fs.NodeOpener     = (*Node)(nil)
 	_ fs.NodeReadlinker = (*Node)(nil)
+	_ fs.NodeCreater    = (*Node)(nil)
+	_ fs.NodeUnlinker   = (*Node)(nil)
+	_ fs.NodeMkdirer    = (*Node)(nil)
+	_ fs.NodeRmdirer    = (*Node)(nil)
+	_ fs.NodeSetattrer  = (*Node)(nil)
 )
 
-func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	n.fillAttrOut(&out.Attr)
-	return 0
+// currentRec returns the Node's current InodeRecord, consulting the
+// repo's coherence.Manager (when non-nil) to decide whether the cached
+// copy is still trustworthy before re-fetching from metadb.
+func (n *Node) currentRec() (metadb.InodeRecord, syscall.Errno) {
+	if n.repo.Coherence == nil {
+		// immutable: content never changes, so whatever was cached at
+		// Lookup/Mount time is permanently correct.
+		return n.getCached(), 0
+	}
+
+	key := repo.InodeCoherenceKey(n.ino)
+	n.mu.Lock()
+	stale := n.stale
+	n.mu.Unlock()
+
+	if !stale {
+		if _, ok := n.repo.Coherence.TrustedVersion(coherenceHolder, key); ok {
+			return n.getCached(), 0
+		}
+	}
+
+	rec, err := n.repo.DB.GetInode(n.ino)
+	if err != nil {
+		return metadb.InodeRecord{}, syscall.EIO
+	}
+	n.mu.Lock()
+	n.cachedRec = rec
+	n.stale = false
+	n.mu.Unlock()
+	n.repo.Coherence.Grant(coherenceHolder, key)
+	n.repo.Coherence.Subscribe(coherenceHolder, key, n.markStale)
+	return rec, 0
 }
 
-func (n *Node) fillAttrOut(out *fuse.Attr) {
-	out.Size = n.rec.Size
+func (n *Node) getCached() metadb.InodeRecord {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.cachedRec
+}
+
+func (n *Node) setCached(rec metadb.InodeRecord) {
+	n.mu.Lock()
+	n.cachedRec = rec
+	n.stale = false
+	n.mu.Unlock()
+}
+
+// markStale is registered with the coherence.Manager as this Node's
+// best-effort push-invalidation callback (DESIGN.md §10.2): it does not
+// re-fetch anything itself, just marks the cache untrustworthy so the
+// next currentRec() call does.
+func (n *Node) markStale() {
+	n.mu.Lock()
+	n.stale = true
+	n.mu.Unlock()
+}
+
+// fillAttrOut fills out from rec. mutable reflects the repo's class
+// (DESIGN.md §8) — a regular file's permission bits are 0o644 on a
+// mutable-class repo and 0o444 on immutable, matching what Open already
+// enforces (a write syscall against an immutable mount fails with EROFS
+// regardless of what these bits say, so this is presentation, not the
+// actual access-control boundary).
+func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
+	out.Size = rec.Size
 	sec := uint64(0)
-	if !n.rec.MTime.IsZero() {
-		sec = uint64(n.rec.MTime.Unix())
+	if !rec.MTime.IsZero() {
+		sec = uint64(rec.MTime.Unix())
 	}
 	out.Mtime = sec
 	out.Atime = sec
 	out.Ctime = sec
 	switch {
-	case n.rec.IsDir:
-		out.Mode = syscall.S_IFDIR | 0o555
+	case rec.IsDir:
+		out.Mode = syscall.S_IFDIR | 0o755
 		out.Nlink = 2
-	case n.rec.IsSymlink:
+	case rec.IsSymlink:
 		out.Mode = syscall.S_IFLNK | 0o777
 		out.Nlink = 1
 	default:
-		out.Mode = syscall.S_IFREG | 0o444
+		mode := uint32(0o444)
+		if mutable {
+			mode = 0o644
+		}
+		out.Mode = syscall.S_IFREG | mode
 		out.Nlink = 1
 	}
 }
@@ -80,36 +189,75 @@ func direntMode(rec metadb.InodeRecord) uint32 {
 	}
 }
 
+func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	rec, errno := n.currentRec()
+	if errno != 0 {
+		return errno
+	}
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return 0
+}
+
 // Readlink returns a symlink's target. The kernel calls this instead of
 // Open when resolving a symlink node.
 func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
-	if !n.rec.IsSymlink {
+	rec, errno := n.currentRec()
+	if errno != 0 {
+		return nil, errno
+	}
+	if !rec.IsSymlink {
 		return nil, syscall.EINVAL
 	}
-	return []byte(n.rec.SymlinkTarget), 0
+	return []byte(rec.SymlinkTarget), 0
 }
 
+// Lookup consults negative caching (DESIGN.md §10.4) before ever
+// touching metadb: a name known-absent as of the directory's last-seen
+// version is rejected locally, and a fresh miss is recorded the same
+// way. Any mutation under this directory (Create/Unlink/Mkdir/Rmdir)
+// bumps the directory's coherence version, which invalidates every
+// negative entry recorded against it in one step — no per-entry
+// messages needed, which is the entire point of gating on dirver
+// instead of push per name.
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if !n.rec.IsDir {
+	rec, errno := n.currentRec()
+	if errno != 0 {
+		return nil, errno
+	}
+	if !rec.IsDir {
 		return nil, syscall.ENOTDIR
 	}
-	childIno, err := n.repo.DB.Lookup(n.ino, name)
-	if err != nil {
+
+	dirKey := repo.DirCoherenceKey(n.ino)
+	if n.repo.Coherence != nil && n.repo.Coherence.NegativeTrusted(coherenceHolder, dirKey, name) {
 		return nil, syscall.ENOENT
 	}
-	rec, err := n.repo.DB.GetInode(childIno)
+
+	childIno, err := n.repo.DB.Lookup(n.ino, name)
+	if err != nil {
+		if n.repo.Coherence != nil {
+			n.repo.Coherence.GrantNegative(coherenceHolder, dirKey, name)
+		}
+		return nil, syscall.ENOENT
+	}
+	childRec, err := n.repo.DB.GetInode(childIno)
 	if err != nil {
 		return nil, syscall.EIO
 	}
-	child := &Node{repo: n.repo, ino: childIno, rec: rec}
-	child.fillAttrOut(&out.Attr)
-	stable := fs.StableAttr{Mode: direntMode(rec), Ino: uint64(childIno)}
+	child := &Node{repo: n.repo, ino: childIno, parent: n.ino, name: name}
+	child.setCached(childRec)
+	fillAttrOut(childRec, n.repo.Class.Mutable(), &out.Attr)
+	stable := fs.StableAttr{Mode: direntMode(childRec), Ino: uint64(childIno)}
 	inode := n.NewInode(ctx, child, stable)
 	return inode, 0
 }
 
 func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	if !n.rec.IsDir {
+	rec, errno := n.currentRec()
+	if errno != 0 {
+		return nil, errno
+	}
+	if !rec.IsDir {
 		return nil, syscall.ENOTDIR
 	}
 	entries, err := n.repo.Readdir(n.ino)
@@ -118,35 +266,240 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	}
 	list := make([]fuse.DirEntry, 0, len(entries))
 	for _, e := range entries {
-		rec, err := n.repo.DB.GetInode(e.Inode)
+		childRec, err := n.repo.DB.GetInode(e.Inode)
 		if err != nil {
 			continue
 		}
-		list = append(list, fuse.DirEntry{Name: e.Name, Ino: uint64(e.Inode), Mode: direntMode(rec)})
+		list = append(list, fuse.DirEntry{Name: e.Name, Ino: uint64(e.Inode), Mode: direntMode(childRec)})
 	}
 	return fs.NewListDirStream(list), 0
 }
 
 func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	if n.rec.IsDir {
+	rec, errno := n.currentRec()
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	if rec.IsDir {
 		return nil, 0, syscall.EISDIR
 	}
-	if n.rec.IsSymlink {
+	if rec.IsSymlink {
 		return nil, 0, syscall.EINVAL
 	}
-	// Read-only mount: writes are rejected before they ever reach a
-	// FileReader (DESIGN.md §8's `immutable` class — mutation is
-	// EROFS by definition, not merely unimplemented here).
+
 	if flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0 {
-		return nil, 0, syscall.EROFS
+		// Read-write mount: writes are rejected before they ever reach a
+		// FileReader/write handle unless the repo's class permits them
+		// (DESIGN.md §8 — `immutable` is EROFS by definition, not merely
+		// unimplemented here).
+		if !n.repo.Class.Mutable() {
+			return nil, 0, syscall.EROFS
+		}
+		wh := &writeFileHandle{repo: n.repo, parent: n.parent, name: n.name, node: n}
+		if flags&syscall.O_TRUNC != 0 {
+			wh.dirty = true // truncate must commit even with zero further writes
+		} else if rec.Size > 0 {
+			fr, err := n.repo.OpenFile(ctx, rec)
+			if err != nil {
+				return nil, 0, syscall.EIO
+			}
+			data, err := fr.ReadAll()
+			if err != nil {
+				return nil, 0, syscall.EIO
+			}
+			wh.buf = append([]byte(nil), data...)
+		}
+		n.mu.Lock()
+		n.activeWrite = wh
+		n.mu.Unlock()
+		return wh, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	fr, err := n.repo.OpenFile(ctx, n.rec)
+
+	fr, err := n.repo.OpenFile(ctx, rec)
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
 	return &fileHandle{fr: fr}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
+// Create makes a new, empty file and returns a writable handle for it.
+// The empty file is committed immediately (visible in the namespace
+// right away, matching ordinary create(2) semantics) — DESIGN.md
+// §16.1's overwrite-in-place path then applies unchanged when the
+// returned handle's Release commits real content into the same inode.
+func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	if !n.repo.Class.Mutable() {
+		return nil, nil, 0, syscall.EROFS
+	}
+	parentRec, errno := n.currentRec()
+	if errno != 0 {
+		return nil, nil, 0, errno
+	}
+	if !parentRec.IsDir {
+		return nil, nil, 0, syscall.ENOTDIR
+	}
+
+	h, err := n.repo.CreateFile(n.ino, name)
+	if err != nil {
+		return nil, nil, 0, errnoFor(err)
+	}
+	id, err := h.Commit(ctx)
+	if err != nil {
+		return nil, nil, 0, errnoFor(err)
+	}
+	rec, err := n.repo.DB.GetInode(id)
+	if err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+
+	child := &Node{repo: n.repo, ino: id, parent: n.ino, name: name}
+	child.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	stable := fs.StableAttr{Mode: direntMode(rec), Ino: uint64(id)}
+	inode := n.NewInode(ctx, child, stable)
+
+	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, node: child}
+	child.activeWrite = fh // no lock needed: child isn't reachable by any other goroutine yet
+	return inode, fh, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
+	return errnoFor(n.repo.Unlink(n.ino, name))
+}
+
+func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	id, err := n.repo.Mkdir(n.ino, name)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	rec, err := n.repo.DB.GetInode(id)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	child := &Node{repo: n.repo, ino: id, parent: n.ino, name: name}
+	child.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	stable := fs.StableAttr{Mode: direntMode(rec), Ino: uint64(id)}
+	return n.NewInode(ctx, child, stable), 0
+}
+
+func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
+	return errnoFor(n.repo.Rmdir(n.ino, name))
+}
+
+// Setattr handles truncate (via truncate(2)/ftruncate(2), and the
+// O_TRUNC-on-an-existing-file case that a plain open(2) also routes
+// through this — not through Node.Open's flags — on Linux's FUSE
+// implementation). Every other attribute change (mode, times, owner) is
+// accepted but not persisted: this build's InodeRecord doesn't track a
+// separate mode from the class-derived default (fillAttrOut), and there
+// is no uid/gid model yet (DESIGN.md §20 is a later phase) — silently
+// accepting rather than returning ENOSYS matches what most FUSE
+// filesystems do for attributes they don't materially support, since
+// returning an error here breaks a surprising amount of ordinary
+// software (cp, rsync, tar) that always tries to restore them.
+func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	rec, errno := n.currentRec()
+	if errno != 0 {
+		return errno
+	}
+
+	if sz, ok := in.GetSize(); ok {
+		if !n.repo.Class.Mutable() {
+			return syscall.EROFS
+		}
+		if rec.IsDir {
+			return syscall.EISDIR
+		}
+
+		// O_TRUNC on an existing file, and ftruncate(2) on an open fd,
+		// both reach us here while a write handle for this node is
+		// already open — but empirically, go-fuse/the kernel does not
+		// reliably pass that handle as f (observed nil in exactly this
+		// case: Open() runs first, sees no O_TRUNC bit by the time it
+		// gets there and preloads the file's existing content, then
+		// Setattr arrives with f == nil). Resizing independently here —
+		// a fresh read-modify-commit disconnected from the handle's
+		// in-memory buffer — would leave that buffer holding stale
+		// pre-truncate bytes that a subsequent Write then partially
+		// overwrites instead of replacing, corrupting the result.
+		// n.activeWrite, not f, is what makes resizing the SAME buffer
+		// Write/Flush operate on reliable.
+		n.mu.Lock()
+		wh := n.activeWrite
+		n.mu.Unlock()
+		if wh != nil {
+			wh.resize(sz)
+			rec.Size = sz
+			fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+			return 0
+		}
+
+		var data []byte
+		if rec.Size > 0 {
+			fr, err := n.repo.OpenFile(ctx, rec)
+			if err != nil {
+				return syscall.EIO
+			}
+			data, err = fr.ReadAll()
+			if err != nil {
+				return syscall.EIO
+			}
+		}
+		if uint64(len(data)) < sz {
+			grown := make([]byte, sz)
+			copy(grown, data)
+			data = grown
+		} else {
+			data = data[:sz]
+		}
+		repoWH, err := n.repo.CreateFile(n.parent, n.name)
+		if err != nil {
+			return errnoFor(err)
+		}
+		if _, err := repoWH.Write(data); err != nil {
+			return syscall.EIO
+		}
+		id, err := repoWH.Commit(ctx)
+		if err != nil {
+			return errnoFor(err)
+		}
+		if newRec, err := n.repo.DB.GetInode(id); err == nil {
+			n.setCached(newRec)
+			rec = newRec
+		}
+	}
+
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return 0
+}
+
+// errnoFor maps pkg/repo's sentinel errors to the errno a real syscall
+// would return, rather than collapsing everything to EIO.
+func errnoFor(err error) syscall.Errno {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, repo.ErrReadOnly):
+		return syscall.EROFS
+	case errors.Is(err, metadb.ErrNotFound):
+		return syscall.ENOENT
+	case errors.Is(err, repo.ErrExists), errors.Is(err, metadb.ErrExists):
+		return syscall.EEXIST
+	case errors.Is(err, repo.ErrIsDirectory):
+		return syscall.EISDIR
+	case errors.Is(err, repo.ErrNotDir), errors.Is(err, metadb.ErrNotDir):
+		return syscall.ENOTDIR
+	case errors.Is(err, repo.ErrNotEmpty):
+		return syscall.ENOTEMPTY
+	default:
+		return syscall.EIO
+	}
+}
+
+// fileHandle is the read-only handle used for O_RDONLY opens (always,
+// on an immutable repo; also on a mutable one when the caller didn't
+// ask to write).
 type fileHandle struct {
 	fr *repo.FileReader
 }
@@ -161,16 +514,156 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 	return fuse.ReadResultData(dest[:n]), 0
 }
 
-// Mount mounts r read-only at mountpoint and blocks until unmounted.
-// unmount(), if non-nil, is invoked with the *fuse.Server once mounted
-// so the caller can wire up signal-triggered unmount.
+// writeFileHandle buffers a file's full content in memory across the
+// life of an open-for-write session and commits it as a unit on
+// Release — DESIGN.md §16.1's buffer-then-chunk-on-close model. Reads
+// on a writable handle are served from the same buffer, so a session
+// sees its own uncommitted writes (read-your-own-writes within one
+// open), which a plain repo.FileReader (backed by the last-committed
+// manifest) would not.
+type writeFileHandle struct {
+	repo   *repo.Repo
+	parent metadb.InodeID
+	name   string
+	node   *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
+
+	mu    sync.Mutex
+	buf   []byte
+	dirty bool
+}
+
+var (
+	_ fs.FileWriter   = (*writeFileHandle)(nil)
+	_ fs.FileReader   = (*writeFileHandle)(nil)
+	_ fs.FileFlusher  = (*writeFileHandle)(nil)
+	_ fs.FileReleaser = (*writeFileHandle)(nil)
+)
+
+// resize truncates or zero-extends the handle's buffer to sz bytes and
+// marks it dirty, so a subsequent Flush commits the resized content —
+// the direct fix for the O_TRUNC/ftruncate corruption described in
+// Node.Setattr's comment above.
+func (h *writeFileHandle) resize(sz uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if uint64(len(h.buf)) < sz {
+		grown := make([]byte, sz)
+		copy(grown, h.buf)
+		h.buf = grown
+	} else {
+		h.buf = h.buf[:sz]
+	}
+	h.dirty = true
+}
+
+func (h *writeFileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	end := off + int64(len(data))
+	if end > int64(len(h.buf)) {
+		grown := make([]byte, end)
+		copy(grown, h.buf)
+		h.buf = grown
+	}
+	copy(h.buf[off:], data)
+	h.dirty = true
+	return uint32(len(data)), 0
+}
+
+func (h *writeFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if off >= int64(len(h.buf)) {
+		return fuse.ReadResultData(nil), 0
+	}
+	end := off + int64(len(dest))
+	if end > int64(len(h.buf)) {
+		end = int64(len(h.buf))
+	}
+	return fuse.ReadResultData(h.buf[off:end]), 0
+}
+
+// Flush commits the buffered content. This — not Release — is the FUSE
+// hook that must do it: RELEASE is documented as asynchronous relative
+// to close(2) (the kernel does not wait for it), while FLUSH is sent
+// synchronously as part of close(2) and the caller does block on it.
+// Committing only on Release would make writes racily invisible to a
+// process that closes the file and immediately reopens it — exactly the
+// read-your-writes property this build exists to get right.
+func (h *writeFileHandle) Flush(ctx context.Context) syscall.Errno {
+	return h.commitIfDirty(ctx)
+}
+
+// Release is a backstop for any caller that drops the last reference to
+// this handle without ever calling close(2)/Flush (e.g. an abnormal
+// exit some FUSE clients can trigger) — commitIfDirty's own guard makes
+// calling it a second time here a no-op in the ordinary case.
+func (h *writeFileHandle) Release(ctx context.Context) syscall.Errno {
+	errno := h.commitIfDirty(ctx)
+	if h.node != nil {
+		h.node.mu.Lock()
+		if h.node.activeWrite == h {
+			h.node.activeWrite = nil
+		}
+		h.node.mu.Unlock()
+	}
+	return errno
+}
+
+// commitIfDirty commits the buffered content whenever there is writing
+// pending since the last commit — NOT just once ever. FLUSH can fire
+// more than once in a single open session (observed empirically: a
+// truncate via Setattr triggers one, and the eventual close(2) triggers
+// another), and a one-shot "already committed" latch would let the
+// FIRST flush — which can land before all of a session's Write calls
+// have happened — permanently block every later one from persisting
+// anything, silently dropping data written after it. Guarding on "dirty
+// since the last commit" instead of "ever committed" is what makes a
+// second, third, etc. Flush in the same session correct: a no-op if
+// nothing changed, a real commit if something did.
+func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.dirty {
+		return 0
+	}
+	h.dirty = false
+
+	wh, err := h.repo.CreateFile(h.parent, h.name)
+	if err != nil {
+		return errnoFor(err)
+	}
+	if _, err := wh.Write(h.buf); err != nil {
+		return syscall.EIO
+	}
+	id, err := wh.Commit(ctx)
+	if err != nil {
+		return errnoFor(err)
+	}
+	if h.node != nil {
+		if rec, err := h.repo.DB.GetInode(id); err == nil {
+			h.node.setCached(rec)
+		}
+	}
+	return 0
+}
+
+// Mount mounts r at mountpoint — read-only for an immutable repo,
+// read-write otherwise — and blocks until unmounted. onMounted, if
+// non-nil, is invoked with the *fuse.Server once mounted so the caller
+// can wire up signal-triggered unmount.
 func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(*fuse.Server)) error {
 	_, rootRec, err := r.Resolve("/")
 	if err != nil {
 		return err
 	}
-	root := &Node{repo: r, ino: metadb.RootInode, rec: rootRec}
+	root := &Node{repo: r, ino: metadb.RootInode}
+	root.setCached(rootRec)
 
+	opts := []string{}
+	if !r.Class.Mutable() {
+		opts = append(opts, "ro")
+	}
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
 		MountOptions: fuse.MountOptions{
 			FsName: "atlasfs",
@@ -181,7 +674,7 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 			// mount(2) fails, so this is strictly more portable, not
 			// less, when we do have CAP_SYS_ADMIN.
 			DirectMount: true,
-			Options:     []string{"ro"},
+			Options:     opts,
 		},
 	})
 	if err != nil {
