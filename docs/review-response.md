@@ -1,8 +1,8 @@
 # Response to Draft 1 Review
 
-Maps each review point to its resolution in `DESIGN.md` (Draft 2). Section numbers on the left are Draft 1's; on the right, Draft 2's.
+Maps each review point to its resolution in `DESIGN.md`. Written against Draft 2; section numbers updated for Draft 3, which added Kubernetes CSI/PVC (§22), NFS export (§23), and pluggable backends (§24) and renumbered the tail. Section numbers on the left are Draft 1's; on the right, current.
 
-**Scope decision:** full general-purpose POSIX, all critiques resolved, with an honest effort estimate (§26: 3–5 engineer-years). The review's narrow-wedge recommendation is preserved as Phase 1 and explicitly costed, so the option remains visible without being the plan.
+**Scope decision:** full general-purpose POSIX, all critiques resolved, with an honest effort estimate (§28: 4–6 engineer-years). The review's narrow-wedge recommendation is preserved as Phase 1 and explicitly costed, so the option remains visible without being the plan.
 
 ---
 
@@ -27,7 +27,7 @@ Your `/users/adam` / `/datasets` example is the worked example in §7.1.
 - **§10.2 — lease vs. callback.** Leases are load-bearing; push invalidation is best-effort and explicitly *not* load-bearing. Rationale for rejecting both pure callbacks (partition ⇒ write outage) and pure TTL (median staleness `D/2`) is stated. The registry is lossy by design, which bounds authority memory at O(hot set).
 - **§10.4 — negative caching.** Leased against directory version; one `GETDIRVER` validates every negative entry in a directory at once. The Python `sys.path` case is the worked example. Negative leases capped at 5 s even in `relaxed`, because a stale negative breaks more software than a stale positive.
 - **§10.5 — granularity.** Two independent lease domains. Parent `dirver` bump explicitly does **not** invalidate children's inode leases, with the ImageNet-ingest reason. The accepted consequence (`ctime` staleness after `rename`) is stated rather than left to be found in conformance testing.
-- **§8.1 — falsifiable guarantees.** G1–G6, phrased for testability, with §25 describing the harness that checks them.
+- **§8.1 — falsifiable guarantees.** G1–G6, phrased for testability, with §27 describing the harness that checks them.
 - **§10.7 — clocks.** `CLOCK_MONOTONIC` durations from *send* time, no NTP dependency; `ε = 500 ms` against ~3 ms of realistic drift; `CLOCK_BOOTTIME` gap detection for suspended VMs.
 - **§10.8 — model-check first.** Quint spec is Phase 0, before the FUSE mount, for exactly your reason.
 
@@ -63,7 +63,7 @@ Your `/users/adam` / `/datasets` example is the worked example in §7.1.
 - **Cache hit rate stated as the business case**, target ≥95%, with packing and P2P framed as cost mechanisms rather than latency optimizations.
 - New finding while working the numbers: **cross-AZ P2P costs ~210× a same-region S3 GET** for a 4 MiB chunk ($0.0000839 vs $0.0000004). §11.1 makes peer selection AZ- and cost-aware; a topology-blind P2P implementation raises the bill while looking like an optimization.
 - **§12.3** — `placement:` gains `budget:` with egress/request ceilings and `on_exceed: block|degrade|alert`, admission control in the replication controller, `atlas placement estimate` for up-front pricing, and per-subtree cost attribution (without which budgets are unenforceable).
-- **§25** — a cost regression test (GETs per GB delivered) gates CI, so §12's premises stay true over time.
+- **§27** — a cost regression test (GETs per GB delivered) gates CI, so §12's premises stay true over time.
 
 ## 7. Consistency-class boundary semantics
 
@@ -77,23 +77,23 @@ Your `/users/adam` / `/datasets` example is the worked example in §7.1.
 |---|---|
 | `fsync(global)` not expressible | **§16.2** — `ioctl(ATLAS_IOC_PUBLISH)` primary, `atlas publish` CLI, `user.atlas.publish` xattr fallback, `.atlas/control` for shells. Semantics split: `fsync()` = durable in home region; publish = satisfies the placement policy's durability predicate. `fsync()` never blocks on cross-region replication. |
 | GC grace invariant unstated | **§19.2** — stated as GC-1: `T_grace > T_write_max + D_max + ε`. Enforced client-side (`ESTALE` on stale write sessions) *and* authority-side (upload epochs validated at commit → `ATLAS_STALE_UPLOAD`), because a buggy client must not be able to construct a dangling manifest. Policy validator rejects configs violating GC-1. |
-| §11 regional cache contradicts §26 | **§11** — regional cache servers removed from the data path. Hierarchy is page cache → node NVMe → same-AZ peer → origin. Only surviving regional construct is an optional write-through replica *bucket* (a bucket, not a server). **§11.1** — P2P with chunk hash as the P2P key, AZ- and cost-aware peer selection; also the answer to object-store per-prefix rate limits. |
+| §11 regional cache contradicts §26 (Draft 1) | **§11** — regional cache servers removed from the data path. Hierarchy is page cache → node NVMe → same-AZ peer → origin. Only surviving regional construct is an optional write-through replica *bucket* (a bucket, not a server). **§11.1** — P2P with chunk hash as the P2P key, AZ- and cost-aware peer selection; also the answer to object-store per-prefix rate limits. |
 | uid/gid/mode vs SPIFFE unreconciled | **§20** — SPIFFE + subtree ACLs are the security boundary, evaluated at the authority; `uid`/`gid`/`mode` are presentation-layer POSIX attributes the authority never consults. Per-mount idmap with default squash. Global uid mapping explicitly not attempted, with the reason. |
 | Hardlinks / `nlink` / GC | **§19.3** — `nlink` transactional; `nlink=0` → graveyard, reachable until `delete_ts + T_grace`. Open-but-unlinked held by leased open handles; graveyard subsumes silly-rename. Cross-region hardlinks are `EXDEV`, so `nlink` never needs cross-region agreement. |
 | `readdir` at 10M entries | **§18.1** — lexicographic dentry keys give natural pagination; **name-based** cookie, not snapshot-based, precisely because a 10M-entry scan cannot hold a read version across FDB's 5 s limit. `dirver` change does not invalidate an in-progress scan. Guarantee: entries present throughout the scan appear exactly once; concurrent mutations may or may not appear. |
 | Quotas | **§18.3** — per-subtree byte and inode quotas, exact via FDB atomic add in the mutation's own transaction. Home-region ownership is what makes exactness cheap. Reserve-then-commit for large writes; `EDQUOT` at commit; quotas may not span home regions. |
 | Byte-range locks, `O_APPEND` | **§17** — `fcntl`/OFD/`flock` at the authority in `posix`; mandatory locking unsupported; `lock=local|global|error` mount option elsewhere, default `local` with the reasoning for that default and loud documentation. **§16.3** — atomic `O_APPEND` in `posix` via an authority transaction returning the allocated offset; best-effort elsewhere, documented, warned by `atlas doctor`. |
 | Whose clock bounds lease expiration | **§10.7** — client's `CLOCK_MONOTONIC` from send time; authority waits `D + ε` on its own monotonic clock before presuming a lease dead; `CLOCK_BOOTTIME` gap expires all leases. |
-| No correctness validation in §34 | **§25** — pjdfstest (100% in `posix`, enumerated justified exceptions), fsx 24 h soak with `mmap`, applicable xfstests `generic/` groups with N/A justifications listed rather than silently skipped, plus Quint/TLA+ model checking and a Jepsen-style bounded-staleness harness. All gating. |
-| Numbering breaks at §28; §31 restates §5; §32–34 overlap | Renumbered 1–27, single level. Duplicated content merged; §25 is the single verification section; §26 the single roadmap. |
+| No correctness validation in §34 | **§27** — pjdfstest (100% in `posix`, enumerated justified exceptions), fsx 24 h soak with `mmap`, applicable xfstests `generic/` groups with N/A justifications listed rather than silently skipped, plus Quint/TLA+ model checking and a Jepsen-style bounded-staleness harness. All gating. |
+| Numbering breaks at §28; §31 restates §5; §32–34 overlap | Renumbered single level (1–29 as of Draft 3). Duplicated content merged; §27 is the single verification section, §28 the single roadmap. |
 | ~30% ASCII blocks listing nouns | Removed. Remaining diagrams-as-text are the two format definitions (§5.2, §6 keyspace) and the policy YAML (§12.3), all of which carry content. Space went to §10 and §12. |
 
 ## On scope
 
-Your closing argument is recorded rather than dismissed. **§26** commits to full scope with a 3–5 engineer-year estimate and a per-phase breakdown, and states plainly that **Phase 1 — read-mostly, immutable, content-addressed, atomic publish, explicit placement — is ~0.5 engineer-years, roughly 10% of the system, and delivers most of the ML value**, because immutable data needs no leases, no `posix` class, almost no GC, and essentially none of §10.
+Your closing argument is recorded rather than dismissed. **§28** commits to full scope with a 4–6 engineer-year estimate and a per-phase breakdown, and states plainly that **Phase 1 — read-mostly, immutable, content-addressed, atomic publish, explicit placement — is ~0.5 engineer-years, roughly 10% of the system, and delivers most of the ML value**, because immutable data needs no leases, no `posix` class, almost no GC, and essentially none of §10.
 
-Phases 3 and 4 are more than half the total cost. §26 says committing to full scope is legitimate, but committing without having priced Phase 3 is not.
+Phases 3 and 4 are more than half the total cost. §28 says committing to full scope is legitimate, but committing without having priced Phase 3 is not.
 
 ## Open, not resolved
 
-**§27** lists what remains genuinely unresolved rather than merely unwritten: adaptive lease duration and its interaction with `ε` and recall; automatic home-region placement; cross-region read replicas for mutable subtrees; `EXDEV` ergonomics for large cross-region moves (a locator-level assisted move looks tractable and is not designed); and the fact that §15's 1.15× dedup gate is a judgement awaiting measurement.
+**§29** lists what remains genuinely unresolved rather than merely unwritten: adaptive lease duration and its interaction with `ε` and recall; automatic home-region placement; cross-region read replicas for mutable subtrees; `EXDEV` ergonomics for large cross-region moves (a locator-level assisted move looks tractable and is not designed); and the fact that §15's 1.15× dedup gate is a judgement awaiting measurement.

@@ -25,6 +25,7 @@ Stated up front, because a design that claims to suit everything describes nothi
 - **Small-scale general file serving.** Use NFS or EFS/Filestore.
 - **Write-heavy shared-mutable workloads with fine-grained cross-node coordination** (databases, build caches with concurrent writers to the same file). The `posix` class supports this correctly but at the coordination cost such workloads imply; a purpose-built system will beat it.
 - **Strict global linearizability across regions.** Not offered at any consistency class. §9 explains why we chose partition-tolerant regional authority instead.
+- **NFS-only access at full scale.** The NFS export (§23) is a compatibility and reach path delivering 50–70% of native throughput, without node-local caching, `mmap` passthrough, or per-client authorization under `AUTH_SYS`. Where the CSI driver can be installed, it is the right answer.
 
 ---
 
@@ -71,9 +72,9 @@ Four layers, each addressable independently. This layering is unchanged from Dra
 
 **Inode** — POSIX attributes, link count, and a pointer to the current manifest. Owned by the same home region as its containing subtree.
 
-**Manifest** — an ordered chunk list describing file content at a version. Content-addressed and immutable; a new version is a new manifest with a new hash. Stored as a blob, not in the metadata store (§6.3).
+**Manifest** — an ordered chunk list describing file content at a version. Content-addressed and immutable; a new version is a new manifest with a new hash. Stored as a blob, not in the metadata store (§5.3).
 
-**Chunk** — content-addressed byte ranges. Immutable, globally deduplicable, location-independent. A chunk's *identity* is separate from its *location* (§6.4) — this indirection is what makes small-file packing, recompaction, and per-region placement possible without touching manifests.
+**Chunk** — content-addressed byte ranges. Immutable, globally deduplicable, location-independent. A chunk's *identity* is separate from its *location* (§5.4) — this indirection is what makes small-file packing, recompaction, and per-region placement possible without touching manifests.
 
 Reads descend; the layers below the namespace are immutable and therefore trivially cacheable, replicable, and verifiable. Essentially all coordination cost lives in the top layer, which is why §9 and §10 are the substance of this design.
 
@@ -139,7 +140,7 @@ This indirection buys four things that are otherwise unreachable:
 - **Recompaction.** Repacking cold containers rewrites locators only.
 - **Codec migration.** Recompressing does not change chunk identity.
 
-Locators live in the metadata store, sharded by `chunk_id` prefix, and are **globally replicated read-mostly state** rather than home-region-owned: a chunk is immutable, so its locator is append-mostly and conflict-free (§9.5).
+Locators live in the metadata store, sharded by `chunk_id` prefix, and are **globally replicated read-mostly state** rather than home-region-owned: a chunk is immutable, so its locator is append-mostly and conflict-free (§7.5).
 
 ### 5.5 Container objects
 
@@ -214,7 +215,7 @@ Moving a subtree's authority between regions. Quiesce-based, not concurrent:
 
 1. Namespace map entry marked `SEALING@epoch+1`. New mutations to the subtree return `EAGAIN`; reads continue from cache.
 2. Old authority waits `D_max + ε` (§10.7) for outstanding leases to expire, then drains in-flight transactions.
-3. Metadata range copied to the new region's cluster. Chunk locators are untouched (they are global, §9.5); actual data placement is a separate, asynchronous concern (§17).
+3. Metadata range copied to the new region's cluster. Chunk locators are untouched (they are global, §7.5); actual data placement is a separate, asynchronous concern (§17).
 4. Namespace map committed at `epoch+1` with the new home region. Old authority now rejects everything for that subtree with `ATLAS_STALE_EPOCH`.
 
 Unavailability window for writes is the quiesce plus the copy — seconds to minutes depending on subtree size. Rehoming is an administrative operation, documented as such, and it is the only operation in the system with a planned write outage.
@@ -250,7 +251,7 @@ A per-subtree property, inherited at creation, changeable only on an empty or qu
 
 ### 8.1 Guarantee statements
 
-These are written to be falsifiable and are the properties checked in §29.
+These are written to be falsifiable and are the properties checked in §27.
 
 Let `D` be the class lease duration and `ε` the clock-error bound (§10.7).
 
@@ -396,7 +397,7 @@ Two rules follow:
 
 The protocol in §10 is the highest-value thing to formally verify, and it is verifiable: it is small, it is entirely about message loss and timing, and its properties (G1–G3) are stateable as temporal formulas.
 
-Phase 0 (§30) delivers a Quint specification covering: lease grant/expiry, best-effort push with arbitrary message loss and reorder, `dirver` bumps and negative-entry validity, the two lease domains, blocking recall with a dead holder, and clock skew bounded by `ε`. Checked properties: G1, G2, G3, and the recall-safety invariant that no conflicting mutation commits while a non-recalled `posix` lease may still be served.
+Phase 0 (§28) delivers a Quint specification covering: lease grant/expiry, best-effort push with arbitrary message loss and reorder, `dirver` bumps and negative-entry validity, the two lease domains, blocking recall with a dead holder, and clock skew bounded by `ε`. Checked properties: G1, G2, G3, and the recall-safety invariant that no conflicting mutation commits while a non-recalled `posix` lease may still be served.
 
 **This is written before the FUSE mount.** The metadata transactions FDB gives us for free; the coherence protocol is where the design bugs live, and finding them in a model is orders of magnitude cheaper than finding them in a conformance run.
 
@@ -408,7 +409,7 @@ Draft 1 listed a "regional cache" tier, which contradicts the principle (retaine
 
 The hierarchy is:
 
-1. **Kernel page cache** — via FUSE writeback cache and, on cache hits, passthrough (§24).
+1. **Kernel page cache** — via FUSE writeback cache and, on cache hits, passthrough (§21).
 2. **Node NVMe cache** — content-addressed by `chunk_id`. Chunk immutability means no coherence protocol at all; the cache is a pure hash map with an LRU/LFU eviction policy.
 3. **Peer NVMe (P2P)** — same-AZ peers first (§13).
 4. **Origin object store** — range GET into a container at a known offset.
@@ -434,6 +435,8 @@ Egress and request charges are the economics of a cross-cloud filesystem. Draft 
 ### 12.1 Egress
 
 Cross-cloud egress runs $0.05–$0.09/GB (AWS) and $0.08–$0.12/GB (GCP). Replicating W3's 50 TB corpus from S3 to GCS is **$2,500–$4,500, one-time, per replica**. This is a budget line item requiring approval, not a config change, and the system must treat it that way (§12.3).
+
+Pricing is not hardcoded: it comes from each backend's `Caps()` (§24.1), so the cost model evaluates whatever backends are actually configured. This matters more than it sounds, because the numbers are not uniform in kind — **Cloudflare R2 charges zero egress**, which does not shift the arithmetic below so much as delete it, and makes R2 a rational replication target for a corpus consumed from multiple clouds. A cost model with AWS prices baked in would never surface that.
 
 ### 12.2 Request charges, and why they are the design constraint
 
@@ -540,7 +543,7 @@ The real tension, stated plainly: content-defined chunking wants small variable 
 
 ### 14.4 Migration risk this removes
 
-Retrofitting the chunk → container indirection after Phase 1 would require rewriting every manifest ever published, which for `immutable` subtrees means changing content-addressed objects that other manifests and snapshots reference by hash. It would be a full-corpus rewrite with no incremental path. The indirection costs one map lookup now and is not negotiable later — which is why it lands in Phase 1 (§30) rather than being scheduled when packing is needed.
+Retrofitting the chunk → container indirection after Phase 1 would require rewriting every manifest ever published, which for `immutable` subtrees means changing content-addressed objects that other manifests and snapshots reference by hash. It would be a full-corpus rewrite with no incremental path. The indirection costs one map lookup now and is not negotiable later — which is why it lands in Phase 1 (§28) rather than being scheduled when packing is needed.
 
 ---
 
@@ -749,17 +752,284 @@ The shim is a compatibility bridge, not the interface; the library is the suppor
 
 ---
 
-## 22. Kubernetes Integration
+## 22. Kubernetes: CSI, PersistentVolumes, and Claims
 
-CSI driver with a node plugin owning the local cache and P2P tracker participation.
+A CSI driver in two parts: a **controller plugin** (provisioning, quota, snapshots, placement reconciliation) and a **node plugin** DaemonSet (mounts, local NVMe cache, P2P tracker membership).
 
-- **`AtlasDataset` CRD** — declares a subtree, its placement policy, and prefetch intent. Reconciled by the replication controller (§13) under the cost budget (§12.3).
-- **Prefetch and pinning** — a dataset may be pinned into node caches ahead of a job. Pinning is admission-controlled against cache capacity; over-subscription is rejected at admission rather than causing thrash at runtime.
-- **Scheduler locality** — nodes advertise cached-chunk coverage per dataset as an extended resource; a scheduler plugin scores nodes by coverage. This is close to what Fluid does and there is no reason to be novel here; the difference is that coverage is computed over content-addressed chunk IDs, so it is exact and shareable across datasets that overlap.
+### 22.1 The volume model: a PVC is a subtree
+
+A PersistentVolume maps to an AtlasFS **subtree**, which is exactly the unit that already carries a home region (§7), a consistency class (§8), a placement policy (§13), and a quota (§18.3). Nothing new is invented for Kubernetes; the CSI driver projects existing subtree properties onto Kubernetes primitives.
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: atlas-scratch
+provisioner: csi.atlas.io
+volumeBindingMode: WaitForFirstConsumer   # home_region follows the pod
+allowVolumeExpansion: true                 # expansion is a quota change
+reclaimPolicy: Delete
+parameters:
+  parentPath: /pvc/{namespace}
+  class: session                           # §8
+  chunkSize: 4Mi
+  placementPolicy: default-single-region    # §13
+  backend: s3-us-west-2                     # §24
+```
+
+**Dynamic provisioning** creates `\{parentPath\}/\{pvc-uid\}` with the StorageClass's class, chunk size, and placement, and sets the quota from `resources.requests.storage`.
+
+**Static provisioning** binds a PV to a pre-existing subtree, which is the important case for ML:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata: { name: imagenet }
+spec:
+  accessModes: [ReadOnlyMany]
+  capacity: { storage: 140Gi }
+  csi:
+    driver: csi.atlas.io
+    volumeHandle: /datasets/imagenet@v3    # subtree, optionally version-pinned
+    volumeAttributes:
+      readOnly: "true"
+      prefetch: whole-dataset
+```
+
+A version-pinned handle (`@v3`) resolves to a sealed manifest set and is immutable for the life of the volume, so a job's input cannot change under it mid-run. This is what dataset reproducibility looks like at the Kubernetes layer, and it costs nothing because `immutable` subtrees are already content-addressed snapshots.
+
+**Ephemeral inline volumes** are supported for read-only dataset mounts, so a training Job can name a dataset without a PVC round trip.
+
+### 22.2 Access modes are a projection of consistency classes
+
+Kubernetes access modes are a coarse, three-valued approximation of what §8 expresses precisely. The driver **enforces the mapping at provisioning and at `NodePublishVolume`, and rejects incoherent combinations rather than mounting something that will quietly misbehave.**
+
+| Access mode | `immutable` | `relaxed` | `session` | `posix` |
+|---|---|---|---|---|
+| `ReadOnlyMany` (ROX) | **ideal** — zero coordination | allowed | allowed | allowed (wasteful) |
+| `ReadWriteOnce` (RWO) | rejected — `EROFS` | allowed | allowed | allowed |
+| `ReadWriteOncePod` (RWOP) | rejected | allowed | allowed | allowed |
+| `ReadWriteMany` (RWX) | rejected — use ROX | **opt-in only** (below) | allowed | allowed |
+
+The row that matters is **RWX on `relaxed`**. RWX advertises concurrent multi-node read-write, and `relaxed`'s 30 s staleness bound silently violates what most software means by that. A blanket rejection would be wrong too, because the dominant ML pattern under RWX — every rank writing its own file into a shared directory — is perfectly safe at `relaxed` and forcing it to `posix` would make it needlessly expensive.
+
+So RWX on `relaxed` requires an explicit contract:
+
+```yaml
+  parameters:
+    class: relaxed
+    rwxContract: disjoint-writers   # required for RWX on relaxed; else provisioning fails
+```
+
+Under `disjoint-writers` the driver mounts with `lock=error` (§17), so any attempt at cross-node locking fails loudly with `ENOLCK` instead of succeeding locally and providing no mutual exclusion. The declared contract and its enforcement match: a workload that violates the contract discovers it immediately, at the lock, rather than as corruption discovered later.
+
+### 22.3 Capacity is a quota, and expansion is a metadata write
+
+Object-store-backed capacity is elastic, so PVC capacity maps to the subtree quota (§18.3) rather than to any allocation:
+
+- `resources.requests.storage: 100Gi` → subtree quota 100 GiB, exact, enforced at commit via FDB atomic add.
+- Volume expansion is a quota update: a single metadata transaction, online, no node-side work, no filesystem resize. `NodeExpandVolume` is a no-op and the driver reports `VolumeExpansion: ONLINE`.
+- Shrink is equally trivial (Kubernetes does not permit it; `atlas quota set` does).
+- `NodeGetVolumeStats` reports used bytes and inodes straight from the quota counters, so `kubelet_volume_stats_*` are exact rather than sampled — again a consequence of one authority per subtree.
+
+For ROX volumes over `immutable` subtrees the capacity field is descriptive only; there is nothing to enforce.
+
+### 22.4 Snapshots and clones are free
+
+This is where content addressing pays off most visibly against block-based CSI drivers, for which snapshot and restore are data copies.
+
+- **`VolumeSnapshot`** → seal the subtree's manifest set and record it. Data copied: **zero**. Time: a metadata transaction. Size: the manifest references, not the bytes.
+- **Clone / restore from snapshot** → a new subtree whose files reference the same chunk IDs. Copy-on-write is inherent: chunks are immutable, so a write to the clone produces new chunks and new manifests, and the original is untouched by construction. There is no CoW machinery to implement.
+- **Restore is instant and is not a data movement**, so recovering a 50 TB dataset to a previous version is a metadata operation, not a 50 TB read-write cycle.
+- GC correctness holds because the mark phase (§19.1) walks all reachable manifests, and a snapshot is a root. Chunks shared between a snapshot and a live subtree are reachable from both and survive until neither references them.
+
+### 22.5 Topology and scheduling
+
+- Node topology keys `topology.atlas.io/region` and `topology.atlas.io/zone` are published by the node plugin, and drive both volume topology and AZ-aware P2P peer selection (§11.1).
+- `volumeBindingMode: WaitForFirstConsumer` lets dynamic provisioning choose `home_region` from where the pod actually lands, which is the difference between metadata at LAN latency and metadata across the WAN (§7.1). This should be the default in every StorageClass and the driver warns when it is not.
+- For static PVs over an existing subtree, the driver publishes `nodeAffinity` preferring regions where the subtree is placed. Mounting from elsewhere is permitted but surfaces a warning event carrying the estimated egress cost (§12.3), so a cross-region mount is a visible decision rather than a line on next month's bill.
+- **Scheduler locality** — nodes advertise per-dataset cached-chunk coverage as an extended resource; a scheduler plugin scores nodes by coverage. Similar to Fluid, and there is no reason to be novel here. The difference is that coverage is computed over content-addressed chunk IDs, so it is exact and automatically shared between datasets that overlap.
+
+### 22.6 `AtlasDataset` CRD
+
+Declares a subtree, its placement policy, and prefetch intent; reconciled by the replication controller (§13) under the cost budget (§12.3). Prefetch and pinning are admission-controlled against cache capacity, so over-subscription is rejected up front rather than becoming cache thrash at runtime.
+
+The CRD and the PV are two views of one subtree: `AtlasDataset` expresses *placement and lifecycle*, the PV expresses *how a pod mounts it*. A dataset typically has one `AtlasDataset` and many ROX PVs.
+
+### 22.7 The FUSE-in-a-pod problem
+
+The standard failure of FUSE-based CSI drivers: the mount lives in the node plugin's process, so upgrading or restarting the DaemonSet kills every mount on the node and every workload pod gets `ENOTCONN` — "transport endpoint is not connected" — from which POSIX offers no recovery.
+
+Design:
+
+- Mounts run in **dedicated mount pods whose lifecycle is independent of the CSI node plugin**, with `mountPropagation: Bidirectional` to the host and `HostToContainer` into workload pods. Upgrading the driver does not touch mounts.
+- A small **supervisor process holds the `/dev/fuse` file descriptor** and passes it to the mount daemon over `SCM_RIGHTS`. The supervisor outlives daemon restarts, so the kernel-side FUSE connection survives a daemon upgrade or crash.
+- On restart the daemon **rebuilds its entire in-memory state from the metadata store**. This works only because AtlasFS inode numbers are stable metadata-store identifiers rather than ephemeral pointers into daemon memory — a property of §6 that was not chosen for this reason but makes seamless restart possible. A daemon whose inode numbers were pointer-derived could not do this at all.
+
+Honest limitation: FUSE has no request replay. Requests in flight across the restart window return `EINTR` or `EIO` to the caller. `libatlas` retries these transparently; applications using raw POSIX see a transient error on operations that happened to be in flight. This is a bounded, sub-second window on daemon restart, and it is a substantial improvement on losing the mount entirely — but it is not zero, and workloads that cannot tolerate a transient `EIO` should be drained before a driver upgrade.
+
+### 22.8 `fsGroup`: why the driver declares `None`
+
+The `CSIDriver` object sets `fsGroupPolicy: None`, deliberately.
+
+The default `fsGroupChangePolicy: Always` makes kubelet **recursively `chown` the entire volume** at mount. On W1's 1.28M-file dataset that is 1.28M metadata mutations against the home-region authority on every pod start — minutes of latency, a quota-sized burst of writes, and a `dirver` bump storm that invalidates every cached dentry in the tree (§10.5). On an `immutable` subtree it is not merely slow but impossible, and would fail the mount.
+
+Ownership is instead handled where §20 already puts it: the per-mount idmap, configured through volume attributes.
+
+```yaml
+      volumeAttributes:
+        uid: "1000"
+        gid: "1000"      # presentation-layer squash target; O(1), not O(files)
+```
+
+Authorization remains SPIFFE plus subtree ACLs (§20) and is unaffected by these values. This is the concrete payoff of separating the security boundary from the POSIX presentation layer: Kubernetes' ownership model becomes a mount-time constant instead of a recursive write.
 
 ---
 
-## 23. Observability
+## 23. NFS Export
+
+Not every consumer can run FUSE. Managed Kubernetes control planes restrict privileged DaemonSets and `/dev/fuse` access; VMs and workstations outside the cluster have no CSI driver; non-Linux clients exist. An NFSv4.1 export makes AtlasFS mountable by anything.
+
+### 23.1 Architecture, and the funnel problem
+
+An NFS server on the data path is precisely the centralized bandwidth funnel that §11 removed and that this design forbids. That tension is real and is resolved by construction rather than waved at:
+
+- **The export tier is horizontally scaled and shares no state on the data path.** Each instance is a full AtlasFS client with its own NVMe cache and P2P membership (§11.1). Because chunks are content-addressed and immutable, any instance can serve any read, and correctness never depends on which instance a client reaches.
+- **Client affinity by consistent hash on export path** keeps cache locality high across a scaled tier.
+- Aggregate bandwidth scales with instance count. There is no shared component that all bytes traverse.
+
+Implementation is **nfs-ganesha with an `FSAL_ATLAS` layer over `libatlas`**, not a from-scratch NFS server. NFSv4.1 sessions, delegations, ACLs, and RPCSEC_GSS are a large amount of protocol surface that is not where this project's novelty lies.
+
+**Honest cost:** the export is still a proxy hop. Expect **50–70% of native FUSE throughput**, an extra network round trip on the metadata path, and doubled east-west bandwidth for cache misses. The export is a compatibility and reach path, not the scale path, and §1.1 says so. Where both are available, CSI is the right answer.
+
+**pNFS considered and rejected for v1.** A flexible-file layout would let clients read from data servers directly and remove the proxy hop, but AtlasFS's "data servers" are object stores requiring credentials and chunk-locator resolution that an NFS client cannot perform. Making this work would mean an AtlasFS-aware NFS client, which is a FUSE client with extra steps.
+
+### 23.2 Consistency composes, it does not compound
+
+An NFS client runs its own attribute cache (`acregmin`/`acregmax`, defaults 3–60 s; `acdirmin`/`acdirmax`, 30–60 s) and its own close-to-open rule. Naively stacked, this adds to AtlasFS's staleness: a `relaxed` subtree (D = 30 s) exported with default mount options can be stale by **up to ~90 s**, which is nobody's intent.
+
+Two things prevent that:
+
+1. **Delegations are driven by leases.** Ganesha grants an NFSv4 read delegation only while the instance holds a valid AtlasFS inode lease, and an AtlasFS invalidation (§10.2) or lease expiry triggers delegation recall. The NFS layer therefore inherits §10's coherence rather than layering a second, independent protocol on top of it. This is the whole reason to use NFSv4.1 rather than v3.
+2. **The driver derives mount options from the class** and publishes them in the export, rather than leaving `actimeo` to chance:
+
+| Subtree class | Exported with | Effective staleness |
+|---|---|---|
+| `immutable` | `actimeo=3600,nocto,ro` | none (content cannot change) |
+| `relaxed` | `actimeo=30` | ≤ D + ε |
+| `session` | `actimeo=5` | ≤ D + ε, close-to-open preserved |
+| `posix` | `actimeo=0` + delegations | as G5, at the cost of `actimeo=0` |
+
+The guarantee for an NFS client is the same G1–G5 as for a FUSE client of that class, provided the published mount options are used. A client that overrides `actimeo` upward gets correspondingly weaker guarantees; `atlas nfs check` inspects a live mount and reports the effective bound.
+
+### 23.3 Locking and `O_APPEND`
+
+NFSv4 byte-range locks map onto §17: they are honored only for `posix` subtrees, where the ganesha instance forwards them to the home-region authority. For other classes the export follows the subtree's `lock=` policy, and `lock=error` returns `NFS4ERR_NOTSUPP` rather than granting a lock that means nothing across instances. NFSv3/NLM locking is not offered — it is advisory, stateful in the wrong ways, and its failure modes across a scaled export tier are not defensible.
+
+### 23.4 Identity: the real limitation
+
+**With `AUTH_SYS`, per-client authorization collapses to per-export authorization.** The uid and gid on an `AUTH_SYS` request are asserted by the client and unauthenticated, so the only trustworthy identity is the ganesha instance's own SPIFFE identity — meaning every client of an export shares one authorization identity. This is a genuine reduction in the security model relative to the CSI path (§20), and it is a property of NFS, not something this design can engineer away.
+
+Consequences, stated rather than buried:
+
+- `AUTH_SYS` exports are safe only within a trust boundary, and only one authorization domain per export. The controller refuses to create an `AUTH_SYS` export over a subtree whose ACLs distinguish between principals, because such an export cannot honor those ACLs.
+- **`RPCSEC_GSS` with krb5p restores per-client authorization**, via a Kerberos principal → SPIFFE identity mapping evaluated per request. This is required for multi-tenant exports and the controller enforces it there.
+- NFSv4 `user@domain` idmapping composes with §20's per-mount idmap; the NFSv4 domain becomes the idmap namespace.
+
+### 23.5 NFS as a Kubernetes PV
+
+The two asks meet here. An AtlasFS NFS export can back a stock `nfs` PersistentVolume or `csi-driver-nfs`, so a cluster that cannot install the AtlasFS CSI driver — managed control plane, no privileged DaemonSet, no `/dev/fuse` — can still consume AtlasFS with zero cluster-side installation.
+
+| | AtlasFS CSI (§22) | NFS export as PV |
+|---|---|---|
+| Install | Privileged DaemonSet, `/dev/fuse` | None cluster-side |
+| Throughput | Full (§21.1) | 50–70% |
+| Node-local NVMe cache, P2P | Yes | No — cache lives in the export tier |
+| `mmap` passthrough (§21.3) | Yes | No |
+| Snapshots, quota-as-capacity | Yes | No (plain NFS PV) |
+| Per-pod authorization | Yes (SPIFFE) | Per-export only, unless krb5p |
+| RWX | Per §22.2 | Native |
+
+The honest summary: NFS-as-PV is the compatibility deployment. It trades the cache hierarchy and the authorization model for zero installation, and for W2's `mmap`-heavy checkpoint loading it gives up the single largest performance mechanism in the design. Use it where CSI is not possible, and know what it costs.
+
+---
+
+## 24. Pluggable Backends
+
+### 24.1 The interface is small on purpose
+
+The container-object design (§5.5) means AtlasFS never asks a backend for rename, directory semantics, partial overwrite, append, or listing on the read path. Objects are written once, sealed, read by range, and eventually deleted. That is the whole requirement, and it is why the interface is six methods and why a new backend is days of work rather than months.
+
+```go
+type Backend interface {
+    Get(ctx context.Context, key string, off, length int64) (io.ReadCloser, error)
+    Put(ctx context.Context, key string, r io.Reader, size int64, o PutOpts) (ObjectInfo, error)
+    Delete(ctx context.Context, keys []string) ([]DeleteResult, error)
+    List(ctx context.Context, prefix, cursor string, limit int) (ListPage, error)
+    Stat(ctx context.Context, key string) (ObjectInfo, error)
+    Caps() Caps
+}
+
+type Caps struct {
+    ConditionalPut  bool     // If-None-Match: * / ifGenerationMatch=0
+    MultipartUpload bool
+    BatchDelete     int      // max keys per request; 0 = one at a time
+    MaxObjectSize   int64
+    StorageTiers    []string
+    // feeds the cost model, §12
+    EgressUSDPerGB, GetUSDPer1k, PutUSDPer1k float64
+}
+```
+
+### 24.2 Capability matrix
+
+| Backend | Conditional put | Multipart | Batch delete | Tiers | Notes |
+|---|---|---|---|---|---|
+| **S3** | `If-None-Match: *` | MPU | 1000/req | STANDARD, IA, GLACIER… | Reference implementation |
+| **GCS** | `ifGenerationMatch=0` | Resumable + compose | Batch endpoint | STANDARD, NEARLINE, COLDLINE, ARCHIVE | |
+| **Azure Blob** | `If-None-Match: *` | Block blobs | 256/batch | Hot, Cool, Cold, Archive | |
+| **S3-compatible** (MinIO, Ceph RGW, Cloudflare R2, Wasabi) | Probe at startup | MPU | Varies | Varies | R2 egress is $0, which materially changes §12 |
+| **POSIX** (local NVMe, NFS, EFS, Filestore, Lustre) | `O_EXCL` + rename | n/a — write in place | `unlink` loop | n/a | Covers NFS-as-backend, on-prem, and test fixtures |
+
+Capabilities are **probed at startup, not assumed from the endpoint**, because S3-compatible implementations vary and a wrong assumption about conditional put is a correctness question, not a performance one.
+
+### 24.3 Missing capabilities degrade, they do not disqualify
+
+The metadata store — never the object store — is the source of truth for whether a container is sealed and what a chunk's locator is. That single decision makes every backend capability optional:
+
+| Missing | Consequence |
+|---|---|
+| Conditional put | Seal races produce a duplicate container, which is wasted space reclaimed by GC compaction (§19.1), never a correctness problem. Conditional put is an optimization. |
+| Multipart upload | Container target size drops to `MaxObjectSize`; more, smaller containers; request cost rises and is reflected in §12 |
+| Batch delete | GC sweep issues one request per object; slower and costlier, modeled and reported, never incorrect |
+| Storage tiers | Placement policy tier directives are rejected at validation rather than silently ignored |
+
+### 24.4 Why a weakly-consistent backend is safe
+
+Directly relevant to the POSIX/NFS backend, whose cache consistency is weak:
+
+- **Reads are self-verifying.** Bytes either hash to the chunk ID or they do not. A failed verification falls through to the next source in the hierarchy (§11) exactly as a cache miss would. A backend cannot serve wrong data undetected.
+- **`LIST` is used only by GC sweep**, and only ever to *reduce* the candidate set. A stale listing that omits an object delays its collection; a listing that includes an already-deleted object produces a harmless repeat delete. Neither can cause premature deletion, because deletion eligibility comes from the metadata store plus the grace period (§19.2), not from the listing.
+- **No read-after-write dependency on the backend.** A chunk is referenced only after its locator commits in the metadata store, which happens after the `Put` returns.
+
+So NFS's weak cache consistency, or an S3-compatible implementation with eventually-consistent listing, costs efficiency and never correctness. This is a property of content addressing rather than of careful coding, which is why it holds for backends nobody has written yet.
+
+### 24.5 The metadata store is also an interface, within limits
+
+Required: serializable transactions over an ordered keyspace, range scans, atomic add, and transactions of at least a few MB. Push invalidation (§10.2) is best-effort and runs in-process, so no watch primitive is needed.
+
+| Store | Verdict |
+|---|---|
+| **FoundationDB** | Default. Per region (§7). |
+| **TiKV** | Viable; same shape, different operational profile |
+| **PostgreSQL** | Viable for single-region deployments below ~10M inodes, using `SERIALIZABLE`. Materially lowers the barrier for on-prem and small Kubernetes clusters that will not run FDB. |
+| **etcd** | **Not viable.** ~8 GiB practical database limit, no range transactions at filesystem scale, and it is the cluster's own control plane — filesystem metadata there is an outage waiting to happen. Stated explicitly because it is the first thing Kubernetes users ask. |
+
+The interface exists to make PostgreSQL possible, which is what makes a small on-prem deployment possible. It is not intended to make every KV store possible.
+
+---
+
+## 25. Observability
 
 Non-negotiable metrics, because several are the only way to know whether the design's premises hold in production:
 
@@ -772,7 +1042,7 @@ Non-negotiable metrics, because several are the only way to know whether the des
 
 ---
 
-## 24. Failure Modes
+## 26. Failure Modes
 
 | Failure | Behavior |
 |---|---|
@@ -783,10 +1053,16 @@ Non-negotiable metrics, because several are the only way to know whether the des
 | Invalidation messages all lost | Correctness unaffected (§10.2); staleness degrades toward `D`. Visible as `atlas_invalidation_delivery_ratio` collapse. |
 | Slow writer exceeding `T_write_max` | `ESTALE` client-side, `ATLAS_STALE_UPLOAD` at commit. Never a dangling manifest (§19.2). |
 | Clock anomaly / VM suspend | `CLOCK_BOOTTIME` gap > `ε` expires all leases (§10.7). |
+| CSI node plugin upgraded or crashes | Mounts unaffected — they live in mount pods with an independent lifecycle (§22.7). |
+| Mount daemon restarts | Supervisor retains the `/dev/fuse` fd; daemon rebuilds state from the metadata store using stable inode IDs. In-flight requests return `EINTR`/`EIO` and are retried by `libatlas`; raw-POSIX callers see a transient error (§22.7). |
+| Node drained with a mount pod on it | Workload pods evict first; the mount pod terminates after the last unpublish. A stuck unpublish is force-released after `T_unpublish_force` (default 120 s), which is safe because a partitioned client's leases expire anyway. |
+| NFS export instance fails | Client reconnects to another instance; any instance can serve any read because chunks are content-addressed. In-flight NFSv4.1 sessions are re-established; delegations are recalled and re-acquired (§23.1). |
+| Backend returns corrupt or wrong bytes | Hash mismatch on verification; the read falls through to the next source in the hierarchy exactly like a cache miss (§24.4). Cannot be served undetected. |
+| Backend lacks a probed capability | Degrades per §24.3 — duplicate containers reclaimed by GC, smaller containers, slower sweep. Never a correctness failure. |
 
 ---
 
-## 25. Verification and Correctness Validation
+## 27. Verification and Correctness Validation
 
 Draft 1 had twelve success criteria and none of them was "passes a POSIX conformance suite." Conspicuous, and corrected: these are **gating** criteria, not aspirations.
 
@@ -811,26 +1087,33 @@ Draft 1 had twelve success criteria and none of them was "passes a POSIX conform
 
 ---
 
-## 26. Roadmap and Honest Effort Estimate
+## 28. Roadmap and Honest Effort Estimate
 
-**As specified, this is a 3–5 engineer-year system to reach the §25 bar.** That is a product, not a prototype, and the phases below are ordered so that value lands early and each phase is independently useful.
+**Reaching the §27 bar is a 4–6 engineer-year system as now specified.** That is a product, not a prototype, and the phases below are ordered so that value lands early and each phase is independently useful.
 
 | Phase | Content | Est. |
 |---|---|---|
-| **0** | Quint/TLA+ specs (§10, §7.4); format specs (§5); `atlas dedup-analyze` | 0.25 y |
-| **1** | Single-region, `immutable` only: content-addressed publish and read, packing + locators, atomic publish, FUSE read path. **No general write path.** | 0.5 y |
-| **2** | Coherence protocol (§10), `relaxed` + `session`, node cache, P2P, `libatlas` + `LD_PRELOAD` fast path | 1.0 y |
-| **3** | Mutable write path, `posix` class, locks, `O_APPEND`, quotas, full GC; pjdfstest/fsx/xfstests gating | 1.25 y |
+| **0** | Quint/TLA+ specs (§10, §7.4); format specs (§5); backend interface (§24) + POSIX backend; `atlas dedup-analyze` | 0.3 y |
+| **1** | Single-region, `immutable` only: content-addressed publish and read, packing + locators, atomic publish, FUSE read path, S3 backend, **CSI static ROX provisioning** (§22.1–22.5). **No general write path.** | 0.75 y |
+| **2** | Coherence protocol (§10), `relaxed` + `session`, node cache, P2P, `libatlas` + `LD_PRELOAD` fast path, dynamic provisioning + quota-as-capacity + mount-pod lifecycle (§22.3, §22.7) | 1.25 y |
+| **3** | Mutable write path, `posix` class, locks, `O_APPEND`, quotas, full GC; RWX access modes (§22.2); pjdfstest/fsx/xfstests gating | 1.25 y |
 | **4** | Multi-region homing, namespace map, rehoming, replication controller | 1.0 y |
-| **5** | Cross-cloud, cost governance (§12), K8s integration (§22) | 0.75 y |
+| **5** | Cross-cloud: GCS + Azure backends, cost governance (§12), scheduler locality, `AtlasDataset` CRD | 0.9 y |
+| **6** | NFS export tier: `FSAL_ATLAS`, delegation/lease binding, krb5p identity mapping, scaled tier (§23) | 0.5 y |
 
-**Phase 1 is ~0.5 engineer-years and delivers most of the ML value.** Read-mostly, immutable, content-addressed dataset and checkpoint storage with atomic publish and explicit placement requires no leases, no `posix` class, no in-place writes, almost no GC, and essentially none of §10 — because immutable data is trivially cacheable. It is roughly 10% of the system.
+Two notes on how this moved from Draft 2's 4.75-year estimate:
 
-A reader deciding whether to build the rest should note that Phase 1 is where the ratio of value to effort is by far the best, and that Phases 3 and 4 together are more than half the total cost. Committing to full scope is a legitimate choice; committing to it without having priced Phase 3 is not.
+**Kubernetes support is now load-bearing rather than a bullet, and it moved earlier.** CSI static ROX provisioning lands in Phase 1, because a content-addressed immutable dataset that cannot be mounted as a PVC is not consumable by the workload it targets. That raises Phase 1 from 0.5 to 0.75 engineer-years and makes it a *deployable* increment instead of a demo — the single best change to the plan here.
+
+**Phase 6 is the honest place to cut.** The NFS export is a reach and compatibility path (§23.1), not the scale path, and it is the only phase whose removal costs no capability that CSI already provides to in-cluster consumers. If scope has to shrink, cut Phase 6 first, then Phase 5's Azure backend. Do not cut Phase 0.
+
+**Phase 1 remains where the value-to-effort ratio is by far the best**: read-mostly, immutable, content-addressed dataset and checkpoint storage with atomic publish, explicit placement, and a working PVC needs no leases, no `posix` class, no in-place writes, almost no GC, and essentially none of §10 — because immutable data is trivially cacheable. It is roughly 12% of the total.
+
+Phases 3 and 4 together remain more than half the cost. Committing to full scope is a legitimate choice; committing to it without having priced Phase 3 is not.
 
 ---
 
-## 27. Open Problems
+## 29. Open Problems
 
 Genuinely unresolved, as distinct from unspecified:
 
