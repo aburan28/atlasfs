@@ -40,12 +40,34 @@ type Repo struct {
 
 	ChunkSize int
 	packer    *pack.Packer
+
+	// SingleObjectThreshold overrides pack.SingleObjectThreshold
+	// (defaults to it in Open). DESIGN.md §5.5 fixes this at 64 MiB in
+	// production; it's exposed here so tests can exercise the dedicated-
+	// container code path without allocating and hashing real 64 MiB
+	// files.
+	SingleObjectThreshold int64
 }
 
 // Open opens (or initializes) a repo rooted at dir: dir/meta.db for
 // metadata, dir/objects/ as the local backend's container/manifest
-// object store.
+// object store. This is the local-backend convenience path; OpenRemote
+// takes any store.Backend (DESIGN.md §24's pluggability — S3, GCS,
+// Azure, or a test double all satisfy the same interface).
 func Open(dir string) (*Repo, error) {
+	backend, err := local.New(filepath.Join(dir, "objects"))
+	if err != nil {
+		return nil, err
+	}
+	return OpenRemote(dir, backend, DefaultRegion)
+}
+
+// OpenRemote opens a repo rooted at dir (dir/meta.db for metadata) using
+// a caller-supplied Backend and region, instead of the local-disk
+// default. Use this to point a repo at S3/GCS/Azure while keeping
+// metadata local — the single-node metadb stand-in doesn't need to move
+// for the backend to become real cloud storage.
+func OpenRemote(dir string, backend store.Backend, region string) (*Repo, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -53,17 +75,13 @@ func Open(dir string) (*Repo, error) {
 	if err != nil {
 		return nil, err
 	}
-	backend, err := local.New(filepath.Join(dir, "objects"))
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
 	r := &Repo{
-		Dir:       dir,
-		DB:        db,
-		Backend:   backend,
-		Region:    DefaultRegion,
-		ChunkSize: chunk.DefaultSize,
+		Dir:                   dir,
+		DB:                    db,
+		Backend:               backend,
+		Region:                region,
+		ChunkSize:             chunk.DefaultSize,
+		SingleObjectThreshold: pack.SingleObjectThreshold,
 	}
 	r.packer = pack.NewPacker(backend, r.Region, pack.DefaultSealSize)
 	return r, nil
@@ -138,9 +156,16 @@ func (r *Repo) PublishTree(ctx context.Context, srcDir string, destPath []string
 			return nil
 		}
 
+		if d.Type()&fs.ModeSymlink != 0 {
+			if err := r.publishSymlink(parentInode, d.Name(), p); err != nil {
+				return fmt.Errorf("publish %s: %w", rel, err)
+			}
+			files++
+			return nil
+		}
 		if !d.Type().IsRegular() {
-			// symlinks, devices, etc. are out of scope for this
-			// build's read-only immutable slice.
+			// devices, sockets, FIFOs: out of scope for this build's
+			// read-only immutable slice.
 			return nil
 		}
 		n, err := r.publishFile(ctx, parentInode, d.Name(), p)
@@ -158,6 +183,37 @@ func (r *Repo) PublishTree(ctx context.Context, srcDir string, destPath []string
 		return files, dirs, bytesIn, err
 	}
 	return files, dirs, bytesIn, nil
+}
+
+// publishSymlink stores a symlink's target verbatim in the inode record.
+// A symlink is never chunked or content-addressed: its "content" is the
+// target string, stored directly, matching how a real filesystem
+// handles fast symlinks.
+func (r *Repo) publishSymlink(dir metadb.InodeID, name, srcPath string) error {
+	target, err := os.Readlink(srcPath)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(srcPath)
+	if err != nil {
+		return err
+	}
+	id, err := r.DB.AllocInode()
+	if err != nil {
+		return err
+	}
+	rec := metadb.InodeRecord{
+		Mode:          0o777,
+		Size:          uint64(len(target)),
+		MTime:         info.ModTime(),
+		NLink:         1,
+		IsSymlink:     true,
+		SymlinkTarget: target,
+	}
+	if err := r.DB.PutInode(id, rec); err != nil {
+		return err
+	}
+	return r.createDentryAllowExists(dir, name, id)
 }
 
 func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPath string) (int64, error) {
@@ -185,7 +241,7 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 		return 0, r.createDentryAllowExists(dir, name, id)
 	}
 
-	useSingleObject := size >= pack.SingleObjectThreshold
+	useSingleObject := size >= r.SingleObjectThreshold
 	chunks, err := chunk.SplitAll(f, r.ChunkSize)
 	if err != nil {
 		return 0, err

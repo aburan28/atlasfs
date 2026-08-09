@@ -46,12 +46,26 @@ func usage() {
 	fmt.Fprint(os.Stderr, `atlas — AtlasFS single-node repo tool (Phase 1: immutable class only)
 
 Usage:
-  atlas publish <repo-dir> <src-dir> [dest-path]   ingest a directory tree, content-addressed
-  atlas ls      <repo-dir> [path]                  list a directory
-  atlas cat     <repo-dir> <path>                  print a file's content to stdout
-  atlas stat    <repo-dir> <path>                  print an inode's metadata
-  atlas mount   <repo-dir> <mountpoint>             read-only FUSE mount (foreground)
+  atlas publish [flags] <repo-dir> <src-dir> [dest-path]   ingest a directory tree, content-addressed
+  atlas ls      [flags] <repo-dir> [path]                  list a directory
+  atlas cat     [flags] <repo-dir> <path>                  print a file's content to stdout
+  atlas stat    [flags] <repo-dir> <path>                  print an inode's metadata
+  atlas mount   [flags] <repo-dir> <mountpoint>             read-only FUSE mount (foreground)
 
-repo-dir is created on first publish. See DESIGN.md §5/§16 for the format.
+repo-dir is created on first publish; metadata always lives there locally
+(DESIGN.md §24.5's single-node metadb stand-in for per-region FDB).
+
+Flags (every subcommand, DESIGN.md §24 pluggable backends):
+  -backend local|s3      object storage backend (default local)
+  -s3-bucket NAME         S3 bucket (required for -backend=s3)
+  -s3-region REGION       AWS region for the S3 client (default us-east-1)
+  -s3-endpoint URL        S3-compatible endpoint override, e.g. MinIO
+  -s3-prefix PREFIX       key prefix within the bucket
+  -region NAME            AtlasFS locator region label (default local)
+
+AWS credentials for -backend=s3 follow the SDK's normal chain (env vars,
+shared config, IMDS) — never passed as a flag.
+
+See DESIGN.md §5/§16 for the on-disk format.
 `)
 }

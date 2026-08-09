@@ -253,6 +253,113 @@ func TestReaddirAndDirectoryStructure(t *testing.T) {
 	}
 }
 
+func TestSingleObjectThresholdPath(t *testing.T) {
+	// DESIGN.md §5.5: files at or above the threshold get dedicated,
+	// unpacked containers (1:1 chunk-to-object) instead of going through
+	// the shared packer. Force a tiny threshold so the test exercises
+	// that path without allocating a real 64 MiB file.
+	ctx := context.Background()
+	src := t.TempDir()
+	data := make([]byte, 20*1024) // 20KiB, several 4KiB chunks
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, src, "checkpoint.bin", data)
+
+	r, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	r.ChunkSize = 4096
+	r.SingleObjectThreshold = 16 * 1024 // below the 20KiB file, above nothing else
+
+	if _, _, _, err := r.PublishTree(ctx, src, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, rec, err := r.Resolve("/checkpoint.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.HasManifest {
+		t.Fatal("large file should still get a manifest even on the single-object path")
+	}
+
+	m, err := r.getManifest(ctx, rec.ManifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Entries) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(m.Entries))
+	}
+
+	// Every chunk on this path must have landed in its own dedicated
+	// container (no packing indirection) — assert no two chunks share a
+	// container key.
+	seen := map[string]bool{}
+	for _, e := range m.Entries {
+		loc, found, err := r.DB.GetLocator(r.Region, e.ChunkID)
+		if err != nil || !found {
+			t.Fatalf("missing locator for chunk %s", e.ChunkID)
+		}
+		if seen[loc.Container] {
+			t.Fatalf("chunk %s shares a container with another chunk: %s (should be dedicated per DESIGN.md §5.5)", e.ChunkID, loc.Container)
+		}
+		seen[loc.Container] = true
+		if loc.Offset != 0 {
+			t.Fatalf("dedicated container should start at offset 0, got %d", loc.Offset)
+		}
+	}
+
+	fr, err := r.OpenFile(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fr.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("single-object-path file content mismatch on read-back")
+	}
+}
+
+func TestPublishAndResolveSymlink(t *testing.T) {
+	ctx := context.Background()
+	src := t.TempDir()
+	writeFile(t, src, "real/target.txt", []byte("real content"))
+	if err := os.MkdirAll(filepath.Join(src, "link"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../real/target.txt", filepath.Join(src, "link", "to-target.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	files, _, _, err := r.PublishTree(ctx, src, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files != 2 { // target.txt + the symlink itself
+		t.Fatalf("expected 2 published files (1 regular + 1 symlink), got %d", files)
+	}
+
+	_, rec, err := r.Resolve("/link/to-target.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.IsSymlink {
+		t.Fatal("expected an IsSymlink inode")
+	}
+	if rec.SymlinkTarget != "../real/target.txt" {
+		t.Fatalf("got target %q, want %q", rec.SymlinkTarget, "../real/target.txt")
+	}
+}
+
 func TestFetchVerifiesHash(t *testing.T) {
 	// Sanity: pack.Fetch (used by FileReader.chunkBytes) is exercised
 	// through the repo read path in the tests above; this confirms the

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -10,20 +11,31 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/aburan28/atlasfs/pkg/fuseserver"
-	"github.com/aburan28/atlasfs/pkg/repo"
 )
 
 func cmdMount(ctx context.Context, args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: atlas mount <repo-dir> <mountpoint>")
+	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
+	var bf backendFlags
+	addBackendFlags(fs, &bf)
+	fs.Usage = func() {
+		fmt.Println("usage: atlas mount [flags] <repo-dir> <mountpoint>")
+		fs.PrintDefaults()
 	}
-	repoDir, mountpoint := args[0], args[1]
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) < 2 {
+		fs.Usage()
+		return fmt.Errorf("usage: atlas mount [flags] <repo-dir> <mountpoint>")
+	}
+	repoDir, mountpoint := pos[0], pos[1]
 
 	if _, err := os.Stat(mountpoint); err != nil {
 		return fmt.Errorf("mountpoint: %w", err)
 	}
 
-	r, err := repo.Open(repoDir)
+	r, err := openRepo(ctx, repoDir, bf)
 	if err != nil {
 		return err
 	}

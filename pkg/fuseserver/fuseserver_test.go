@@ -32,6 +32,9 @@ func TestMountReadBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustWrite(t, filepath.Join(src, "data", "big.bin"), big)
+	if err := os.Symlink("hello.txt", filepath.Join(src, "hello-link.txt")); err != nil {
+		t.Fatal(err)
+	}
 
 	repoDir := t.TempDir()
 	r, err := repo.Open(repoDir)
@@ -94,8 +97,23 @@ func TestMountReadBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 top-level entries, got %d", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 top-level entries, got %d", len(entries))
+	}
+
+	linkTarget, err := os.Readlink(filepath.Join(mountpoint, "hello-link.txt"))
+	if err != nil {
+		t.Fatalf("readlink through FUSE mount: %v", err)
+	}
+	if linkTarget != "hello.txt" {
+		t.Fatalf("got symlink target %q, want %q", linkTarget, "hello.txt")
+	}
+	gotViaLink, err := os.ReadFile(filepath.Join(mountpoint, "hello-link.txt"))
+	if err != nil {
+		t.Fatalf("read through symlink: %v", err)
+	}
+	if string(gotViaLink) != "hello atlasfs" {
+		t.Fatalf("read through symlink got %q", gotViaLink)
 	}
 
 	// The mount is read-only end to end: DESIGN.md §8's `immutable`

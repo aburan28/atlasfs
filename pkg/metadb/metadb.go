@@ -57,6 +57,13 @@ type InodeRecord struct {
 	ManifestID  manifest.ID
 	HasInline   bool
 	InlineChunk chunk.ID
+
+	// IsSymlink and SymlinkTarget hold a symlink's target path verbatim.
+	// A symlink is never chunked or content-addressed — its "content"
+	// is the target string, small and stored directly in the inode
+	// record, the same way a real filesystem treats a fast symlink.
+	IsSymlink     bool
+	SymlinkTarget string
 }
 
 type DirEntry struct {

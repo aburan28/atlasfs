@@ -31,10 +31,11 @@ type Node struct {
 }
 
 var (
-	_ fs.NodeLookuper  = (*Node)(nil)
-	_ fs.NodeReaddirer = (*Node)(nil)
-	_ fs.NodeGetattrer = (*Node)(nil)
-	_ fs.NodeOpener    = (*Node)(nil)
+	_ fs.NodeLookuper   = (*Node)(nil)
+	_ fs.NodeReaddirer  = (*Node)(nil)
+	_ fs.NodeGetattrer  = (*Node)(nil)
+	_ fs.NodeOpener     = (*Node)(nil)
+	_ fs.NodeReadlinker = (*Node)(nil)
 )
 
 func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -51,13 +52,41 @@ func (n *Node) fillAttrOut(out *fuse.Attr) {
 	out.Mtime = sec
 	out.Atime = sec
 	out.Ctime = sec
-	if n.rec.IsDir {
+	switch {
+	case n.rec.IsDir:
 		out.Mode = syscall.S_IFDIR | 0o555
 		out.Nlink = 2
-	} else {
+	case n.rec.IsSymlink:
+		out.Mode = syscall.S_IFLNK | 0o777
+		out.Nlink = 1
+	default:
 		out.Mode = syscall.S_IFREG | 0o444
 		out.Nlink = 1
 	}
+}
+
+// direntMode is the raw type bits (S_IFDIR/S_IFLNK/S_IFREG) go-fuse
+// needs for a StableAttr or DirEntry — the permission bits live in
+// fillAttrOut instead, since directory listings and Lookup don't carry
+// full attrs.
+func direntMode(rec metadb.InodeRecord) uint32 {
+	switch {
+	case rec.IsDir:
+		return syscall.S_IFDIR
+	case rec.IsSymlink:
+		return syscall.S_IFLNK
+	default:
+		return syscall.S_IFREG
+	}
+}
+
+// Readlink returns a symlink's target. The kernel calls this instead of
+// Open when resolving a symlink node.
+func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	if !n.rec.IsSymlink {
+		return nil, syscall.EINVAL
+	}
+	return []byte(n.rec.SymlinkTarget), 0
 }
 
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -74,11 +103,7 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	}
 	child := &Node{repo: n.repo, ino: childIno, rec: rec}
 	child.fillAttrOut(&out.Attr)
-	mode := uint32(syscall.S_IFREG)
-	if rec.IsDir {
-		mode = syscall.S_IFDIR
-	}
-	stable := fs.StableAttr{Mode: mode, Ino: uint64(childIno)}
+	stable := fs.StableAttr{Mode: direntMode(rec), Ino: uint64(childIno)}
 	inode := n.NewInode(ctx, child, stable)
 	return inode, 0
 }
@@ -97,11 +122,7 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		if err != nil {
 			continue
 		}
-		mode := uint32(syscall.S_IFREG)
-		if rec.IsDir {
-			mode = syscall.S_IFDIR
-		}
-		list = append(list, fuse.DirEntry{Name: e.Name, Ino: uint64(e.Inode), Mode: mode})
+		list = append(list, fuse.DirEntry{Name: e.Name, Ino: uint64(e.Inode), Mode: direntMode(rec)})
 	}
 	return fs.NewListDirStream(list), 0
 }
@@ -109,6 +130,9 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if n.rec.IsDir {
 		return nil, 0, syscall.EISDIR
+	}
+	if n.rec.IsSymlink {
+		return nil, 0, syscall.EINVAL
 	}
 	// Read-only mount: writes are rejected before they ever reach a
 	// FileReader (DESIGN.md §8's `immutable` class — mutation is

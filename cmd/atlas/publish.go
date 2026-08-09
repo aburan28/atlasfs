@@ -2,23 +2,34 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"time"
-
-	"github.com/aburan28/atlasfs/pkg/repo"
 )
 
 func cmdPublish(ctx context.Context, args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: atlas publish <repo-dir> <src-dir> [dest-path]")
+	fs := flag.NewFlagSet("publish", flag.ContinueOnError)
+	var bf backendFlags
+	addBackendFlags(fs, &bf)
+	fs.Usage = func() {
+		fmt.Println("usage: atlas publish [flags] <repo-dir> <src-dir> [dest-path]")
+		fs.PrintDefaults()
 	}
-	repoDir, srcDir := args[0], args[1]
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) < 2 {
+		fs.Usage()
+		return fmt.Errorf("usage: atlas publish [flags] <repo-dir> <src-dir> [dest-path]")
+	}
+	repoDir, srcDir := pos[0], pos[1]
 	dest := "/"
-	if len(args) >= 3 {
-		dest = args[2]
+	if len(pos) >= 3 {
+		dest = pos[2]
 	}
 
-	r, err := repo.Open(repoDir)
+	r, err := openRepo(ctx, repoDir, bf)
 	if err != nil {
 		return err
 	}
