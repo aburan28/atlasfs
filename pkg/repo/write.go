@@ -1,0 +1,259 @@
+// Mutable write path for non-immutable repos (DESIGN.md §16.1, §8).
+//
+// Writes buffer in memory and commit as a unit on Close — the same
+// buffer-then-chunk-on-close model §16.1 describes for the general
+// write path, not an in-place random-access byte-range writer. That
+// scope is deliberate: arbitrary O_RDWR mid-file writes, O_APPEND, and
+// byte-range locks are §16.3/§17's `posix`-class territory, explicitly
+// out of scope for this build (see pkg/coherence's package doc).
+//
+// Overwriting an existing name reuses that name's existing inode ID and
+// swaps its content pointer in one metadb transaction — DESIGN.md
+// §16.1's "the manifest swap is atomic: a reader sees either the old
+// manifest or the new one, never a partial file" — rather than
+// allocating a fresh inode per write, which is what makes a cached
+// lookup-by-inode-ID (pkg/coherence's per-object leases) a meaningful
+// thing to invalidate on overwrite instead of silently going stale.
+package repo
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/aburan28/atlasfs/pkg/metadb"
+)
+
+// Sentinel errors for the mutable write path, distinguished so a caller
+// like pkg/fuseserver can map each one to the right errno instead of a
+// generic EIO for everything.
+var (
+	ErrReadOnly      = errors.New("repo: repo is immutable-class, read-only")
+	ErrExists        = errors.New("repo: name already exists")
+	ErrIsDirectory   = errors.New("repo: is a directory")
+	ErrNotDir        = errors.New("repo: not a directory")
+	ErrNotEmpty      = errors.New("repo: directory not empty")
+	ErrQuotaExceeded = errors.New("repo: quota exceeded")
+)
+
+func InodeCoherenceKey(id metadb.InodeID) string { return fmt.Sprintf("inode:%d", id) }
+func DirCoherenceKey(id metadb.InodeID) string   { return fmt.Sprintf("dir:%d", id) }
+
+// SetQuota sets this repo's byte and inode limits (DESIGN.md §18.3). A
+// zero value means unlimited for that dimension. This build has exactly
+// one subtree per repo (see pkg/metadb's package doc), so there is one
+// quota scope rather than a per-subtree one.
+func (r *Repo) SetQuota(bytesLimit, inodesLimit uint64) error {
+	return r.DB.SetQuotaLimits(bytesLimit, inodesLimit)
+}
+
+// QuotaUsage reports current byte and inode usage against this repo's
+// quota (DESIGN.md §18.3).
+func (r *Repo) QuotaUsage() (bytesUsed, inodesUsed uint64, err error) {
+	return r.DB.GetQuotaUsage()
+}
+
+// WriteHandle buffers a new or replacement file's content. Nothing is
+// visible in the namespace until Commit.
+type WriteHandle struct {
+	repo *Repo
+	dir  metadb.InodeID
+	name string
+	buf  bytes.Buffer
+	done bool
+}
+
+// CreateFile opens a buffered write handle for name within dir. Fails
+// with ErrReadOnly outside a mutable class. Does not touch the
+// namespace or check for an existing name — that's resolved atomically
+// at Commit, matching §16.1: nothing before Commit is observable to a
+// reader.
+func (r *Repo) CreateFile(dir metadb.InodeID, name string) (*WriteHandle, error) {
+	if !r.Class.Mutable() {
+		return nil, ErrReadOnly
+	}
+	return &WriteHandle{repo: r, dir: dir, name: name}, nil
+}
+
+// Write buffers p. Never fails except after Commit/Discard.
+func (h *WriteHandle) Write(p []byte) (int, error) {
+	if h.done {
+		return 0, fmt.Errorf("repo: write to a committed or discarded handle")
+	}
+	return h.buf.Write(p)
+}
+
+// Discard abandons the handle; nothing is committed. Idempotent.
+func (h *WriteHandle) Discard() { h.done = true }
+
+// Commit chunks the buffered content (DESIGN.md §16.1), stores it via
+// the same dedup-checked path publish uses (storeContent), and binds it
+// into the namespace: an existing name's inode is updated in place, a
+// new name gets a fresh inode. Fires the coherence invalidations that
+// make the update visible to a lease-holding reader — bumping both the
+// file's own object key (an existing cached attr/manifest lookup by
+// inode ID is now stale) and the parent directory's version (a lookup
+// or negative-cache entry for this name is now stale).
+func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
+	if h.done {
+		return 0, fmt.Errorf("repo: Commit called on an already-committed or discarded handle")
+	}
+	h.done = true
+	r := h.repo
+
+	// Resolve the target name before doing any real storage work, both
+	// to compute the byte delta an overwrite charges (new size minus old
+	// size — an overwrite must not double-count the bytes it replaces)
+	// and to reject an over-quota write via CheckQuota before chunking,
+	// hashing, and packing content that would just be thrown away: a
+	// rejection here leaves no dangling chunk locator. CommitFile below
+	// re-resolves and re-checks atomically with the actual write, which
+	// is what actually enforces the limit (DESIGN.md §18.3) — this is
+	// only the fast, non-authoritative path that keeps the common case
+	// cheap and trace-free.
+	existing, lookupErr := r.DB.Lookup(h.dir, h.name)
+	isNew := errors.Is(lookupErr, metadb.ErrNotFound)
+	var oldSize uint64
+	switch {
+	case lookupErr == nil:
+		existingRec, err := r.DB.GetInode(existing)
+		if err != nil {
+			return 0, err
+		}
+		if existingRec.IsDir {
+			return 0, fmt.Errorf("%w: %q", ErrIsDirectory, h.name)
+		}
+		oldSize = existingRec.Size
+	case isNew:
+		// nothing bound yet: oldSize stays 0
+	default:
+		return 0, lookupErr
+	}
+
+	inodeDelta := int64(0)
+	if isNew {
+		inodeDelta = 1
+	}
+	byteDelta := int64(h.buf.Len()) - int64(oldSize)
+	if err := r.DB.CheckQuota(byteDelta, inodeDelta); err != nil {
+		return 0, ErrQuotaExceeded
+	}
+
+	content, err := r.storeContent(ctx, bytes.NewReader(h.buf.Bytes()), int64(h.buf.Len()))
+	if err != nil {
+		return 0, err
+	}
+	// Unlike PublishTree — which defers sealing across an entire walk
+	// for packing efficiency and flushes once at the end — a standalone
+	// Commit has no "end of walk" to defer to: its chunk must be
+	// durable and locatable the moment Commit returns, so it flushes
+	// its own (likely partial) container immediately. This trades some
+	// packing efficiency on the mutable path for correctness; a busier
+	// mutable workload batching multiple Commits before an explicit
+	// flush is a real future optimization, not attempted here.
+	if err := r.flushPacker(ctx); err != nil {
+		return 0, err
+	}
+
+	rec := metadb.InodeRecord{Mode: 0o644, MTime: time.Now(), NLink: 1}
+	content.apply(&rec)
+
+	id, err := r.DB.CommitFile(h.dir, h.name, rec)
+	if err != nil {
+		switch {
+		case errors.Is(err, metadb.ErrIsDirectory):
+			return 0, fmt.Errorf("%w: %q", ErrIsDirectory, h.name)
+		case errors.Is(err, metadb.ErrQuotaExceeded):
+			return 0, ErrQuotaExceeded
+		default:
+			return 0, err
+		}
+	}
+
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
+		r.Coherence.BumpDir(DirCoherenceKey(h.dir))
+	}
+	return id, nil
+}
+
+// Unlink removes name from dir, moving the target inode into the
+// graveyard (DESIGN.md §19.3) rather than reclaiming it immediately —
+// pkg/repo.Sweep is what later collects its chunks, once past the grace
+// period. This build has no open-file-handle tracking across process
+// boundaries (single process only — see gc.go's doc comment), so unlike
+// real §19.3, an inode is gravable immediately on unlink rather than
+// only once its last open handle closes; that gap is stated, not
+// hidden.
+func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
+	if !r.Class.Mutable() {
+		return ErrReadOnly
+	}
+	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
+		return err
+	}
+	if r.Coherence != nil {
+		r.Coherence.BumpDir(DirCoherenceKey(dir))
+	}
+	return nil
+}
+
+// Mkdir creates a new, empty directory named name under dir. Fails with
+// EEXIST-equivalent if name is already bound to anything — unlike
+// WriteHandle.Commit, mkdir(2) never silently overwrites.
+func (r *Repo) Mkdir(dir metadb.InodeID, name string) (metadb.InodeID, error) {
+	if !r.Class.Mutable() {
+		return 0, ErrReadOnly
+	}
+	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2})
+	if err != nil {
+		switch {
+		case errors.Is(err, metadb.ErrExists):
+			return 0, fmt.Errorf("%w: %q", ErrExists, name)
+		case errors.Is(err, metadb.ErrQuotaExceeded):
+			return 0, ErrQuotaExceeded
+		default:
+			return 0, err
+		}
+	}
+	if r.Coherence != nil {
+		r.Coherence.BumpDir(DirCoherenceKey(dir))
+	}
+	return id, nil
+}
+
+// Rmdir removes an empty directory named name under dir. Fails if the
+// directory is not empty — the same restriction POSIX rmdir(2) imposes,
+// kept here rather than silently recursing.
+func (r *Repo) Rmdir(dir metadb.InodeID, name string) error {
+	if !r.Class.Mutable() {
+		return ErrReadOnly
+	}
+	id, err := r.DB.Lookup(dir, name)
+	if err != nil {
+		return err
+	}
+	rec, err := r.DB.GetInode(id)
+	if err != nil {
+		return err
+	}
+	if !rec.IsDir {
+		return fmt.Errorf("%w: %q", ErrNotDir, name)
+	}
+	entries, err := r.DB.Readdir(id)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("%w: %q", ErrNotEmpty, name)
+	}
+	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
+		return err
+	}
+	if r.Coherence != nil {
+		r.Coherence.BumpDir(DirCoherenceKey(dir))
+	}
+	return nil
+}
