@@ -12,6 +12,7 @@ import (
 
 	"github.com/aburan28/atlasfs/pkg/mds"
 	"github.com/aburan28/atlasfs/pkg/metadb"
+	"github.com/aburan28/atlasfs/pkg/repo"
 )
 
 // The mutating half of the mount. Every operation here is a round trip
@@ -28,6 +29,7 @@ var (
 	_ fs.NodeRenamer   = (*Node)(nil)
 	_ fs.NodeSymlinker = (*Node)(nil)
 	_ fs.NodeLinker    = (*Node)(nil)
+	_ fs.NodeStatfser  = (*Node)(nil)
 )
 
 // errnoFor maps an authority failure back to the errno a filesystem
@@ -249,6 +251,29 @@ func (n *Node) binding() (metadb.InodeID, string) {
 	defer n.mu.Unlock()
 	return n.parent, n.name
 }
+
+// Statfs answers df from the authority's quota — the only capacity
+// numbers that mean anything here (see pkg/repo/statfs.go).
+func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	resp, err := n.cfg.Client.Statfs(ctx)
+	if err != nil {
+		return errnoFor(err)
+	}
+	info := repo.StatfsInfoFrom(resp.BytesLimit, resp.InodesLimit, resp.BytesUsed, resp.InodesUsed)
+	out.Bsize, out.Frsize = statfsBlockSize, statfsBlockSize
+	out.Blocks = info.Total / statfsBlockSize
+	free := info.Free() / statfsBlockSize
+	out.Bfree, out.Bavail = free, free
+	out.Files = info.Files
+	out.Ffree = info.FilesFree()
+	out.NameLen = 255
+	return 0
+}
+
+// statfsBlockSize is the unit df divides by — a reporting unit, not an
+// allocation unit: content-addressed chunks live in packed containers
+// (§5.4), so there is no on-disk block to match.
+const statfsBlockSize = 4096
 
 // Link binds name in this directory to an already-existing inode. It
 // returns the existing node rather than a fresh one: two names for one

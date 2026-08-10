@@ -92,6 +92,7 @@ var (
 	_ fs.NodeRenamer    = (*Node)(nil)
 	_ fs.NodeSymlinker  = (*Node)(nil)
 	_ fs.NodeLinker     = (*Node)(nil)
+	_ fs.NodeStatfser   = (*Node)(nil)
 )
 
 // binding reads the dentry this node is currently bound to. Rename
@@ -212,6 +213,33 @@ func direntMode(rec metadb.InodeRecord) uint32 {
 	default:
 		return syscall.S_IFREG
 	}
+}
+
+// Statfs answers df. See pkg/repo/statfs.go for why the numbers are the
+// quota's and not the backend's.
+func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	info, err := n.repo.Statfs()
+	if err != nil {
+		return syscall.EIO
+	}
+	fillStatfs(info, out)
+	return 0
+}
+
+// statfsBlockSize is the unit df divides by. It is a reporting unit, not
+// an allocation unit — this filesystem stores content-addressed chunks in
+// packed containers (§5.4), so there is no on-disk block to match.
+const statfsBlockSize = 4096
+
+func fillStatfs(info repo.StatfsInfo, out *fuse.StatfsOut) {
+	out.Bsize = statfsBlockSize
+	out.Frsize = statfsBlockSize
+	out.Blocks = info.Total / statfsBlockSize
+	free := info.Free() / statfsBlockSize
+	out.Bfree, out.Bavail = free, free
+	out.Files = info.Files
+	out.Ffree = info.FilesFree()
+	out.NameLen = 255
 }
 
 func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {

@@ -488,6 +488,13 @@ func (c *Client) Rename(ctx context.Context, oldDir metadb.InodeID, oldName stri
 	return err
 }
 
+// Statfs asks the authority for the subtree's quota and usage.
+func (c *Client) Statfs(ctx context.Context) (StatfsResponse, error) {
+	var resp StatfsResponse
+	err := c.cc.Invoke(ctx, MethodStatfs, &StatfsRequest{Holder: c.holder}, &resp)
+	return resp, err
+}
+
 // Link binds another name to target and returns its updated record.
 func (c *Client) Link(ctx context.Context, dir metadb.InodeID, name string, target metadb.InodeID) (metadb.InodeRecord, error) {
 	var resp LinkResponse

@@ -249,6 +249,7 @@ const (
 	MethodRename     = "/" + ServiceName + "/Rename"
 	MethodSymlink    = "/" + ServiceName + "/Symlink"
 	MethodLink       = "/" + ServiceName + "/Link"
+	MethodStatfs     = "/" + ServiceName + "/Statfs"
 )
 
 // RenameRequest moves a binding. Both directories are named because a
@@ -292,4 +293,20 @@ type LinkRequest struct {
 
 type LinkResponse struct {
 	Record metadb.InodeRecord `json:"record"`
+}
+
+// StatfsRequest asks the authority for the subtree's quota and usage —
+// the only capacity numbers that mean anything for an object-backed
+// filesystem (§18.3). A zero limit means unlimited for that dimension;
+// turning that into something df can print is the mount's job, not the
+// authority's, so the wire carries the raw quota.
+type StatfsRequest struct {
+	Holder string `json:"holder"`
+}
+
+type StatfsResponse struct {
+	BytesLimit  uint64 `json:"bytesLimit"`
+	InodesLimit uint64 `json:"inodesLimit"`
+	BytesUsed   uint64 `json:"bytesUsed"`
+	InodesUsed  uint64 `json:"inodesUsed"`
 }

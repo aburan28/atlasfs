@@ -428,6 +428,25 @@ func (s *Server) Rename(ctx context.Context, req *RenameRequest) (*RenameRespons
 	return &RenameResponse{}, nil
 }
 
+// Statfs reports the subtree's quota and usage. It is not cached under a
+// lease: usage changes on every write from every holder, so a leased copy
+// would be stale far more often than not, and df is rare enough that the
+// round trip costs nothing worth saving.
+func (s *Server) Statfs(ctx context.Context, req *StatfsRequest) (*StatfsResponse, error) {
+	bytesLimit, inodesLimit, err := s.db.GetQuotaLimits()
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	bytesUsed, inodesUsed, err := s.db.GetQuotaUsage()
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &StatfsResponse{
+		BytesLimit: bytesLimit, InodesLimit: inodesLimit,
+		BytesUsed: bytesUsed, InodesUsed: inodesUsed,
+	}, nil
+}
+
 // Link binds another name to an existing inode. Both lease domains move
 // (§10.5): the directory gained a name, and the inode's nlink changed.
 func (s *Server) Link(ctx context.Context, req *LinkRequest) (*LinkResponse, error) {
