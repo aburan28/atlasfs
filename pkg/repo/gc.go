@@ -17,6 +17,10 @@
 //     reachable from the live tree or a not-yet-expired graveyard
 //     entry) is never swept regardless of which timestamp gated the
 //     scan.
+//   - §19.3's nlink half *is* implemented: an inode with more than one
+//     name only enters the graveyard when its last name goes (see
+//     metadb's dropLinkTx), so unlinking one of two hard links leaves
+//     the surviving name's chunks reachable by the mark phase.
 //   - §19.3's "open-but-unlinked" guarantee — an inode staying reachable
 //     while any client holds an open handle, via a leased open-handle
 //     registry — is not implemented. This build has no open-file-handle

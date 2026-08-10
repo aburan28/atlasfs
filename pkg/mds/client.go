@@ -488,6 +488,17 @@ func (c *Client) Rename(ctx context.Context, oldDir metadb.InodeID, oldName stri
 	return err
 }
 
+// Link binds another name to target and returns its updated record.
+func (c *Client) Link(ctx context.Context, dir metadb.InodeID, name string, target metadb.InodeID) (metadb.InodeRecord, error) {
+	var resp LinkResponse
+	err := c.cc.Invoke(ctx, MethodLink, &LinkRequest{Holder: c.holder, Dir: dir, Name: name, Target: target}, &resp)
+	if err == nil {
+		c.invalidate(inodeObj(target))
+		c.invalidateOwnMutation(dir)
+	}
+	return resp.Record, err
+}
+
 func (c *Client) Symlink(ctx context.Context, dir metadb.InodeID, name, target string) (metadb.InodeID, error) {
 	var resp SymlinkResponse
 	err := c.cc.Invoke(ctx, MethodSymlink, &SymlinkRequest{Holder: c.holder, Dir: dir, Name: name, Target: target}, &resp)

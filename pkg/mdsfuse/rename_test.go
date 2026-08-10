@@ -229,3 +229,42 @@ func TestRenameAndSymlinkRefusedOnReadOnlyMount(t *testing.T) {
 		t.Fatal("expected rename on a read-only mount to fail")
 	}
 }
+
+// TestHardLinkThroughAuthority: `ln` across the RPC boundary, and the
+// property that matters — removing one name leaves the other readable.
+func TestHardLinkThroughAuthority(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
+	mnt := c.mountAt(t, "writer", 0)
+
+	orig := filepath.Join(mnt, "orig")
+	link := filepath.Join(mnt, "link")
+	if err := os.WriteFile(orig, []byte("shared through the authority"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("ln", orig, link).CombinedOutput(); err != nil {
+		t.Fatalf("ln: %v: %s", err, out)
+	}
+
+	oi, err := os.Stat(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	li, err := os.Stat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(oi, li) {
+		t.Fatal("the two names do not share an inode")
+	}
+	if n := li.Sys().(*syscall.Stat_t).Nlink; n != 2 {
+		t.Fatalf("nlink through the authority = %d, want 2", n)
+	}
+
+	if err := os.Remove(orig); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(link)
+	if err != nil || string(got) != "shared through the authority" {
+		t.Fatalf("surviving link reads %q err=%v", got, err)
+	}
+}

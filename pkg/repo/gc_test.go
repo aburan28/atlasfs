@@ -443,3 +443,66 @@ func TestPublishRejectedOverQuota(t *testing.T) {
 		t.Fatalf("PublishTree over quota = %v, want ErrQuotaExceeded", err)
 	}
 }
+
+// TestSweepPreservesAHardLinkedFile is the §19.3 hazard in its concrete
+// form. Two names, one inode: removing one name must not grave the
+// inode, or Sweep would reclaim chunks the surviving name still reads.
+// Distinct from TestSweepPreservesChunkSharedByALiveInode above, which
+// covers dedup — two inodes sharing a chunk — rather than one inode with
+// two names.
+func TestSweepPreservesAHardLinkedFile(t *testing.T) {
+	r, clk := openRelaxedWithClock(t)
+	ctx := context.Background()
+
+	data := bytes.Repeat([]byte("hard-linked-"), 50)
+	writeCommit(t, r, metadb.RootInode, "one", data)
+	id, err := r.DB.Lookup(metadb.RootInode, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Link(metadb.RootInode, "two", id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Unlink(metadb.RootInode, "one"); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(DefaultGraceDuration + time.Hour)
+
+	collected, err := r.Sweep(ctx, DefaultGraceDuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 0 {
+		t.Fatalf("Sweep collected %d inodes; the file is still named \"two\"", collected)
+	}
+
+	_, rec, err := r.Resolve("/two")
+	if err != nil {
+		t.Fatalf("surviving link no longer resolves: %v", err)
+	}
+	fr, err := r.OpenFile(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fr.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("surviving link's content was reclaimed by Sweep")
+	}
+
+	// And once the last name goes, it does become collectable.
+	if err := r.Unlink(metadb.RootInode, "two"); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(DefaultGraceDuration + time.Hour)
+	collected, err = r.Sweep(ctx, DefaultGraceDuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected == 0 {
+		t.Fatal("Sweep collected nothing after the last name was removed")
+	}
+}

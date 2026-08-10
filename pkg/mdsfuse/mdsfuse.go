@@ -27,16 +27,18 @@
 //
 // This mount serves the POSIX surface this build implements: lookup,
 // getattr, readdir, readlink, open, read, create, write, truncate,
-// unlink, mkdir, rmdir, rename and symlink. Writes follow DESIGN.md
+// unlink, mkdir, rmdir, rename, symlink and hard links. Writes follow DESIGN.md
 // §16.1's upload-then-commit — the client chunks and uploads to the
 // backend itself, then calls Commit — so the bytes still never cross the
 // authority.
 //
 // What it does not do is §16.3's in-place random-access writes: a file's
 // content is buffered and committed as a unit on flush, the same cut
-// pkg/repo/write.go makes. Hard links (§6's NLink is written but never
-// exceeds 1) and a uid/gid model (§20) are likewise unimplemented on
-// both mounts. Unifying this mount and pkg/fuseserver behind one node
+// pkg/repo/write.go makes. A uid/gid model (§20) is likewise
+// unimplemented on both mounts, and §19.3's open-but-unlinked handle
+// tracking is not there either: an unlink graves the inode once its last
+// name goes, without waiting for open handles to close. Unifying this
+// mount and pkg/fuseserver behind one node
 // implementation remains follow-up work; they are two node types sharing
 // a design, not one shared implementation.
 package mdsfuse
@@ -188,7 +190,14 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 			// invite an EROFS later.
 			mode = 0o444
 		}
-		out.Mode, out.Nlink = syscall.S_IFREG|mode, 1
+		// The stored link count, not a constant: a hard-linked file
+		// reporting 1 would tell a caller it is safe to delete the last
+		// name when it is not.
+		nlink := uint32(rec.NLink)
+		if nlink == 0 {
+			nlink = 1
+		}
+		out.Mode, out.Nlink = syscall.S_IFREG|mode, nlink
 	}
 }
 

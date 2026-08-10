@@ -287,6 +287,25 @@ func (r *Repo) Rename(oldDir metadb.InodeID, oldName string, newDir metadb.Inode
 	return nil
 }
 
+// Link binds an additional name to an existing inode (DESIGN.md §19.3).
+// Both leases move: the directory gains a name, and the inode's own
+// nlink changed, which §10.5 puts in the inode's lease domain.
+func (r *Repo) Link(dir metadb.InodeID, name string, target metadb.InodeID) (metadb.InodeRecord, error) {
+	if !r.Class.Mutable() {
+		return metadb.InodeRecord{}, ErrReadOnly
+	}
+	rec, err := r.DB.Link(dir, name, target)
+	if err != nil {
+		return metadb.InodeRecord{}, err
+	}
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(target))
+		r.Coherence.BumpDir(DirCoherenceKey(dir))
+		r.Coherence.Bump(DirCoherenceKey(dir))
+	}
+	return rec, nil
+}
+
 // Symlink creates a symlink at (dir, name) pointing at target.
 func (r *Repo) Symlink(dir metadb.InodeID, name, target string) (metadb.InodeID, error) {
 	if !r.Class.Mutable() {

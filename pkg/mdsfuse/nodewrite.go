@@ -27,6 +27,7 @@ var (
 	_ fs.NodeSetattrer = (*Node)(nil)
 	_ fs.NodeRenamer   = (*Node)(nil)
 	_ fs.NodeSymlinker = (*Node)(nil)
+	_ fs.NodeLinker    = (*Node)(nil)
 )
 
 // errnoFor maps an authority failure back to the errno a filesystem
@@ -247,6 +248,26 @@ func (n *Node) binding() (metadb.InodeID, string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.parent, n.name
+}
+
+// Link binds name in this directory to an already-existing inode. It
+// returns the existing node rather than a fresh one: two names for one
+// inode is the point, and a second node would give the kernel two inode
+// identities for the same file.
+func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.cfg.ReadOnly {
+		return nil, syscall.EROFS
+	}
+	tn, ok := target.(*Node)
+	if !ok {
+		return nil, syscall.EXDEV
+	}
+	rec, err := n.cfg.Client.Link(ctx, n.ino, name, tn.ino)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
+	return tn.EmbeddedInode(), 0
 }
 
 func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

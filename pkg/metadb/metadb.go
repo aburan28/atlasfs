@@ -332,11 +332,76 @@ func (db *DB) RemoveEntry(dir InodeID, name string, deletedAt time.Time) error {
 		if err := tx.Bucket(bucketDentry).Delete(dentryKey(dir, name)); err != nil {
 			return err
 		}
-		if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
+		return dropLinkTx(tx, id, rec, deletedAt)
+	})
+}
+
+// dropLinkTx removes one reference to an inode: nlink falls by one, and
+// only when it reaches zero does the inode go to the graveyard and give
+// its quota back (DESIGN.md §19.3 — nlink is updated transactionally
+// with link/unlink, and the graveyard is what a zero-link inode enters
+// instead of being deleted outright).
+//
+// Graving an inode that still has another name bound to it would make
+// GC reclaim chunks the surviving link still reads, so the count is not
+// bookkeeping — it is what keeps a hard-linked file readable after one
+// of its names is removed.
+func dropLinkTx(tx *bbolt.Tx, id InodeID, rec InodeRecord, deletedAt time.Time) error {
+	// A directory's NLink is 2 by convention ("." plus its parent's
+	// entry), not a hard-link count — Link refuses directories, so that 2
+	// can never mean two names. Decrementing it here would leave every
+	// rmdir'd directory un-graved and its inode unreclaimable.
+	if !rec.IsDir && rec.NLink > 1 {
+		rec.NLink--
+		return putInode(tx, id, rec)
+	}
+	if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
+		return err
+	}
+	return addToGraveyardTx(tx, id, deletedAt)
+}
+
+// Link binds an additional name to an existing inode (§19.3). It is
+// refused for directories — POSIX reserves directory hard links to the
+// kernel's own "." and ".." — and it charges no quota: a link creates a
+// dentry, not an inode, and the bytes were already counted once.
+func (db *DB) Link(dir InodeID, name string, target InodeID) (InodeRecord, error) {
+	var out InodeRecord
+	err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		rec, err := getInodeTx(tx, target)
+		if err != nil {
 			return err
 		}
-		return addToGraveyardTx(tx, id, deletedAt)
+		if rec.IsDir {
+			return ErrIsDirectory
+		}
+		if dirRec, err := getInodeTx(tx, dir); err != nil {
+			return err
+		} else if !dirRec.IsDir {
+			return ErrNotDir
+		}
+		if _, err := lookupTx(tx, dir, name); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if rec.NLink == 0 {
+			// Records written before nlink was tracked read back as 0;
+			// treating that as one existing link keeps the count honest
+			// rather than letting the first link make it 1.
+			rec.NLink = 1
+		}
+		rec.NLink++
+		if err := putInode(tx, target, rec); err != nil {
+			return err
+		}
+		if err := setDentryTx(tx, dir, name, target); err != nil {
+			return err
+		}
+		out = rec
+		return nil
 	})
+	return out, err
 }
 
 // Rename moves the binding at (oldDir, oldName) to (newDir, newName),
@@ -404,12 +469,11 @@ func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName str
 					return ErrNotEmpty
 				}
 			}
-			// Displace the target: release its quota and grave it, the
-			// same treatment an explicit unlink would give.
-			if err := applyQuotaDeltaTx(tx, -int64(dstRec.Size), -1); err != nil {
-				return err
-			}
-			if err := addToGraveyardTx(tx, dstID, deletedAt); err != nil {
+			// Displace the target: exactly the treatment an explicit
+			// unlink would give, nlink included — a displaced name that
+			// was one of several hard links must not grave the inode the
+			// other links still read.
+			if err := dropLinkTx(tx, dstID, dstRec, deletedAt); err != nil {
 				return err
 			}
 		} else if !errors.Is(err, ErrNotFound) {
@@ -1048,6 +1112,15 @@ func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID,
 			}
 			id = existing
 			oldSize = existingRec.Size
+			// The caller supplies content and mtime, not link count.
+			// Taking rec's NLink verbatim would reset a hard-linked
+			// file's count to 1 on every overwrite, after which removing
+			// one of its names would grave an inode the other name still
+			// resolves to — and GC would then reclaim chunks a live file
+			// reads.
+			if existingRec.NLink > 1 {
+				rec.NLink = existingRec.NLink
+			}
 		case isNew:
 			newID, err := allocInodeTx(tx)
 			if err != nil {

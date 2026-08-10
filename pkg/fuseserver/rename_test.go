@@ -236,3 +236,86 @@ func TestMountSymlinkOnImmutableIsReadOnly(t *testing.T) {
 		t.Fatal("expected rename on an immutable mount to fail")
 	}
 }
+
+// TestMountHardLink exercises `ln` (no -s) through a real mount: two
+// names, one inode, and removing one name leaves the other readable.
+// That last part is the property DESIGN.md §19.3 is about — an early
+// grave would let GC reclaim chunks the surviving name still reads.
+func TestMountHardLink(t *testing.T) {
+	_, mnt := mountWritable(t)
+
+	orig := filepath.Join(mnt, "orig")
+	link := filepath.Join(mnt, "link")
+	if err := os.WriteFile(orig, []byte("shared bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("ln", orig, link).CombinedOutput(); err != nil {
+		t.Fatalf("ln through the mount: %v: %s", err, out)
+	}
+
+	origInfo, err := os.Stat(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkInfo, err := os.Stat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(origInfo, linkInfo) {
+		t.Fatal("the two names do not share an inode; this is a copy, not a link")
+	}
+	if n := linkInfo.Sys().(*syscall.Stat_t).Nlink; n != 2 {
+		t.Fatalf("nlink reported through stat = %d, want 2", n)
+	}
+
+	if err := os.Remove(orig); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(link)
+	if err != nil {
+		t.Fatalf("surviving link unreadable after the other name was removed: %v", err)
+	}
+	if string(got) != "shared bytes" {
+		t.Fatalf("surviving link reads %q, want %q", got, "shared bytes")
+	}
+	after, err := os.Stat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := after.Sys().(*syscall.Stat_t).Nlink; n != 1 {
+		t.Fatalf("nlink after removing one name = %d, want 1", n)
+	}
+}
+
+// TestMountHardLinkRefusals: linking a directory and linking over an
+// existing name are both errors, and the errnos are the ones `ln` prints.
+func TestMountHardLinkRefusals(t *testing.T) {
+	_, mnt := mountWritable(t)
+
+	if err := os.Mkdir(filepath.Join(mnt, "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mnt, "f"), []byte("f"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mnt, "taken"), []byte("t"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := os.Link(filepath.Join(mnt, "d"), filepath.Join(mnt, "dlink"))
+	if err == nil {
+		t.Fatal("expected linking a directory to fail")
+	}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) || (errno != syscall.EPERM && errno != syscall.EISDIR) {
+		// Linux's VFS returns EPERM for a directory hard link before the
+		// filesystem is consulted; EISDIR is what this filesystem would
+		// return on its own. Either is a correct refusal.
+		t.Fatalf("got %v (errno %d), want EPERM or EISDIR", err, errno)
+	}
+
+	err = os.Link(filepath.Join(mnt, "f"), filepath.Join(mnt, "taken"))
+	if !errors.As(err, &errno) || errno != syscall.EEXIST {
+		t.Fatalf("linking over an existing name: got %v, want EEXIST", err)
+	}
+}

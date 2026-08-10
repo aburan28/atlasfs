@@ -91,6 +91,7 @@ var (
 	_ fs.NodeSetattrer  = (*Node)(nil)
 	_ fs.NodeRenamer    = (*Node)(nil)
 	_ fs.NodeSymlinker  = (*Node)(nil)
+	_ fs.NodeLinker     = (*Node)(nil)
 )
 
 // binding reads the dentry this node is currently bound to. Rename
@@ -188,7 +189,13 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 			mode = 0o644
 		}
 		out.Mode = syscall.S_IFREG | mode
-		out.Nlink = 1
+		// The stored count, not a constant: `ls -l` and `find -links`
+		// read it, and a hard-linked file reporting 1 would tell a
+		// caller it is safe to delete the last name when it is not.
+		out.Nlink = uint32(rec.NLink)
+		if out.Nlink == 0 {
+			out.Nlink = 1
+		}
 	}
 }
 
@@ -437,6 +444,24 @@ func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		}
 	}
 	return 0
+}
+
+// Link binds name in this directory to an already-existing inode. The
+// returned *fs.Inode is the existing node, not a new one — two names for
+// one inode is the entire point, and handing back a fresh node would
+// give the kernel two inode identities for the same file.
+func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	tn, ok := target.(*Node)
+	if !ok {
+		return nil, syscall.EXDEV
+	}
+	rec, err := n.repo.Link(n.ino, name, tn.ino)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	tn.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return tn.EmbeddedInode(), 0
 }
 
 func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

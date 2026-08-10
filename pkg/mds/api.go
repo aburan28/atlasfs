@@ -248,6 +248,7 @@ const (
 	MethodRmdir      = "/" + ServiceName + "/Rmdir"
 	MethodRename     = "/" + ServiceName + "/Rename"
 	MethodSymlink    = "/" + ServiceName + "/Symlink"
+	MethodLink       = "/" + ServiceName + "/Link"
 )
 
 // RenameRequest moves a binding. Both directories are named because a
@@ -276,4 +277,19 @@ type SymlinkRequest struct {
 
 type SymlinkResponse struct {
 	Inode metadb.InodeID `json:"inode"`
+}
+
+// LinkRequest binds an additional name to an existing inode (§19.3).
+// The response carries the updated record because the caller needs the
+// new nlink to report from stat, and fetching it separately would race
+// another link or unlink.
+type LinkRequest struct {
+	Holder string         `json:"holder"`
+	Dir    metadb.InodeID `json:"dir"`
+	Name   string         `json:"name"`
+	Target metadb.InodeID `json:"target"`
+}
+
+type LinkResponse struct {
+	Record metadb.InodeRecord `json:"record"`
 }

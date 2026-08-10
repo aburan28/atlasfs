@@ -428,6 +428,20 @@ func (s *Server) Rename(ctx context.Context, req *RenameRequest) (*RenameRespons
 	return &RenameResponse{}, nil
 }
 
+// Link binds another name to an existing inode. Both lease domains move
+// (§10.5): the directory gained a name, and the inode's nlink changed.
+func (s *Server) Link(ctx context.Context, req *LinkRequest) (*LinkResponse, error) {
+	rec, err := s.db.Link(req.Dir, req.Name, req.Target)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	if s.coh != nil {
+		s.coh.Bump(inodeObj(req.Target))
+	}
+	s.bumpDir(req.Dir)
+	return &LinkResponse{Record: rec}, nil
+}
+
 func (s *Server) Symlink(ctx context.Context, req *SymlinkRequest) (*SymlinkResponse, error) {
 	id, err := s.db.CreateSymlink(req.Dir, req.Name, req.Target)
 	if err != nil {

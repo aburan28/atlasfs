@@ -189,3 +189,125 @@ func TestCreateSymlinkRecord(t *testing.T) {
 		t.Fatalf("got %v, want ErrExists", err)
 	}
 }
+
+// TestLinkTracksNLink is DESIGN.md §19.3's core property: an inode with
+// more than one name must survive losing one of them. Graving it early
+// would let GC reclaim chunks the surviving name still reads.
+func TestLinkTracksNLink(t *testing.T) {
+	db := openTestDB(t)
+	id := mustFile(t, db, RootInode, "one", 100)
+
+	rec, err := db.Link(RootInode, "two", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.NLink != 2 {
+		t.Fatalf("nlink after link = %d, want 2", rec.NLink)
+	}
+	if got, err := db.Lookup(RootInode, "two"); err != nil || got != id {
+		t.Fatalf("second name resolves to %d err=%v, want %d", got, err, id)
+	}
+
+	// A link creates a dentry, not an inode, and duplicates no bytes.
+	bytesUsed, inodesUsed, err := db.GetQuotaUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesUsed != 100 || inodesUsed != 1 {
+		t.Fatalf("usage after link = %d bytes / %d inodes, want 100/1", bytesUsed, inodesUsed)
+	}
+
+	if err := db.RemoveEntry(RootInode, "one", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := db.GetInode(id)
+	if err != nil {
+		t.Fatalf("inode gone while a name still points at it: %v", err)
+	}
+	if after.NLink != 1 {
+		t.Fatalf("nlink after removing one of two names = %d, want 1", after.NLink)
+	}
+	graves, err := db.ListGraveyard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graves) != 0 {
+		t.Fatalf("inode graved with a name still bound: %+v", graves)
+	}
+
+	// The last name going is what graves it.
+	if err := db.RemoveEntry(RootInode, "two", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	graves, err = db.ListGraveyard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graves) != 1 || graves[0].InodeID != id {
+		t.Fatalf("last unlink did not grave the inode: %+v", graves)
+	}
+	if bytesUsed, inodesUsed, _ := db.GetQuotaUsage(); bytesUsed != 0 || inodesUsed != 0 {
+		t.Fatalf("quota not released on the last unlink: %d bytes / %d inodes", bytesUsed, inodesUsed)
+	}
+}
+
+// TestOverwriteKeepsNLink: CommitFile takes a caller-built record whose
+// NLink is 1, and writing that verbatim would reset a hard-linked file's
+// count — after which removing one name would grave an inode the other
+// name still resolves to.
+func TestOverwriteKeepsNLink(t *testing.T) {
+	db := openTestDB(t)
+	id := mustFile(t, db, RootInode, "one", 10)
+	if _, err := db.Link(RootInode, "two", id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CommitFile(RootInode, "one", InodeRecord{Mode: 0o644, Size: 20, NLink: 1, MTime: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := db.GetInode(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.NLink != 2 {
+		t.Fatalf("nlink after overwriting one of two names = %d, want 2", rec.NLink)
+	}
+	if rec.Size != 20 {
+		t.Fatalf("overwrite did not take effect: size = %d", rec.Size)
+	}
+}
+
+func TestLinkRefusals(t *testing.T) {
+	db := openTestDB(t)
+	dir := mustDir(t, db, RootInode, "d")
+	id := mustFile(t, db, RootInode, "f", 1)
+	mustFile(t, db, RootInode, "taken", 1)
+
+	// POSIX reserves directory hard links to the kernel's own "."/"..".
+	if _, err := db.Link(RootInode, "dlink", dir); !errors.Is(err, ErrIsDirectory) {
+		t.Fatalf("linking a directory: got %v, want ErrIsDirectory", err)
+	}
+	if _, err := db.Link(RootInode, "taken", id); !errors.Is(err, ErrExists) {
+		t.Fatalf("linking over an existing name: got %v, want ErrExists", err)
+	}
+	if _, err := db.Link(RootInode, "x", 99999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("linking a missing inode: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestRmdirStillGravesTheDirectory guards the interaction between nlink
+// and a directory's conventional NLink of 2: decrementing that instead of
+// graving would leave every removed directory unreclaimable.
+func TestRmdirStillGravesTheDirectory(t *testing.T) {
+	db := openTestDB(t)
+	id := mustDir(t, db, RootInode, "gone")
+	if err := db.RemoveEntry(RootInode, "gone", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	graves, err := db.ListGraveyard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graves) != 1 || graves[0].InodeID != id {
+		t.Fatalf("rmdir did not grave the directory inode: %+v", graves)
+	}
+}
