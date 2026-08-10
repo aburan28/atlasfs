@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
@@ -44,6 +46,14 @@ const (
 	ClassImmutable Class = "immutable"
 	ClassRelaxed   Class = "relaxed"
 	ClassSession   Class = "session"
+
+	// ClassPosix is DESIGN.md §8's linearizable class. Its staleness
+	// bound is D = 0, achieved by §10.6's blocking recall rather than by
+	// a short lease — see LeaseDuration. It is served by cmd/atlas-mds,
+	// which has real remote holders to recall from; the in-process
+	// pkg/fuseserver path does not offer it, because a single holder
+	// cannot demonstrate the property that distinguishes the class.
+	ClassPosix Class = "posix"
 )
 
 // leaseDuration returns DESIGN.md §8's stated default lease duration
@@ -55,10 +65,68 @@ func (c Class) leaseDuration() time.Duration {
 		return 5 * time.Second
 	case ClassRelaxed:
 		return 30 * time.Second
+	case ClassPosix:
+		return posixLeaseDuration
 	default:
 		return 0
 	}
 }
+
+// LeaseDuration exports leaseDuration for callers outside this package
+// (cmd/atlas-mds configures a pkg/mds.Server from it).
+func (c Class) LeaseDuration() time.Duration { return c.leaseDuration() }
+
+// posixLeaseDuration is long on purpose, and it is not a contradiction
+// of §8.1's "D = 0" for the `posix` class. D bounds *staleness*, and for
+// posix that bound is enforced by §10.6's blocking recall — a mutation
+// cannot commit until holders have given their copies up — not by
+// waiting for a lease to lapse. A short lease would add revalidation
+// traffic on every read while changing the staleness bound not at all,
+// since recall already drives it to zero. The lease still exists so that
+// a holder which loses contact with the authority eventually stops
+// trusting its cache on its own clock (§10.7).
+const posixLeaseDuration = time.Hour
+
+// KernelCacheTTL is how long a kernel-side attribute or dentry cache
+// entry may be trusted for this class — the `D` of DESIGN.md §10 applied
+// to the one cache holder the design never names explicitly: the kernel
+// itself. A FUSE mount that leaves the kernel's attr/entry timeouts at
+// zero has not made itself more correct, only slower; it has moved every
+// getattr into a userspace round trip while §10's lease machinery sits
+// unused one layer down. Handing the kernel exactly the class's own D
+// makes it a well-behaved holder under the same bound every other holder
+// obeys.
+//
+// ClassImmutable gets a long but finite TTL rather than an infinite one,
+// because §8.2 is explicit that `immutable` means "this content does not
+// change", not "this path never rebinds" — republishing over a path is
+// legal, and a client that cached the old binding forever would never
+// see it.
+func (c Class) KernelCacheTTL() time.Duration {
+	switch c {
+	case ClassImmutable, "":
+		return immutableKernelCacheTTL
+	case ClassPosix:
+		// Zero, and not posixLeaseDuration. The kernel's attr cache
+		// cannot participate in §10.6's recall — there is no way to ask
+		// it to drop an entry and acknowledge — so any non-zero TTL here
+		// would let the kernel answer a getattr from a copy the recall
+		// protocol believes was surrendered. `posix` buys D = 0 by paying
+		// a round trip per operation; caching in the one layer that
+		// cannot be recalled would spend the guarantee to get the cost
+		// back.
+		return 0
+	default:
+		return c.leaseDuration()
+	}
+}
+
+// immutableKernelCacheTTL bounds how stale an `immutable` binding may be
+// after a republish (DESIGN.md §8.2). One minute is a judgement call, not
+// a figure from the design: long enough that a tree walk over a published
+// dataset is served from the kernel, short enough that a republish shows
+// up without an unmount.
+const immutableKernelCacheTTL = time.Minute
 
 // Mutable reports whether this class permits Create/Write/Unlink/Mkdir
 // after initial publish. Only ClassImmutable is not.
@@ -161,6 +229,25 @@ func OpenWithClass(dir string, backend store.Backend, region string, class Class
 	return r, nil
 }
 
+// SetChunkAlignment makes every chunk this repo packs from now on start
+// on an n-byte boundary within its container. Pass pack.GDSAlignment to
+// make containers readable by GPUDirect Storage without falling into its
+// bounce-buffer path; pass 0 for tight packing (the default).
+//
+// This is a per-deployment choice with a real cost, not a free
+// improvement: measured at ~4x container inflation for 1 KiB files
+// (pkg/pack's TestAlignmentPaddingCost), because DESIGN.md §14's
+// small-file packing is exactly what padding undoes. Datasets read by
+// GPUs want it; a repo full of small files read by CPUs does not.
+//
+// Existing chunks are unaffected — their locators already point at
+// wherever they were written, and alignment changes nothing about how a
+// locator is interpreted.
+func (r *Repo) SetChunkAlignment(n int) { r.packer.SetAlignment(n) }
+
+// ChunkAlignment reports the current chunk-start alignment.
+func (r *Repo) ChunkAlignment() int { return r.packer.Alignment() }
+
 func (r *Repo) Close() error { return r.DB.Close() }
 
 func manifestKey(id manifest.ID) string {
@@ -206,24 +293,22 @@ func (r *Repo) PublishTree(ctx context.Context, srcDir string, destPath []string
 		}
 
 		if d.IsDir() {
-			id, err := r.DB.AllocInode()
-			if err != nil {
-				return err
-			}
 			info, err := d.Info()
 			if err != nil {
 				return err
 			}
-			if err := r.DB.PutInode(id, metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: info.ModTime(), NLink: 2}); err != nil {
-				return err
+			uid, gid := ownerOf(info)
+			rec := metadb.InodeRecord{
+				IsDir: true, Mode: permOf(info.Mode()),
+				Uid: uid, Gid: gid, MTime: info.ModTime(), NLink: 2,
 			}
-			if err := r.DB.CreateDentry(parentInode, d.Name(), id); err != nil && !errors.Is(err, metadb.ErrExists) {
-				return err
-			} else if errors.Is(err, metadb.ErrExists) {
-				id, err = r.DB.Lookup(parentInode, d.Name())
-				if err != nil {
+			id, err := r.DB.CommitMkdir(parentInode, d.Name(), rec)
+			if errors.Is(err, metadb.ErrExists) {
+				if id, err = r.DB.Lookup(parentInode, d.Name()); err != nil {
 					return err
 				}
+			} else if err != nil {
+				return err
 			}
 			dirInodes[rel] = id
 			dirs++
@@ -272,22 +357,21 @@ func (r *Repo) publishSymlink(dir metadb.InodeID, name, srcPath string) error {
 	if err != nil {
 		return err
 	}
-	id, err := r.DB.AllocInode()
-	if err != nil {
-		return err
-	}
+	uid, gid := ownerOf(info)
 	rec := metadb.InodeRecord{
 		Mode:          0o777,
+		Uid:           uid,
+		Gid:           gid,
 		Size:          uint64(len(target)),
 		MTime:         info.ModTime(),
 		NLink:         1,
 		IsSymlink:     true,
 		SymlinkTarget: target,
 	}
-	if err := r.DB.PutInode(id, rec); err != nil {
-		return err
+	if _, err := r.DB.PublishFile(dir, name, rec); err != nil {
+		return publishBindErr(name, err)
 	}
-	return r.createDentryAllowExists(dir, name, id)
+	return nil
 }
 
 func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPath string) (int64, error) {
@@ -302,21 +386,37 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 	}
 	size := info.Size()
 
-	id, err := r.DB.AllocInode()
-	if err != nil {
-		return 0, err
-	}
-
 	content, err := r.storeContent(ctx, f, size)
 	if err != nil {
 		return 0, err
 	}
-	rec := metadb.InodeRecord{Mode: 0o644, MTime: info.ModTime(), NLink: 1}
+	// The source's own permission bits, not a constant: publishing a
+	// tree of executables and mounting it has to give back executables,
+	// and a hardcoded 0o644 silently strips every exec bit in the tree.
+	uid, gid := ownerOf(info)
+	rec := metadb.InodeRecord{Mode: permOf(info.Mode()), Uid: uid, Gid: gid, MTime: info.ModTime(), NLink: 1}
 	content.apply(&rec)
-	if err := r.DB.PutInode(id, rec); err != nil {
-		return 0, err
+	if _, err := r.DB.PublishFile(dir, name, rec); err != nil {
+		return 0, publishBindErr(name, err)
 	}
-	return size, r.createDentryAllowExists(dir, name, id)
+	return size, nil
+}
+
+// permOf extracts the permission bits from a source file's mode.
+// A source file with no permission bits publishes with none: preserving
+// the tree means preserving it, not second-guessing an unusual mode.
+func permOf(m os.FileMode) uint32 { return uint32(m.Perm()) }
+
+// ownerOf reads a source file's uid/gid so a published tree keeps its
+// ownership (DESIGN.md §20). The syscall-level stat is behind an
+// interface assertion because os.FileInfo.Sys() is platform-specific;
+// on anything that does not supply it, the tree publishes as root-owned,
+// which is what it did before ownership existed at all.
+func ownerOf(info os.FileInfo) (uid, gid uint32) {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Uid, st.Gid
+	}
+	return 0, 0
 }
 
 // contentRef is the chunk/manifest-shaped part of an InodeRecord, the
@@ -370,8 +470,12 @@ func (r *Repo) storeContent(ctx context.Context, rd io.Reader, size int64) (cont
 	return contentRef{size: uint64(size), hasManifest: true, manifestID: mid}, nil
 }
 
-func (r *Repo) createDentryAllowExists(dir metadb.InodeID, name string, id metadb.InodeID) error {
-	err := r.DB.CreateDentry(dir, name, id)
+// publishBindErr turns metadb's sentinel into the message the publish
+// path has always given for a name collision, and passes everything else
+// (notably ErrQuotaExceeded, which publish can now return since it
+// charges the quota it consumes) through unwrapped so callers can still
+// match on it.
+func publishBindErr(name string, err error) error {
 	if errors.Is(err, metadb.ErrExists) {
 		return fmt.Errorf("repo: %q already published in this directory (immutable class: republish under a new path or version)", name)
 	}
@@ -471,8 +575,44 @@ type FileReader struct {
 	m       *manifest.Manifest
 	offsets []int64
 
+	// mu guards cache/cacheQ. One FileReader backs one open fd, and the
+	// kernel serves concurrent READ requests on a single fd from several
+	// go-fuse goroutines at once — so "one handle, one goroutine" is not
+	// true here. Without this the chunk cache takes concurrent map writes
+	// and the process dies with a fatal error, not a recoverable one.
+	// (Found by a benchmark: a 16 MiB sequential read is enough
+	// parallelism to hit it, and `go test -race` never did because no
+	// test read one handle from two goroutines.)
+	mu     sync.Mutex
 	cache  map[chunk.ID][]byte
 	cacheQ []chunk.ID
+}
+
+// cached looks a chunk up under the lock.
+func (fr *FileReader) cached(id chunk.ID) ([]byte, bool) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	b, ok := fr.cache[id]
+	return b, ok
+}
+
+// store adds a chunk to the cache, evicting the oldest past the bound.
+func (fr *FileReader) store(id chunk.ID, buf []byte) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if _, dup := fr.cache[id]; dup {
+		// Another goroutine fetched the same chunk concurrently. Keeping
+		// the first is arbitrary but must be consistent: appending to
+		// cacheQ twice would evict the entry while the map still held it.
+		return
+	}
+	fr.cache[id] = buf
+	fr.cacheQ = append(fr.cacheQ, id)
+	if len(fr.cacheQ) > fileReaderCacheEntries {
+		old := fr.cacheQ[0]
+		fr.cacheQ = fr.cacheQ[1:]
+		delete(fr.cache, old)
+	}
 }
 
 const fileReaderCacheEntries = 16
@@ -499,29 +639,54 @@ func (r *Repo) OpenFile(ctx context.Context, rec metadb.InodeRecord) (*FileReade
 	return fr, nil
 }
 
-func (fr *FileReader) chunkBytes(id chunk.ID) ([]byte, error) {
-	if b, ok := fr.cache[id]; ok {
-		return b, nil
-	}
+// locate resolves a chunk ID to its locator in this repo's region.
+func (fr *FileReader) locate(id chunk.ID) (pack.Locator, error) {
 	loc, found, err := fr.repo.DB.GetLocator(fr.repo.Region, id)
 	if err != nil {
-		return nil, err
+		return pack.Locator{}, err
 	}
 	if !found {
-		return nil, fmt.Errorf("repo: chunk %s: no locator in region %s", id, fr.repo.Region)
+		return pack.Locator{}, fmt.Errorf("repo: chunk %s: no locator in region %s", id, fr.repo.Region)
 	}
-	data, err := pack.Fetch(fr.ctx, fr.repo.Backend, id, loc)
+	return loc, nil
+}
+
+// readChunkInto fetches a whole chunk directly into p, which must be
+// exactly the chunk's length. This is the path that carries no
+// allocation at all: the destination is the caller's, and verification
+// happens in place (pack.FetchInto).
+func (fr *FileReader) readChunkInto(id chunk.ID, p []byte) error {
+	loc, err := fr.locate(id)
+	if err != nil {
+		return err
+	}
+	return pack.FetchInto(fr.ctx, fr.repo.Backend, id, loc, p)
+}
+
+// chunkBytes returns a chunk's bytes, caching them so repeated reads
+// within the same file (the random-access pattern) do not refetch. It
+// reuses a pooled buffer per fetch rather than letting io.ReadAll size
+// one by doubling — the same bytes end up cached either way, but the
+// transient garbage does not.
+func (fr *FileReader) chunkBytes(id chunk.ID) ([]byte, error) {
+	if b, ok := fr.cached(id); ok {
+		return b, nil
+	}
+	loc, err := fr.locate(id)
 	if err != nil {
 		return nil, err
 	}
-	fr.cache[id] = data
-	fr.cacheQ = append(fr.cacheQ, id)
-	if len(fr.cacheQ) > fileReaderCacheEntries {
-		old := fr.cacheQ[0]
-		fr.cacheQ = fr.cacheQ[1:]
-		delete(fr.cache, old)
+	// The fetch happens outside the lock: it is a network round trip, and
+	// holding the cache lock across it would serialize every concurrent
+	// reader of the file behind the slowest one. Two goroutines racing on
+	// the same chunk both fetch it; store keeps one. Duplicated work on a
+	// rare race beats a lock held across I/O.
+	buf := make([]byte, loc.Length)
+	if err := pack.FetchInto(fr.ctx, fr.repo.Backend, id, loc, buf); err != nil {
+		return nil, err
 	}
-	return data, nil
+	fr.store(id, buf)
+	return buf, nil
 }
 
 // ReadAt implements io.ReaderAt.
@@ -557,11 +722,29 @@ func (fr *FileReader) ReadAt(p []byte, off int64) (int, error) {
 			break
 		}
 		entry := fr.m.Entries[idx]
+		localOff := off - fr.offsets[idx]
+
+		// Fast path: this read starts exactly on a chunk boundary and has
+		// room for the whole chunk, and the chunk is not already cached.
+		// The chunk can then land directly in the caller's buffer — no
+		// intermediate allocation and no copy. This is the shape a
+		// GPUDirect destination would take, which is why it is worth
+		// having even though the sequential-read win alone would justify
+		// it (a whole-file read is entirely made of such chunks).
+		if _, isCached := fr.cached(entry.ChunkID); !isCached && localOff == 0 && len(p)-total >= int(entry.Length) {
+			dst := p[total : total+int(entry.Length)]
+			if err := fr.readChunkInto(entry.ChunkID, dst); err != nil {
+				return total, err
+			}
+			total += int(entry.Length)
+			off += int64(entry.Length)
+			continue
+		}
+
 		data, err := fr.chunkBytes(entry.ChunkID)
 		if err != nil {
 			return total, err
 		}
-		localOff := off - fr.offsets[idx]
 		n := copy(p[total:], data[localOff:])
 		total += n
 		off += int64(n)

@@ -274,3 +274,235 @@ func TestPublishUnlinkSweepEndToEnd(t *testing.T) {
 		t.Fatalf("keep.txt content = %q, want %q", got, "keep me around")
 	}
 }
+
+// backendBytes totals the size of every object the backend holds. This
+// is the number that matters for DESIGN.md §19.1 step 3: before
+// compaction existed, a Sweep could report chunks "collected" while this
+// figure never moved, because deleting a locator does not delete the
+// bytes it pointed into.
+func backendBytes(t *testing.T, r *Repo) int64 {
+	t.Helper()
+	ctx := context.Background()
+	var total int64
+	cursor := ""
+	for {
+		page, err := r.Backend.List(ctx, "", cursor, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range page.Keys {
+			total += o.Size
+		}
+		if page.NextCursor == "" {
+			return total
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// TestSweepCompactionActuallyReclaimsBackendBytes is the test the old
+// locator-only GC could not have passed. Pack several files into one
+// container, unlink most of them, sweep past grace, and require that the
+// backend actually got smaller — not merely that the locator index did.
+func TestSweepCompactionActuallyReclaimsBackendBytes(t *testing.T) {
+	r, clk := openRelaxedWithClock(t)
+	ctx := context.Background()
+
+	// Distinct payloads, each large enough that the reclaim is
+	// unambiguous, all packed into the same container (well under the
+	// 128 MiB seal threshold, so nothing seals early).
+	const payload = 256 << 10
+	const keep = 1
+	const total = 8
+	for i := 0; i < total; i++ {
+		data := bytes.Repeat([]byte{byte('a' + i)}, payload)
+		writeCommit(t, r, metadb.RootInode, string(rune('f'+i))+".bin", data)
+	}
+
+	before := backendBytes(t, r)
+	if before < total*payload {
+		t.Fatalf("expected at least %d bytes stored, got %d", total*payload, before)
+	}
+
+	// Unlink everything but one file.
+	for i := keep; i < total; i++ {
+		if err := r.Unlink(metadb.RootInode, string(rune('f'+i))+".bin"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Past grace for both the graveyard entries and the containers
+	// compaction retires. Two sweeps: the first collects locators and
+	// rewrites the container, retiring the original; the second, once
+	// the retired container is itself past grace, actually deletes it.
+	clk.advance(DefaultGraceDuration + time.Hour)
+	if _, err := r.Sweep(ctx, DefaultGraceDuration); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(DefaultGraceDuration + time.Hour)
+	if _, err := r.Sweep(ctx, DefaultGraceDuration); err != nil {
+		t.Fatal(err)
+	}
+
+	after := backendBytes(t, r)
+	if after >= before {
+		t.Fatalf("backend did not shrink: before=%d after=%d — compaction reclaimed no actual storage", before, after)
+	}
+	// The surviving file's bytes must still be there; anything at or
+	// below that means compaction ate live data.
+	if after < keep*payload {
+		t.Fatalf("backend shrank below the live set: after=%d, live payload=%d", after, keep*payload)
+	}
+	t.Logf("backend bytes: %d -> %d (%.0f%% reclaimed)", before, after, 100*float64(before-after)/float64(before))
+
+	// The surviving file must still read back correctly through its
+	// repointed locator — the whole point of §5.4's identity/location
+	// split is that moving bytes does not disturb content addressing.
+	_, rec, err := r.Resolve("/f.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, err := r.OpenFile(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fr.ReadAll()
+	if err != nil {
+		t.Fatalf("reading the survivor after compaction moved its bytes: %v", err)
+	}
+	if want := bytes.Repeat([]byte{'a'}, payload); !bytes.Equal(got, want) {
+		t.Fatalf("survivor content corrupted by compaction: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+// TestCompactLeavesDenseContainersAlone guards the other direction:
+// DESIGN.md §19.1 step 3 repacks containers *below* the liveness
+// threshold. Rewriting a fully-live container would be pure cost — read
+// every byte, write every byte, delete the original — for no reclaim.
+func TestCompactLeavesDenseContainersAlone(t *testing.T) {
+	r, _ := openRelaxedWithClock(t)
+	ctx := context.Background()
+
+	for i := 0; i < 4; i++ {
+		writeCommit(t, r, metadb.RootInode, string(rune('a'+i))+".bin",
+			bytes.Repeat([]byte{byte('a' + i)}, 4096))
+	}
+
+	rewritten, err := r.Compact(ctx, DefaultLivenessThreshold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten != 0 {
+		t.Fatalf("Compact rewrote %d fully-live container(s); nothing was collectable", rewritten)
+	}
+}
+
+// TestPublishChargesQuota guards a gap the `atlas quota` command
+// surfaced: PublishTree used to allocate inodes and bind dentries
+// outside any quota transaction, so the primary ingest path consumed no
+// quota at all. A repo could be filled straight past a configured byte
+// limit by publishing, while `atlas quota` cheerfully reported 0 used.
+func TestPublishChargesQuota(t *testing.T) {
+	ctx := context.Background()
+	src := t.TempDir()
+	payload := bytes.Repeat([]byte("x"), 4096)
+	writeFile(t, src, "a.bin", payload)
+	writeFile(t, src, "sub/b.bin", payload)
+
+	r := openRelaxed(t)
+	if _, _, _, err := r.PublishTree(ctx, src, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	bytesUsed, inodesUsed, err := r.QuotaUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(2 * len(payload)); bytesUsed != want {
+		t.Fatalf("publish charged %d bytes, want %d", bytesUsed, want)
+	}
+	// Two files plus the "sub" directory.
+	if inodesUsed != 3 {
+		t.Fatalf("publish charged %d inodes, want 3 (2 files + 1 dir)", inodesUsed)
+	}
+}
+
+// TestPublishRejectedOverQuota is the enforcement half: a publish that
+// would cross a configured byte limit must fail, not merely be counted.
+func TestPublishRejectedOverQuota(t *testing.T) {
+	ctx := context.Background()
+	src := t.TempDir()
+	writeFile(t, src, "big.bin", bytes.Repeat([]byte("y"), 8192))
+
+	r := openRelaxed(t)
+	if err := r.SetQuota(4096, 0); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err := r.PublishTree(ctx, src, nil)
+	if !errors.Is(err, metadb.ErrQuotaExceeded) {
+		t.Fatalf("PublishTree over quota = %v, want ErrQuotaExceeded", err)
+	}
+}
+
+// TestSweepPreservesAHardLinkedFile is the §19.3 hazard in its concrete
+// form. Two names, one inode: removing one name must not grave the
+// inode, or Sweep would reclaim chunks the surviving name still reads.
+// Distinct from TestSweepPreservesChunkSharedByALiveInode above, which
+// covers dedup — two inodes sharing a chunk — rather than one inode with
+// two names.
+func TestSweepPreservesAHardLinkedFile(t *testing.T) {
+	r, clk := openRelaxedWithClock(t)
+	ctx := context.Background()
+
+	data := bytes.Repeat([]byte("hard-linked-"), 50)
+	writeCommit(t, r, metadb.RootInode, "one", data)
+	id, err := r.DB.Lookup(metadb.RootInode, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Link(metadb.RootInode, "two", id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Unlink(metadb.RootInode, "one"); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(DefaultGraceDuration + time.Hour)
+
+	collected, err := r.Sweep(ctx, DefaultGraceDuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 0 {
+		t.Fatalf("Sweep collected %d inodes; the file is still named \"two\"", collected)
+	}
+
+	_, rec, err := r.Resolve("/two")
+	if err != nil {
+		t.Fatalf("surviving link no longer resolves: %v", err)
+	}
+	fr, err := r.OpenFile(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fr.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("surviving link's content was reclaimed by Sweep")
+	}
+
+	// And once the last name goes, it does become collectable.
+	if err := r.Unlink(metadb.RootInode, "two"); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(DefaultGraceDuration + time.Hour)
+	collected, err = r.Sweep(ctx, DefaultGraceDuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected == 0 {
+		t.Fatal("Sweep collected nothing after the last name was removed")
+	}
+}

@@ -15,7 +15,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/aburan28/atlasfs/pkg/mds"
+	"github.com/aburan28/atlasfs/pkg/metadb"
 	"github.com/aburan28/atlasfs/pkg/repo"
+	"github.com/aburan28/atlasfs/pkg/store/local"
 )
 
 // startTestServer runs a real grpc.Server over an in-memory bufconn
@@ -376,4 +379,117 @@ func TestNodePublishVolumeRequiresRepoPath(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when volume_context lacks repoPath")
 	}
+}
+
+// TestPublishVolumeBackedByMetadataAuthority completes the Kubernetes
+// end-to-end path: a PV whose VolumeContext names an mds address mounts
+// through the authority instead of opening metadata on the node.
+//
+// That difference is what makes a PVC a *shared, coherent* namespace
+// rather than one node's private view — every pod mounting it becomes
+// its own lease holder, so a write from one is invalidated on the
+// others. The assertions therefore check both that the mount works and
+// that it is genuinely authority-backed.
+func TestPublishVolumeBackedByMetadataAuthority(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("no /dev/fuse in this environment")
+	}
+	ctx := context.Background()
+
+	// A repo with content, then an authority serving its metadata.
+	repoDir := t.TempDir()
+	r, err := repo.OpenWithClass(repoDir, mustLocalBackend(t, filepath.Join(repoDir, "objects")),
+		repo.DefaultRegion, repo.ClassRelaxed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "pv.txt"), []byte("served to a pod"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := r.PublishTree(ctx, src, nil); err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+
+	db, err := metadb.Open(filepath.Join(repoDir, "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// A zero lease duration is deliberate: with a real lease the client
+	// would be *entitled* to keep answering from cache after the
+	// authority stops, so the "stop it and watch reads fail" assertion
+	// below would be testing the lease, not the dependency.
+	mdsSrv := mds.NewServer(mds.Config{DB: db})
+	g := grpc.NewServer()
+	mdsSrv.Register(g)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go g.Serve(lis)
+	defer g.Stop()
+
+	_, nodeClient, _ := startTestServer(t)
+	target := filepath.Join(t.TempDir(), "mnt")
+
+	_, err = nodeClient.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol-mds",
+		TargetPath: target,
+		Readonly:   true,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+			},
+		},
+		VolumeContext: map[string]string{
+			"repoPath": repoDir,
+			"mdsAddr":  lis.Addr().String(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume via authority: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(target, "pv.txt"))
+	if err != nil {
+		t.Fatalf("read through the authority-backed PV: %v", err)
+	}
+	if string(got) != "served to a pod" {
+		t.Fatalf("got %q through the PV", got)
+	}
+
+	// The load-bearing assertion: stop the authority and the volume must
+	// stop resolving. Without it this test would pass just as happily if
+	// the driver had ignored mdsAddr and opened the local metadb.
+	g.Stop()
+	deadline := time.Now().Add(5 * time.Second)
+	authorityWasLoadBearing := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(target, "pv.txt")); err != nil {
+			authorityWasLoadBearing = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if _, err := nodeClient.NodeUnpublishVolume(ctx, &csi.NodeUnpublishVolumeRequest{
+		VolumeId: "vol-mds", TargetPath: target,
+	}); err != nil {
+		t.Fatalf("NodeUnpublishVolume: %v", err)
+	}
+	if !authorityWasLoadBearing {
+		t.Fatal("the volume kept resolving after the authority stopped — mdsAddr was not actually used")
+	}
+}
+
+func mustLocalBackend(t *testing.T, dir string) *local.Backend {
+	t.Helper()
+	b, err := local.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

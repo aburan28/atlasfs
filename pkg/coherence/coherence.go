@@ -6,20 +6,25 @@
 // invalidation only shortens the staleness window, and losing every
 // invalidation message violates no guarantee (§10.2).
 //
-// Scope cut, stated plainly: this package implements the `relaxed`/
-// `session` mechanics (leases, negative caching, best-effort push). It
-// does not implement §10.6's blocking recall for the `posix` class —
-// that needs a live RPC round trip to a remote holder, and this build
-// has no remote holders yet (metadb is a single-process embedded store,
-// so every consumer of a Manager in this codebase is in-process). The
-// registry/push machinery below is written and tested generically
-// against multiple holder IDs anyway, the same way spec/coherence.qnt
-// checks it against symbolic clients "c1"/"c2" — so it's ready for a
-// real second holder (a second process against a shared metadb) without
-// changing this package, even though this build doesn't have one yet.
+// This package implements both halves of §10: the `relaxed`/`session`
+// mechanics (leases, negative caching, best-effort push) and §10.6's
+// blocking recall for the `posix` class. Recall was previously
+// unimplementable here for a concrete reason — it needs a live round
+// trip to a *remote* holder to be anything more than a function call,
+// and every Manager consumer was in-process. pkg/mds is that remote
+// holder: it serves leases to separate client processes over gRPC, so
+// Recall below now blocks a mutation on real acknowledgements crossing a
+// real network boundary.
+//
+// The recall shape here is the one spec/coherence.qnt checks
+// (RequestPosixMutate / AckRecall / CompletePosixMutate): a posix
+// mutation may only commit once every current lease holder has either
+// acknowledged the recall or blown its DRECALL deadline.
 package coherence
 
 import (
+	"context"
+	"sort"
 	"sync"
 	"time"
 )
@@ -73,6 +78,24 @@ type Manager struct {
 	// neg[dir][holder+"\x00"+name] — negative entries, invalidated in
 	// bulk by a dirver bump rather than individually.
 	neg map[string]map[string]negEntry
+
+	// recallers[obj][holder] — blocking-recall handlers for the `posix`
+	// class (§10.6). Distinct from subscribers: a subscriber is a
+	// best-effort notification the protocol may drop freely, while a
+	// recaller is on the critical path of a mutation that must not
+	// commit until it answers.
+	recallers map[string]map[string]func(recallID uint64)
+
+	nextRecallID uint64
+	// pending[recallID] — recalls currently blocking a mutation.
+	pending map[uint64]*pendingRecall
+}
+
+type pendingRecall struct {
+	obj      string
+	awaiting map[string]struct{}
+	done     chan struct{}
+	closed   bool
 }
 
 // New returns a Manager granting leases of duration d, using clock for
@@ -85,6 +108,8 @@ func New(clock Clock, d time.Duration) *Manager {
 		subscribers: map[string]map[string]func(){},
 		dirver:      map[string]uint64{},
 		neg:         map[string]map[string]negEntry{},
+		recallers:   map[string]map[string]func(uint64){},
+		pending:     map[uint64]*pendingRecall{},
 	}
 }
 
@@ -180,6 +205,149 @@ func (m *Manager) setVersionLocked(obj string, v uint64) {
 		m.versions = map[string]uint64{}
 	}
 	m.versions[obj] = v
+}
+
+// --- blocking recall, the `posix` class (DESIGN.md §10.6) ------------
+
+// SubscribeRecall registers holder's blocking-recall handler for obj.
+// Unlike Subscribe, this is not best-effort: a mutation will wait on
+// this handler answering, so onRecall must eventually lead to AckRecall
+// (or the mutation waits out its DRECALL deadline instead).
+//
+// onRecall runs on the mutating goroutine and must not block on
+// anything slow. pkg/mds hands the recall to the holder's already-open
+// server stream, which is a channel send, and acks arrive on a separate
+// RPC.
+func (m *Manager) SubscribeRecall(holder, obj string, onRecall func(recallID uint64)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.recallers[obj] == nil {
+		m.recallers[obj] = map[string]func(uint64){}
+	}
+	m.recallers[obj][holder] = onRecall
+}
+
+// UnsubscribeRecall drops holder's recall handler for obj — called when
+// a holder disconnects, so a dead holder cannot stall every subsequent
+// mutation for a full DRECALL deadline.
+func (m *Manager) UnsubscribeRecall(holder, obj string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.recallers[obj], holder)
+	if len(m.recallers[obj]) == 0 {
+		delete(m.recallers, obj)
+	}
+}
+
+// RecallResult reports how a Recall concluded, which the caller needs in
+// order to distinguish "every holder confirmed it dropped its cache"
+// from "one holder went unreachable and we proceeded on the deadline."
+type RecallResult struct {
+	Acked    []string
+	TimedOut []string
+}
+
+// Recall implements DESIGN.md §10.6: it revokes every current lease on
+// obj other than the mutator's, and blocks until each affected holder
+// has acknowledged — or until drecall elapses, whichever comes first.
+// The caller applies its mutation only after Recall returns.
+//
+// Two design points worth being explicit about, because they are what
+// make this safe rather than merely blocking:
+//
+//   - The lease is dropped *before* the handler is invoked, not after
+//     the ack. A holder that never answers must not be able to keep
+//     serving reads from a lease this Manager still considers valid; the
+//     ack confirms the holder dropped its own copy, it is not what makes
+//     the server-side grant invalid.
+//   - Timing out is not an error. §10.6 bounds a mutation's wait by
+//     DRECALL precisely so one unreachable holder cannot deadlock the
+//     filesystem. The unacked holders are reported rather than swallowed,
+//     because "we proceeded without confirmation" is exactly the fact an
+//     operator needs when a client is partitioned.
+func (m *Manager) Recall(ctx context.Context, obj, mutator string, drecall time.Duration) (RecallResult, error) {
+	m.mu.Lock()
+	now := m.clock.Now()
+	var handlers []func(uint64)
+	// recalled is this call's own record of who was asked; pendingRecall
+	// gets a separate map, because AckRecall drains that one and we still
+	// need the original set to report who acked versus who timed out.
+	var recalled []string
+	awaiting := map[string]struct{}{}
+	for holder, lease := range m.leases[obj] {
+		if holder == mutator || now.After(lease.expiry) {
+			continue
+		}
+		delete(m.leases[obj], holder)
+		cb := m.recallers[obj][holder]
+		if cb == nil {
+			// Holds a lease but registered no recall handler, so there is
+			// nobody to ask. Revoking the lease above is the whole of what
+			// we can do, and it is enough: the holder cannot be granted a
+			// fresh one without coming back through Grant.
+			continue
+		}
+		recalled = append(recalled, holder)
+		awaiting[holder] = struct{}{}
+		handlers = append(handlers, cb)
+	}
+	if len(recalled) == 0 {
+		m.mu.Unlock()
+		return RecallResult{}, nil
+	}
+
+	m.nextRecallID++
+	id := m.nextRecallID
+	p := &pendingRecall{obj: obj, awaiting: awaiting, done: make(chan struct{})}
+	m.pending[id] = p
+	m.mu.Unlock()
+
+	for _, cb := range handlers {
+		cb(id)
+	}
+
+	timer := time.NewTimer(drecall)
+	defer timer.Stop()
+	var err error
+	select {
+	case <-p.done:
+	case <-timer.C:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.pending, id)
+	res := RecallResult{}
+	for _, holder := range recalled {
+		if _, stillWaiting := p.awaiting[holder]; stillWaiting {
+			res.TimedOut = append(res.TimedOut, holder)
+		} else {
+			res.Acked = append(res.Acked, holder)
+		}
+	}
+	sort.Strings(res.Acked)
+	sort.Strings(res.TimedOut)
+	return res, err
+}
+
+// AckRecall records that holder has dropped its cached copy for the
+// recall identified by recallID. Acking an unknown or already-completed
+// recall is a no-op, not an error: a late ack arriving after the
+// mutation gave up on the deadline is harmless.
+func (m *Manager) AckRecall(recallID uint64, holder string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p := m.pending[recallID]
+	if p == nil {
+		return
+	}
+	delete(p.awaiting, holder)
+	if len(p.awaiting) == 0 && !p.closed {
+		p.closed = true
+		close(p.done)
+	}
 }
 
 // --- negative caching (DESIGN.md §10.4) ------------------------------

@@ -28,6 +28,10 @@ func main() {
 		err = cmdStat(ctx, os.Args[2:])
 	case "mount":
 		err = cmdMount(ctx, os.Args[2:])
+	case "gc":
+		err = cmdGC(ctx, os.Args[2:])
+	case "quota":
+		err = cmdQuota(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -51,16 +55,22 @@ Usage:
   atlas cat     [flags] <repo-dir> <path>                  print a file's content to stdout
   atlas stat    [flags] <repo-dir> <path>                  print an inode's metadata
   atlas mount   [flags] <repo-dir> <mountpoint>             FUSE mount (foreground; read-write iff -class isn't immutable)
+  atlas gc      [flags] <repo-dir>                         mark-and-sweep + compact (DESIGN.md §19)
+  atlas quota   [flags] <repo-dir>                         show or set the repo's quota (DESIGN.md §18.3)
 
 repo-dir is created on first publish; metadata always lives there locally
 (DESIGN.md §24.5's single-node metadb stand-in for per-region FDB).
 
 Flags (every subcommand, DESIGN.md §24 pluggable backends and §8 classes):
-  -backend local|s3      object storage backend (default local)
+  -backend local|s3|gcs|azure
+                          object storage backend (default local)
   -s3-bucket NAME         S3 bucket (required for -backend=s3)
   -s3-region REGION       AWS region for the S3 client (default us-east-1)
   -s3-endpoint URL        S3-compatible endpoint override, e.g. MinIO
   -s3-prefix PREFIX       key prefix within the bucket
+  -gcs-bucket NAME        GCS bucket (required for -backend=gcs)
+  -azure-service-url URL  Azure blob endpoint, optionally with a SAS query string
+  -azure-container NAME   Azure container (required for -backend=azure)
   -region NAME            AtlasFS locator region label (default local)
   -class immutable|relaxed|session
                           consistency class for a brand-new repo (default immutable);

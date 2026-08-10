@@ -8,12 +8,14 @@
 // A repo's consistency class (DESIGN.md §8) is stored once, at creation,
 // and never changes for that repo's lifetime — this build's honest
 // simplification of "per-subtree" down to "per-repo", since there is no
-// subtree-boundary tracking here (one repo, one mount, one class). The
-// `posix` class (real locking, blocking recall, O_APPEND) is not
-// implemented; that needs a remote-holder recall protocol this
-// single-process build has no second holder to exercise (see
-// pkg/coherence's doc comment). `immutable`, `relaxed`, and `session`
-// are.
+// subtree-boundary tracking here (one repo, one mount, one class).
+//
+// The `posix` class's blocking recall is implemented, but not through
+// this file: it lives in pkg/coherence and is driven by pkg/mds, whose
+// remote holders are what make a recall mean anything. What `posix`
+// still lacks is byte-range locking (§17). A repo opened through
+// pkg/repo therefore offers `immutable`, `relaxed`, and `session`; a
+// `posix` subtree is served by cmd/atlas-mds.
 //
 // Quotas (DESIGN.md §18.3) are per-subtree in the general design, but
 // this build has exactly one subtree per repo (no subtree-boundary
@@ -40,6 +42,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -61,7 +64,64 @@ var (
 	bucketMeta    = []byte("meta")      // "next_inode" -> uint64
 	bucketQuota   = []byte("quota")     // "root" -> gob(quotaRecord), see package doc
 	bucketGravey  = []byte("graveyard") // (deleteTsNano||inodeID) -> empty, see package doc
+	bucketDeadCnt = []byte("deadcontainer")
 )
+
+// MaxNameLen is NAME_MAX: the longest single path component. POSIX
+// requires ENAMETOOLONG beyond it, and the kernel does not enforce it on
+// a FUSE filesystem's behalf — a name longer than this arrived intact.
+const MaxNameLen = 255
+
+// ErrNameTooLong is returned for a path component longer than
+// MaxNameLen.
+var ErrNameTooLong = errors.New("metadb: name too long")
+
+// checkName rejects a component POSIX would not allow. Empty names and
+// names containing a separator are refused as well: both would produce a
+// dentry no path resolution could ever reach.
+func checkName(name string) error {
+	if len(name) > MaxNameLen {
+		return ErrNameTooLong
+	}
+	return nil
+}
+
+// adjustDirLinksTx moves a directory's own link count when a
+// subdirectory is added to or removed from it.
+//
+// A directory's nlink is 2 plus its subdirectory count: "." plus its
+// parent's entry, plus one ".." from each child directory. Reporting a
+// constant 2 is not cosmetic — `find` uses nlink-2 to decide a directory
+// has no subdirectories left to visit, so a wrong count makes it skip
+// real subtrees.
+func adjustDirLinksTx(tx *bbolt.Tx, dir InodeID, delta int32) error {
+	rec, err := getInodeTx(tx, dir)
+	if err != nil {
+		return err
+	}
+	if !rec.IsDir {
+		return nil
+	}
+	n := int32(rec.NLink) + delta
+	if n < 2 {
+		n = 2
+	}
+	rec.NLink = uint32(n)
+	return putInode(tx, dir, rec)
+}
+
+// touchDirTx moves a directory's mtime and ctime, which POSIX requires
+// whenever an entry is added to it or removed from it. Without this a
+// build tool watching a directory's mtime never notices a file appearing
+// in it.
+func touchDirTx(tx *bbolt.Tx, dir InodeID, now time.Time) error {
+	rec, err := getInodeTx(tx, dir)
+	if err != nil {
+		return err
+	}
+	rec.MTime, rec.CTime = now, now
+	return putInode(tx, dir, rec)
+}
 
 var ErrNotFound = errors.New("metadb: not found")
 var ErrExists = errors.New("metadb: already exists")
@@ -74,15 +134,40 @@ var ErrQuotaExceeded = errors.New("metadb: quota exceeded")
 // inline single chunk (§5.3: "small files ... inline the chunk ID
 // directly in the inode and skip the manifest object entirely").
 type InodeRecord struct {
-	IsDir       bool
-	Mode        uint32
-	Size        uint64
-	MTime       time.Time
+	IsDir bool
+	Mode  uint32
+	// Uid and Gid are DESIGN.md §20's ownership, stored per inode.
+	// They are the caller's at create time and change only through
+	// chown; a zero pair means "unset" for records written before
+	// ownership was tracked, and the mounts present that as root-owned,
+	// which is what an unowned inode already looked like.
+	Uid   uint32
+	Gid   uint32
+	Size  uint64
+	MTime time.Time
+	// ATime and CTime are the access and inode-change times. Both fall
+	// back to MTime when zero, which is what a record written before they
+	// were tracked has and what this filesystem reported for all three
+	// before that. ATime is only ever set explicitly (utimensat):
+	// updating it on every read would turn each read into a metadata
+	// write, which is the reason real filesystems default to relatime.
+	ATime       time.Time
+	CTime       time.Time
 	NLink       uint32
 	HasManifest bool
 	ManifestID  manifest.ID
 	HasInline   bool
 	InlineChunk chunk.ID
+
+	// Type holds the S_IFMT bits for a special file — FIFO, socket, or
+	// device node — created by mknod(2). Zero means an ordinary file,
+	// which is what every record written before special files existed
+	// reads back as. Directories and symlinks keep their own flags
+	// rather than moving here, so nothing about them changes.
+	//
+	// Rdev is the device number, meaningful only for S_IFCHR/S_IFBLK.
+	Type uint32
+	Rdev uint32
 
 	// IsSymlink and SymlinkTarget hold a symlink's target path verbatim.
 	// A symlink is never chunked or content-addressed — its "content"
@@ -90,6 +175,22 @@ type InodeRecord struct {
 	// record, the same way a real filesystem treats a fast symlink.
 	IsSymlink     bool
 	SymlinkTarget string
+}
+
+// Atime is the access time to report, falling back to MTime.
+func (r InodeRecord) Atime() time.Time {
+	if r.ATime.IsZero() {
+		return r.MTime
+	}
+	return r.ATime
+}
+
+// Ctime is the inode-change time to report, falling back to MTime.
+func (r InodeRecord) Ctime() time.Time {
+	if r.CTime.IsZero() {
+		return r.MTime
+	}
+	return r.CTime
 }
 
 type DirEntry struct {
@@ -107,7 +208,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("metadb: open: %w", err)
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey} {
+		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey, bucketDeadCnt} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -159,7 +260,16 @@ func (db *DB) ensureRoot() error {
 		return err
 	}
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		if err := putInode(tx, RootInode, InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}); err != nil {
+		// The root belongs to whoever created the repo. Leaving it
+		// owned by uid 0 would make every mount by an ordinary user
+		// read-only in practice: with `default_permissions` the kernel
+		// refuses a create in a root-owned 0755 directory, so the first
+		// write at the mount root fails with EACCES.
+		if err := putInode(tx, RootInode, InodeRecord{
+			IsDir: true, Mode: 0o755,
+			Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
+			MTime: time.Now(), NLink: 2,
+		}); err != nil {
 			return err
 		}
 		return advanceSeqTo(tx, uint64(RootInode))
@@ -286,6 +396,12 @@ func (db *DB) SetDentry(dir InodeID, name string, child InodeID) error {
 }
 
 func setDentryTx(tx *bbolt.Tx, dir InodeID, name string, child InodeID) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	if err := touchDirTx(tx, dir, time.Now()); err != nil {
+		return err
+	}
 	var v [8]byte
 	binary.BigEndian.PutUint64(v[:], uint64(child))
 	return tx.Bucket(bucketDentry).Put(dentryKey(dir, name), v[:])
@@ -329,11 +445,270 @@ func (db *DB) RemoveEntry(dir InodeID, name string, deletedAt time.Time) error {
 		if err := tx.Bucket(bucketDentry).Delete(dentryKey(dir, name)); err != nil {
 			return err
 		}
-		if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
+		if err := touchDirTx(tx, dir, deletedAt); err != nil {
 			return err
 		}
-		return addToGraveyardTx(tx, id, deletedAt)
+		if rec.IsDir {
+			// Its ".." went with it.
+			if err := adjustDirLinksTx(tx, dir, -1); err != nil {
+				return err
+			}
+		}
+		return dropLinkTx(tx, id, rec, deletedAt)
 	})
+}
+
+// dropLinkTx removes one reference to an inode: nlink falls by one, and
+// only when it reaches zero does the inode go to the graveyard and give
+// its quota back (DESIGN.md §19.3 — nlink is updated transactionally
+// with link/unlink, and the graveyard is what a zero-link inode enters
+// instead of being deleted outright).
+//
+// Graving an inode that still has another name bound to it would make
+// GC reclaim chunks the surviving link still reads, so the count is not
+// bookkeeping — it is what keeps a hard-linked file readable after one
+// of its names is removed.
+func dropLinkTx(tx *bbolt.Tx, id InodeID, rec InodeRecord, deletedAt time.Time) error {
+	// A directory's NLink is 2 by convention ("." plus its parent's
+	// entry), not a hard-link count — Link refuses directories, so that 2
+	// can never mean two names. Decrementing it here would leave every
+	// rmdir'd directory un-graved and its inode unreclaimable.
+	if !rec.IsDir && rec.NLink > 1 {
+		rec.NLink--
+		rec.CTime = deletedAt // a link-count change is an inode change
+		return putInode(tx, id, rec)
+	}
+	if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
+		return err
+	}
+	return addToGraveyardTx(tx, id, deletedAt)
+}
+
+// Link binds an additional name to an existing inode (§19.3). It is
+// refused for directories — POSIX reserves directory hard links to the
+// kernel's own "." and ".." — and it charges no quota: a link creates a
+// dentry, not an inode, and the bytes were already counted once.
+func (db *DB) Link(dir InodeID, name string, target InodeID) (InodeRecord, error) {
+	var out InodeRecord
+	err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		rec, err := getInodeTx(tx, target)
+		if err != nil {
+			return err
+		}
+		if rec.IsDir {
+			return ErrIsDirectory
+		}
+		if dirRec, err := getInodeTx(tx, dir); err != nil {
+			return err
+		} else if !dirRec.IsDir {
+			return ErrNotDir
+		}
+		if _, err := lookupTx(tx, dir, name); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if rec.NLink == 0 {
+			// Records written before nlink was tracked read back as 0;
+			// treating that as one existing link keeps the count honest
+			// rather than letting the first link make it 1.
+			rec.NLink = 1
+		}
+		rec.NLink++
+		rec.CTime = time.Now() // a link-count change is an inode change
+		if err := putInode(tx, target, rec); err != nil {
+			return err
+		}
+		if err := setDentryTx(tx, dir, name, target); err != nil {
+			return err
+		}
+		out = rec
+		return nil
+	})
+	return out, err
+}
+
+// Rename moves the binding at (oldDir, oldName) to (newDir, newName),
+// atomically. POSIX requires the whole thing to be one step — an
+// observer must never see the name at neither location nor at both — so
+// it is a single bbolt transaction rather than a remove and a create.
+//
+// Semantics implemented, and the reasoning where POSIX allows choices:
+//
+//   - Renaming onto an existing *file* replaces it, and the replaced
+//     inode goes to the graveyard rather than being deleted, exactly as
+//     unlink does (§19.3) — GC is what eventually reclaims it, and its
+//     quota is released here.
+//   - Renaming onto an existing *directory* requires that directory to
+//     be empty, and renaming a non-directory onto a directory (or the
+//     reverse) is refused. Those are POSIX's rules, and the emptiness
+//     check has to happen inside this transaction or it races a create.
+//   - Renaming a directory into its own subtree would detach that
+//     subtree from the root, so it is refused with ErrInvalidRename.
+//     Nothing else in the system would notice — the entries would simply
+//     become unreachable and GC would eventually eat them.
+//
+// Quota is unchanged for a plain move: the same bytes and inode stay
+// bound, just under a different name.
+func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName string, deletedAt time.Time) error {
+	if oldDir == newDir && oldName == newName {
+		return nil
+	}
+	if err := checkName(newName); err != nil {
+		return err
+	}
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		srcID, err := lookupTx(tx, oldDir, oldName)
+		if err != nil {
+			return err
+		}
+		srcRec, err := getInodeTx(tx, srcID)
+		if err != nil {
+			return err
+		}
+		if newDirRec, err := getInodeTx(tx, newDir); err != nil {
+			return err
+		} else if !newDirRec.IsDir {
+			return ErrNotDir
+		}
+		if srcRec.IsDir {
+			if err := checkNotDescendantTx(tx, srcID, newDir); err != nil {
+				return err
+			}
+		}
+
+		if dstID, err := lookupTx(tx, newDir, newName); err == nil {
+			dstRec, err := getInodeTx(tx, dstID)
+			if err != nil {
+				return err
+			}
+			switch {
+			case dstRec.IsDir && !srcRec.IsDir:
+				return ErrIsDirectory
+			case !dstRec.IsDir && srcRec.IsDir:
+				return ErrNotDir
+			case dstRec.IsDir && srcRec.IsDir:
+				kids, err := readdirTx(tx, dstID)
+				if err != nil {
+					return err
+				}
+				if len(kids) > 0 {
+					return ErrNotEmpty
+				}
+			}
+			// Displace the target: exactly the treatment an explicit
+			// unlink would give, nlink included — a displaced name that
+			// was one of several hard links must not grave the inode the
+			// other links still read.
+			if err := dropLinkTx(tx, dstID, dstRec, deletedAt); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+
+		if err := tx.Bucket(bucketDentry).Delete(dentryKey(oldDir, oldName)); err != nil {
+			return err
+		}
+		if err := touchDirTx(tx, oldDir, deletedAt); err != nil {
+			return err
+		}
+		if srcRec.IsDir && oldDir != newDir {
+			// The moved directory's ".." now points at newDir.
+			if err := adjustDirLinksTx(tx, oldDir, -1); err != nil {
+				return err
+			}
+			if err := adjustDirLinksTx(tx, newDir, +1); err != nil {
+				return err
+			}
+		}
+		return setDentryTx(tx, newDir, newName, srcID)
+	})
+}
+
+// ErrNotEmpty is returned when an operation requires an empty directory.
+var ErrNotEmpty = errors.New("metadb: directory not empty")
+
+// ErrInvalidRename is returned for a rename that would detach a subtree
+// from the root by moving a directory inside itself.
+var ErrInvalidRename = errors.New("metadb: cannot rename a directory into its own subtree")
+
+// checkNotDescendantTx walks up from start to the root, refusing if it
+// meets ancestor. Walking up is O(depth); walking down from ancestor
+// would be O(subtree), and depth is the smaller number by a wide margin
+// for the trees this filesystem targets.
+func checkNotDescendantTx(tx *bbolt.Tx, ancestor, start InodeID) error {
+	for cur := start; cur != RootInode; {
+		if cur == ancestor {
+			return ErrInvalidRename
+		}
+		parent, err := parentOfTx(tx, cur)
+		if err != nil {
+			// No parent link found: treat as reaching the top rather than
+			// failing the rename, since an unparented inode cannot be
+			// inside ancestor's subtree either.
+			return nil
+		}
+		if parent == cur {
+			return nil
+		}
+		cur = parent
+	}
+	return nil
+}
+
+// parentOfTx finds a directory's parent by scanning dentries for the one
+// binding that points at it.
+//
+// This is a scan because the schema has no parent pointer: DESIGN.md
+// §6's inode record is attrs plus a content pointer, and adding a parent
+// field would be a second place for the truth to live. Rename is rare
+// and directory depth is small, so paying a scan here is cheaper than
+// maintaining a denormalized link on every mutation.
+func parentOfTx(tx *bbolt.Tx, child InodeID) (InodeID, error) {
+	c := tx.Bucket(bucketDentry).Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if InodeID(binary.BigEndian.Uint64(v)) == child {
+			return InodeID(binary.BigEndian.Uint64(k[:8])), nil
+		}
+	}
+	return 0, ErrNotFound
+}
+
+// CreateSpecial binds a new special file — FIFO, socket, or device node
+// — at (dir, name). It has no content: a FIFO's data lives in the
+// kernel's pipe buffer and a socket's in the network stack, so there is
+// nothing to chunk. What the filesystem stores is the type, so lookup
+// and getattr report it and the VFS handles the rest itself.
+func (db *DB) CreateSpecial(dir InodeID, name string, typ uint32, rdev uint32, mode, uid, gid uint32) (InodeID, error) {
+	rec := InodeRecord{
+		Mode:  mode & 0o7777,
+		Type:  typ,
+		Rdev:  rdev,
+		Uid:   uid,
+		Gid:   gid,
+		MTime: time.Now(),
+		NLink: 1,
+	}
+	return db.PublishFile(dir, name, rec)
+}
+
+// CreateSymlink binds a new symlink at (dir, name). A symlink's target
+// is stored verbatim in the inode record rather than chunked — its
+// "content" is a short string, the same way a real filesystem treats a
+// fast symlink (see InodeRecord.SymlinkTarget).
+func (db *DB) CreateSymlink(dir InodeID, name, target string, uid, gid uint32) (InodeID, error) {
+	rec := InodeRecord{
+		Mode:          0o777,
+		Uid:           uid,
+		Gid:           gid,
+		Size:          uint64(len(target)),
+		MTime:         time.Now(),
+		NLink:         1,
+		IsSymlink:     true,
+		SymlinkTarget: target,
+	}
+	return db.PublishFile(dir, name, rec)
 }
 
 // DeleteInode removes id's record outright. The only caller is
@@ -444,17 +819,24 @@ func (db *DB) Lookup(dir InodeID, name string) (InodeID, error) {
 func (db *DB) Readdir(dir InodeID) ([]DirEntry, error) {
 	var out []DirEntry
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		c := tx.Bucket(bucketDentry).Cursor()
-		prefix := dentryPrefix(dir)
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			out = append(out, DirEntry{
-				Name:  string(k[len(prefix):]),
-				Inode: InodeID(binary.BigEndian.Uint64(v)),
-			})
-		}
-		return nil
+		var err error
+		out, err = readdirTx(tx, dir)
+		return err
 	})
 	return out, err
+}
+
+func readdirTx(tx *bbolt.Tx, dir InodeID) ([]DirEntry, error) {
+	var out []DirEntry
+	c := tx.Bucket(bucketDentry).Cursor()
+	prefix := dentryPrefix(dir)
+	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		out = append(out, DirEntry{
+			Name:  string(k[len(prefix):]),
+			Inode: InodeID(binary.BigEndian.Uint64(v)),
+		})
+	}
+	return out, nil
 }
 
 // EnsureDir walks path from root, creating any missing directory inodes,
@@ -471,7 +853,11 @@ func (db *DB) EnsureDir(path []string) (InodeID, error) {
 			if err != nil {
 				return 0, err
 			}
-			if err := db.PutInode(id, InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}); err != nil {
+			if err := db.PutInode(id, InodeRecord{
+				IsDir: true, Mode: 0o755,
+				Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
+				MTime: time.Now(), NLink: 2,
+			}); err != nil {
 				return 0, err
 			}
 			if err := db.CreateDentry(cur, name, id); err != nil && !errors.Is(err, ErrExists) {
@@ -554,6 +940,88 @@ func (db *DB) GetLocator(region string, id chunk.ID) (pack.Locator, bool, error)
 func (db *DB) HasLocator(region string, id chunk.ID) (bool, error) {
 	_, found, err := db.GetLocator(region, id)
 	return found, err
+}
+
+// LocatorEntry pairs a chunk with where it currently lives, for callers
+// that need to reason about containers rather than individual chunks.
+type LocatorEntry struct {
+	ChunkID chunk.ID
+	Locator pack.Locator
+}
+
+// ListLocators returns every locator bound in region. Compaction
+// (DESIGN.md §19.1 step 3) needs this because liveness is a property of
+// a *container* — "which chunks does this container still hold that
+// anyone references" is not answerable from a per-chunk lookup.
+func (db *DB) ListLocators(region string) ([]LocatorEntry, error) {
+	prefix := append([]byte(region), 0x00)
+	var out []LocatorEntry
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		c := tx.Bucket(bucketLocator).Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			var e LocatorEntry
+			copy(e.ChunkID[:], k[len(prefix):])
+			if err := gob.NewDecoder(bytes.NewReader(v)).Decode(&e.Locator); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// DeadContainer is a container object that compaction has rewritten and
+// which is therefore no longer referenced by any locator — but which is
+// not deleted immediately. See MarkContainerDead.
+type DeadContainer struct {
+	Key       string
+	RetiredAt time.Time
+}
+
+// MarkContainerDead records that key's contents have been rewritten
+// elsewhere and it may be deleted from the backend once past grace.
+//
+// Compaction deliberately does not delete the old object inline. A
+// reader that resolved a locator just before the rewrite is still
+// holding the old (container, offset) pair and may be mid-Get; deleting
+// underneath it would turn a GC run into a read error. Deferring the
+// delete behind the same T_grace the graveyard uses (DESIGN.md §19.2)
+// costs only storage, and storage is exactly what that invariant already
+// trades away for safety.
+func (db *DB) MarkContainerDead(key string, at time.Time) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(at); err != nil {
+		return err
+	}
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketDeadCnt).Put([]byte(key), buf.Bytes())
+	})
+}
+
+// ListDeadContainers returns every container awaiting deletion.
+func (db *DB) ListDeadContainers() ([]DeadContainer, error) {
+	var out []DeadContainer
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		c := tx.Bucket(bucketDeadCnt).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			d := DeadContainer{Key: string(k)}
+			if err := gob.NewDecoder(bytes.NewReader(v)).Decode(&d.RetiredAt); err != nil {
+				return err
+			}
+			out = append(out, d)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// RemoveDeadContainer drops the bookkeeping entry for key, once the
+// backend object itself has actually been deleted.
+func (db *DB) RemoveDeadContainer(key string) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketDeadCnt).Delete([]byte(key))
+	})
 }
 
 // --- quotas (DESIGN.md §18.3) --------------------------------------------
@@ -663,6 +1131,102 @@ func (db *DB) GetQuotaUsage() (bytesUsed, inodesUsed uint64, err error) {
 	return
 }
 
+// PublishFile binds a brand-new file inode at (dir, name) and charges
+// the quota for it, in one transaction — the publish-path counterpart to
+// CommitFile.
+//
+// It differs from CommitFile in exactly one way, and deliberately:
+// rebinding an existing name is ErrExists rather than an in-place
+// overwrite, because DESIGN.md §8 says an `immutable` subtree is not
+// rewritten in place. That is why this cannot simply call CommitFile.
+//
+// Publish used to allocate, write, and bind outside any quota
+// transaction, which meant the primary ingest path consumed no quota at
+// all: a repo could be filled past a set byte limit by publishing, and
+// `atlas quota` would report 0 used (DESIGN.md §18.3, and §22.3's
+// capacity-is-a-quota claim for CSI).
+func (db *DB) PublishFile(dir InodeID, name string, rec InodeRecord) (id InodeID, err error) {
+	err = db.bolt.Update(func(tx *bbolt.Tx) error {
+		dirRec, err := getInodeTx(tx, dir)
+		if err != nil {
+			return err
+		}
+		if !dirRec.IsDir {
+			return ErrNotDir
+		}
+		if _, err := lookupTx(tx, dir, name); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+
+		id, err = allocInodeTx(tx)
+		if err != nil {
+			return err
+		}
+		if err := applyQuotaDeltaTx(tx, int64(rec.Size), 1); err != nil {
+			return err
+		}
+		if err := putInode(tx, id, rec); err != nil {
+			return err
+		}
+		return setDentryTx(tx, dir, name, id)
+	})
+	return id, err
+}
+
+// EnsureDirCharged is EnsureDir with quota accounting: each directory it
+// actually creates costs one inode, and each is created inside its own
+// transaction alongside that charge. Directories already present cost
+// nothing, so it stays idempotent — publish walks the same parent
+// directories repeatedly and must not be charged twice for them.
+func (db *DB) EnsureDirCharged(path []string) (InodeID, error) {
+	cur := RootInode
+	for _, name := range path {
+		if name == "" {
+			continue
+		}
+		id, err := db.Lookup(cur, name)
+		if err == nil {
+			cur = id
+			continue
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return 0, err
+		}
+		rec := InodeRecord{
+			IsDir: true, Mode: 0o755,
+			Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
+			MTime: time.Now(), NLink: 2,
+		}
+		id, err = db.CommitMkdir(cur, name, rec)
+		if errors.Is(err, ErrExists) {
+			// Raced with another writer creating the same directory;
+			// theirs is as good as ours.
+			if id, err = db.Lookup(cur, name); err != nil {
+				return 0, err
+			}
+		} else if err != nil {
+			return 0, err
+		}
+		cur = id
+	}
+	return cur, nil
+}
+
+// GetQuotaLimits reports the configured limits; 0 means unlimited.
+func (db *DB) GetQuotaLimits() (bytesLimit, inodesLimit uint64, err error) {
+	err = db.bolt.View(func(tx *bbolt.Tx) error {
+		q, err := getQuotaTx(tx)
+		if err != nil {
+			return err
+		}
+		bytesLimit, inodesLimit = q.BytesLimit, q.InodesLimit
+		return nil
+	})
+	return
+}
+
 // CheckQuota reports ErrQuotaExceeded if applying (byteDelta, inodeDelta)
 // to current usage would cross a set limit, without changing anything.
 // It is a cheap, non-authoritative early-out: a caller like
@@ -715,6 +1279,18 @@ func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID,
 			}
 			id = existing
 			oldSize = existingRec.Size
+			// The caller supplies content and mtime — not link count, not
+			// permissions, not ownership. Taking rec's NLink verbatim
+			// would reset a hard-linked file's count to 1 on every
+			// overwrite, after which removing one of its names would
+			// grave an inode the other name still resolves to and GC
+			// would reclaim chunks a live file reads. Taking its Mode
+			// would strip the exec bit off any script the caller merely
+			// rewrote. Taking its Uid/Gid would transfer a file to
+			// whoever last wrote to it.
+			rec.NLink, rec.Mode = existingRec.NLink, existingRec.Mode
+			rec.Uid, rec.Gid = existingRec.Uid, existingRec.Gid
+			rec.CTime = time.Now()
 		case isNew:
 			newID, err := allocInodeTx(tx)
 			if err != nil {
@@ -776,6 +1352,10 @@ func (db *DB) CommitMkdir(dir InodeID, name string, rec InodeRecord) (InodeID, e
 			return err
 		}
 		if err := setDentryTx(tx, dir, name, newID); err != nil {
+			return err
+		}
+		// The new directory's ".." is a link to its parent.
+		if err := adjustDirLinksTx(tx, dir, +1); err != nil {
 			return err
 		}
 		id = newID

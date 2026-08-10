@@ -39,7 +39,40 @@ var (
 )
 
 func InodeCoherenceKey(id metadb.InodeID) string { return fmt.Sprintf("inode:%d", id) }
-func DirCoherenceKey(id metadb.InodeID) string   { return fmt.Sprintf("dir:%d", id) }
+
+// bumpDirEntries invalidates everything a change to dir's contents makes
+// stale. That is two objects, not one (DESIGN.md §10.5's two lease
+// domains): the directory's version, which covers its name bindings and
+// negative entries, and the directory's own inode, because adding or
+// removing an entry moves its mtime and ctime. Bumping only the former
+// leaves a holder serving the pre-change timestamps from a lease nothing
+// invalidated — and a directory mtime that never moves is one every
+// build tool and file watcher relies on.
+func (r *Repo) bumpDirEntries(dir metadb.InodeID) {
+	if r.Coherence == nil {
+		return
+	}
+	r.Coherence.BumpDir(DirCoherenceKey(dir))
+	r.Coherence.Bump(DirCoherenceKey(dir))
+	r.Coherence.Bump(InodeCoherenceKey(dir))
+}
+func DirCoherenceKey(id metadb.InodeID) string { return fmt.Sprintf("dir:%d", id) }
+
+// MaxFileSize is the largest size this build accepts for a file, and
+// truncate(2) beyond it fails with EFBIG.
+//
+// The number is not a storage limit — a manifest can address far more —
+// it is a guard on the write path, which buffers a whole file in memory
+// before committing it (§16.1). Without a bound, `truncate(f, 1<<62)`
+// asks that path to allocate an exabyte and takes the mount down with
+// it: an unprivileged local denial of service, not a missing feature.
+// A file anywhere near this size is impractical here for the same
+// buffering reason; the limit exists to make the failure an errno
+// instead of an OOM kill.
+const MaxFileSize = 1 << 40 // 1 TiB
+
+// ErrFileTooBig is returned for a size beyond MaxFileSize.
+var ErrFileTooBig = errors.New("repo: file size exceeds the maximum")
 
 // SetQuota sets this repo's byte and inode limits (DESIGN.md §18.3). A
 // zero value means unlimited for that dimension. This build has exactly
@@ -55,15 +88,51 @@ func (r *Repo) QuotaUsage() (bytesUsed, inodesUsed uint64, err error) {
 	return r.DB.GetQuotaUsage()
 }
 
+// QuotaLimits reports this repo's configured quota limits; 0 means
+// unlimited (DESIGN.md §18.3).
+func (r *Repo) QuotaLimits() (bytesLimit, inodesLimit uint64, err error) {
+	return r.DB.GetQuotaLimits()
+}
+
 // WriteHandle buffers a new or replacement file's content. Nothing is
 // visible in the namespace until Commit.
 type WriteHandle struct {
 	repo *Repo
 	dir  metadb.InodeID
 	name string
-	buf  bytes.Buffer
-	done bool
+	// mode/modeSet: a create(2) asking for mode 0 is a legitimate
+	// request (an unreadable, unwritable file), so "no mode given" needs
+	// its own flag rather than being spelled as zero.
+	mode    uint32
+	modeSet bool
+	owner   Owner
+	buf     bytes.Buffer
+	done    bool
 }
+
+// Owner is the uid/gid a new inode is created with (DESIGN.md §20).
+// The caller supplies it because only the mount knows who made the
+// syscall — pkg/repo has no notion of a current user.
+type Owner struct {
+	Uid uint32
+	Gid uint32
+}
+
+// SetOwner records the uid/gid a newly-created file gets. Like SetMode
+// it applies only when Commit binds a new name; an overwrite leaves the
+// existing inode's ownership alone, because writing to a file you do not
+// own must not quietly transfer it to you.
+func (h *WriteHandle) SetOwner(o Owner) { h.owner = o }
+
+// SetMode records the permission bits a create(2) asked for. It applies
+// only when Commit binds a *new* name: an overwrite keeps the existing
+// inode's mode, because the caller is supplying content, not
+// permissions (see metadb.CommitFile).
+//
+// Without this an open(2) with O_CREAT and mode 0755 produces a 0644
+// file, and every program that creates an executable directly — install,
+// tar restoring an archive, a build emitting a script — loses the bit.
+func (h *WriteHandle) SetMode(mode uint32) { h.mode, h.modeSet = mode&0o7777, true }
 
 // CreateFile opens a buffered write handle for name within dir. Fails
 // with ErrReadOnly outside a mutable class. Does not touch the
@@ -157,7 +226,11 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 		return 0, err
 	}
 
-	rec := metadb.InodeRecord{Mode: 0o644, MTime: time.Now(), NLink: 1}
+	mode := h.mode
+	if !h.modeSet {
+		mode = 0o644
+	}
+	rec := metadb.InodeRecord{Mode: mode, Uid: h.owner.Uid, Gid: h.owner.Gid, MTime: time.Now(), NLink: 1}
 	content.apply(&rec)
 
 	id, err := r.DB.CommitFile(h.dir, h.name, rec)
@@ -174,8 +247,8 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 
 	if r.Coherence != nil {
 		r.Coherence.Bump(InodeCoherenceKey(id))
-		r.Coherence.BumpDir(DirCoherenceKey(h.dir))
 	}
+	r.bumpDirEntries(h.dir)
 	return id, nil
 }
 
@@ -191,23 +264,34 @@ func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 	if !r.Class.Mutable() {
 		return ErrReadOnly
 	}
+	// Resolve before removing: the inode's own lease has to be bumped
+	// too. DESIGN.md §10.5 puts nlink in the inode's domain — "bumped by
+	// ... link/unlink (via nlink)" — and an unlink changes it. Without
+	// this a holder that reached the file by another name keeps serving
+	// the pre-unlink link count for a full lease, which xfstests
+	// generic/002 catches by removing twenty links one at a time and
+	// watching the count fail to move.
+	id, lookupErr := r.DB.Lookup(dir, name)
 	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
 		return err
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
+	if lookupErr == nil && r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
 	}
+	r.bumpDirEntries(dir)
 	return nil
 }
 
 // Mkdir creates a new, empty directory named name under dir. Fails with
 // EEXIST-equivalent if name is already bound to anything — unlike
 // WriteHandle.Commit, mkdir(2) never silently overwrites.
-func (r *Repo) Mkdir(dir metadb.InodeID, name string) (metadb.InodeID, error) {
+func (r *Repo) Mkdir(dir metadb.InodeID, name string, mode uint32, owner Owner) (metadb.InodeID, error) {
 	if !r.Class.Mutable() {
 		return 0, ErrReadOnly
 	}
-	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2})
+	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{
+		IsDir: true, Mode: mode & 0o7777, Uid: owner.Uid, Gid: owner.Gid, MTime: time.Now(), NLink: 2,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, metadb.ErrExists):
@@ -218,9 +302,7 @@ func (r *Repo) Mkdir(dir metadb.InodeID, name string) (metadb.InodeID, error) {
 			return 0, err
 		}
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
-	}
+	r.bumpDirEntries(dir)
 	return id, nil
 }
 
@@ -253,7 +335,90 @@ func (r *Repo) Rmdir(dir metadb.InodeID, name string) error {
 		return err
 	}
 	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
+		r.Coherence.Bump(InodeCoherenceKey(id))
+	}
+	r.bumpDirEntries(dir)
+	return nil
+}
+
+// Rename moves oldName in oldDir to newName in newDir (DESIGN.md §16.1's
+// namespace mutations). The metadata move is one transaction in metadb;
+// what this adds is the coherence side effect — both directories'
+// versions bump, since a name appeared in one and vanished from the
+// other, and any holder caching either listing must be told.
+func (r *Repo) Rename(oldDir metadb.InodeID, oldName string, newDir metadb.InodeID, newName string) error {
+	if !r.Class.Mutable() {
+		return ErrReadOnly
+	}
+	if err := r.DB.Rename(oldDir, oldName, newDir, newName, r.Clock.Now()); err != nil {
+		return err
+	}
+	r.bumpDirEntries(oldDir)
+	if newDir != oldDir {
+		r.bumpDirEntries(newDir)
 	}
 	return nil
+}
+
+// Link binds an additional name to an existing inode (DESIGN.md §19.3).
+// Both leases move: the directory gains a name, and the inode's own
+// nlink changed, which §10.5 puts in the inode's lease domain.
+func (r *Repo) Link(dir metadb.InodeID, name string, target metadb.InodeID) (metadb.InodeRecord, error) {
+	if !r.Class.Mutable() {
+		return metadb.InodeRecord{}, ErrReadOnly
+	}
+	rec, err := r.DB.Link(dir, name, target)
+	if err != nil {
+		return metadb.InodeRecord{}, err
+	}
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(target))
+	}
+	r.bumpDirEntries(dir)
+	return rec, nil
+}
+
+// Mknod creates a special file — FIFO, socket, or device node — at
+// (dir, name). typ is the S_IFMT bits and rdev the device number, which
+// only S_IFCHR/S_IFBLK use.
+func (r *Repo) Mknod(dir metadb.InodeID, name string, typ, rdev, mode uint32, owner Owner) (metadb.InodeID, error) {
+	if !r.Class.Mutable() {
+		return 0, ErrReadOnly
+	}
+	id, err := r.DB.CreateSpecial(dir, name, typ, rdev, mode, owner.Uid, owner.Gid)
+	if err != nil {
+		return 0, err
+	}
+	r.bumpDirEntries(dir)
+	return id, nil
+}
+
+// Symlink creates a symlink at (dir, name) pointing at target.
+func (r *Repo) Symlink(dir metadb.InodeID, name, target string, owner Owner) (metadb.InodeID, error) {
+	if !r.Class.Mutable() {
+		return 0, ErrReadOnly
+	}
+	id, err := r.DB.CreateSymlink(dir, name, target, owner.Uid, owner.Gid)
+	if err != nil {
+		return 0, err
+	}
+	r.bumpDirEntries(dir)
+	return id, nil
+}
+
+// SetAttr changes an inode's mode and/or mtime (metadb.AttrMutation
+// names which). It bumps the inode's own lease and not the directory's:
+// §10.5 puts attributes in the inode's domain, and no name changed.
+func (r *Repo) SetAttr(id metadb.InodeID, mut metadb.AttrMutation) (metadb.InodeRecord, error) {
+	if !r.Class.Mutable() {
+		return metadb.InodeRecord{}, ErrReadOnly
+	}
+	rec, err := r.DB.SetAttr(id, mut)
+	if err != nil {
+		return metadb.InodeRecord{}, err
+	}
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
+	}
+	return rec, nil
 }

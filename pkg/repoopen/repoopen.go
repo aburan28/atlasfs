@@ -17,7 +17,9 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/aburan28/atlasfs/pkg/repo"
+	"github.com/aburan28/atlasfs/pkg/store"
 	"github.com/aburan28/atlasfs/pkg/store/azure"
+	"github.com/aburan28/atlasfs/pkg/store/dragonfly"
 	"github.com/aburan28/atlasfs/pkg/store/gcs"
 	"github.com/aburan28/atlasfs/pkg/store/local"
 	"github.com/aburan28/atlasfs/pkg/store/s3"
@@ -45,6 +47,22 @@ type Params struct {
 	AzureContainer  string
 	AzurePrefix     string
 
+	// DragonflyProxy, when set, routes object GETs through a Dragonfly
+	// (d7y.io) peer at this address, implementing DESIGN.md §11.1's P2P
+	// chunk exchange without AtlasFS speaking a peer protocol itself.
+	// The win is §12.2's: origin GET charges collapse from once-per-node
+	// to once-per-cluster for a shared dataset. Applies to the s3 backend
+	// (the one whose SDK takes an HTTP client here); "auto" uses the
+	// default dfdaemon address.
+	DragonflyProxy string
+	DragonflyTag   string
+
+	// MDSAddr, when set, means this volume's metadata lives behind a
+	// remote authority (cmd/atlas-mds) rather than in repoDir. The repo
+	// directory then supplies only the object backend, since DESIGN.md
+	// §11 keeps chunk bytes out of the authority's path.
+	MDSAddr string
+
 	Region string // AtlasFS locator region (DESIGN.md §7.5), not the cloud provider's region
 
 	// Class is only a hint used when repoDir holds no repo yet — see
@@ -65,6 +83,17 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 	if class == "" {
 		class = repo.ClassImmutable
 	}
+	if class == repo.ClassPosix {
+		// Refuse rather than quietly hand back a mount labelled `posix`
+		// that cannot deliver it. §10.6's guarantee comes from recalling
+		// *other* holders' leases, and a repo opened here has no other
+		// holders to recall — the coherence manager is in-process. A
+		// mount that accepted the flag would give a caller the class's
+		// cost with none of its semantics, which is worse than an error.
+		return nil, fmt.Errorf("repoopen: class %q is served by cmd/atlas-mds, not by a local mount: "+
+			"its D=0 guarantee depends on blocking recall against remote holders (DESIGN.md §10.6), "+
+			"which an in-process coherence manager has none of", repo.ClassPosix)
+	}
 	switch p.Backend {
 	case "", "local":
 		backend, err := local.New(filepath.Join(repoDir, "objects"))
@@ -83,6 +112,19 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(s3Region))
 		if err != nil {
 			return nil, fmt.Errorf("repoopen: load AWS config: %w", err)
+		}
+		if p.DragonflyProxy != "" {
+			proxy := p.DragonflyProxy
+			if proxy == "auto" {
+				proxy = dragonfly.DefaultProxyURL
+			}
+			// Swapping the HTTP client is the whole integration: the S3
+			// backend is untouched and unaware.
+			dfClient, err := dragonfly.NewHTTPClient(dragonfly.Config{ProxyURL: proxy, Tag: p.DragonflyTag})
+			if err != nil {
+				return nil, fmt.Errorf("repoopen: %w", err)
+			}
+			awsCfg.HTTPClient = dfClient
 		}
 		var optFns []func(*awss3.Options)
 		if p.S3Endpoint != "" {
@@ -119,6 +161,78 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 	}
 }
 
+// OpenBackend builds only the object backend Params selects, without
+// touching repoDir's metadata store.
+//
+// It exists for the mds-backed mount (pkg/mdsfuse): there the metadata
+// lives behind a remote authority, so opening a local metadb would be
+// both wrong and actively harmful — two processes with the same bbolt
+// file open is a lock fight at best. repoDir still names where the local
+// backend's objects live, because DESIGN.md §11 keeps chunk bytes out of
+// the authority's path.
+func OpenBackend(ctx context.Context, repoDir string, p Params) (store.Backend, error) {
+	switch p.Backend {
+	case "", "local":
+		return local.New(filepath.Join(repoDir, "objects"))
+	case "s3", "gcs", "azure":
+		// The cloud backends are constructed identically whether or not a
+		// metadata store is involved, so route through the same code
+		// rather than duplicating credential and probe handling. Opening
+		// a throwaway repo would defeat the point, so this is the one
+		// place the switch is repeated — kept minimal on purpose.
+		return openCloudBackend(ctx, p)
+	default:
+		return nil, fmt.Errorf("repoopen: unknown backend %q (want local|s3|gcs|azure)", p.Backend)
+	}
+}
+
+func openCloudBackend(ctx context.Context, p Params) (store.Backend, error) {
+	switch p.Backend {
+	case "s3":
+		if p.S3Bucket == "" {
+			return nil, fmt.Errorf("repoopen: s3 backend requires a bucket")
+		}
+		s3Region := p.S3Region
+		if s3Region == "" {
+			s3Region = "us-east-1"
+		}
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(s3Region))
+		if err != nil {
+			return nil, fmt.Errorf("repoopen: load AWS config: %w", err)
+		}
+		if p.DragonflyProxy != "" {
+			proxy := p.DragonflyProxy
+			if proxy == "auto" {
+				proxy = dragonfly.DefaultProxyURL
+			}
+			dfClient, err := dragonfly.NewHTTPClient(dragonfly.Config{ProxyURL: proxy, Tag: p.DragonflyTag})
+			if err != nil {
+				return nil, fmt.Errorf("repoopen: %w", err)
+			}
+			awsCfg.HTTPClient = dfClient
+		}
+		var optFns []func(*awss3.Options)
+		if p.S3Endpoint != "" {
+			optFns = append(optFns, func(o *awss3.Options) {
+				o.UsePathStyle = true
+				o.BaseEndpoint = aws.String(p.S3Endpoint)
+			})
+		}
+		return s3.New(ctx, awsCfg, s3.Config{Bucket: p.S3Bucket, Prefix: p.S3Prefix}, optFns...)
+	case "gcs":
+		if p.GCSBucket == "" {
+			return nil, fmt.Errorf("repoopen: gcs backend requires a bucket")
+		}
+		return gcs.New(ctx, gcs.Config{Bucket: p.GCSBucket, Prefix: p.GCSPrefix})
+	case "azure":
+		if p.AzureServiceURL == "" || p.AzureContainer == "" {
+			return nil, fmt.Errorf("repoopen: azure backend requires a service URL and a container")
+		}
+		return azure.New(ctx, p.AzureServiceURL, azure.Config{Container: p.AzureContainer, Prefix: p.AzurePrefix})
+	}
+	return nil, fmt.Errorf("repoopen: unknown backend %q", p.Backend)
+}
+
 // Known parameter keys used by ParamsFromMap — the CSI VolumeContext
 // convention this driver defines (DESIGN.md §22.1's volumeAttributes).
 const (
@@ -135,6 +249,11 @@ const (
 	KeyAzureServiceURL = "azureServiceURL"
 	KeyAzureContainer  = "azureContainer"
 	KeyAzurePrefix     = "azurePrefix"
+
+	KeyDragonflyProxy = "dragonflyProxy"
+	KeyDragonflyTag   = "dragonflyTag"
+
+	KeyMDSAddr = "mdsAddr"
 
 	KeyRegion = "region"
 	KeyClass  = "class"
@@ -161,6 +280,11 @@ func ParamsFromMap(m map[string]string) (repoDir string, p Params, err error) {
 		AzureServiceURL: m[KeyAzureServiceURL],
 		AzureContainer:  m[KeyAzureContainer],
 		AzurePrefix:     m[KeyAzurePrefix],
+
+		DragonflyProxy: m[KeyDragonflyProxy],
+		DragonflyTag:   m[KeyDragonflyTag],
+
+		MDSAddr: m[KeyMDSAddr],
 
 		Region: m[KeyRegion],
 		Class:  m[KeyClass],

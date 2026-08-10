@@ -7,8 +7,14 @@
 // consumer this build has of pkg/coherence's per-holder leases and
 // negative cache — every Node caches its own metadb.InodeRecord and
 // negative-lookup results in memory, using a fixed holder ID ("local")
-// because a single mount is this build's only holder (see
-// pkg/coherence's package doc for why there is no second one yet).
+// because this mount talks to an in-process metadb rather than to a
+// metadata authority.
+//
+// That is the mount's current limit, stated plainly: pkg/mds serves
+// leases to real remote holders and implements §10.6's recall against
+// them, but this mount does not go through it. `posix` is reachable by
+// mounting through pkg/mdsfuse instead, where the mount is a genuine
+// remote holder and a recall against it crosses a process boundary.
 //
 // This is a plain go-fuse mount (splice/passthrough tuning from
 // DESIGN.md §21.2 is not implemented here — that is a later-phase
@@ -22,8 +28,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -35,6 +43,19 @@ import (
 // coherenceHolder is the single local holder ID this in-process mount
 // registers as with a repo's coherence.Manager.
 const coherenceHolder = "local"
+
+// callerOwner is the uid/gid to stamp on an inode a syscall is creating:
+// the caller's own, which go-fuse carries on the request context
+// (DESIGN.md §20). A request with no caller information — go-fuse
+// synthesises some internally — falls back to the process's own identity
+// rather than to root, so a non-root mount does not produce files it
+// then cannot write.
+func callerOwner(ctx context.Context) repo.Owner {
+	if c, ok := fuse.FromContext(ctx); ok {
+		return repo.Owner{Uid: c.Uid, Gid: c.Gid}
+	}
+	return repo.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+}
 
 // Node is one FUSE inode, backed by an AtlasFS inode in a Repo. parent
 // and name are needed to commit an overwrite (writing to an existing
@@ -83,7 +104,22 @@ var (
 	_ fs.NodeMkdirer    = (*Node)(nil)
 	_ fs.NodeRmdirer    = (*Node)(nil)
 	_ fs.NodeSetattrer  = (*Node)(nil)
+	_ fs.NodeRenamer    = (*Node)(nil)
+	_ fs.NodeSymlinker  = (*Node)(nil)
+	_ fs.NodeLinker     = (*Node)(nil)
+	_ fs.NodeStatfser   = (*Node)(nil)
+	_ fs.NodeMknoder    = (*Node)(nil)
 )
+
+// binding reads the dentry this node is currently bound to. Rename
+// rewrites it under mu, so a write path that captured the pair at open
+// time must re-read it rather than close over the fields — committing to
+// the pre-rename name would recreate the name the rename removed.
+func (n *Node) binding() (metadb.InodeID, string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.parent, n.name
+}
 
 // currentRec returns the Node's current InodeRecord, consulting the
 // repo's coherence.Manager (when non-nil) to decide whether the cached
@@ -150,28 +186,90 @@ func (n *Node) markStale() {
 // actual access-control boundary).
 func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 	out.Size = rec.Size
+	out.Owner = fuse.Owner{Uid: rec.Uid, Gid: rec.Gid}
+	out.Rdev = rec.Rdev
 	sec := uint64(0)
 	if !rec.MTime.IsZero() {
 		sec = uint64(rec.MTime.Unix())
 	}
-	out.Mtime = sec
-	out.Atime = sec
-	out.Ctime = sec
+	out.Mtime, out.Mtimensec = sec, nsecOf(rec.MTime)
+	out.Atime, out.Atimensec = unixOrZero(rec.Atime()), nsecOf(rec.Atime())
+	out.Ctime, out.Ctimensec = unixOrZero(rec.Ctime()), nsecOf(rec.Ctime())
 	switch {
 	case rec.IsDir:
-		out.Mode = syscall.S_IFDIR | 0o755
-		out.Nlink = 2
+		out.Mode = syscall.S_IFDIR | permBits(rec.Mode, mutable)
+		out.Nlink = nlinkOf(rec)
 	case rec.IsSymlink:
 		out.Mode = syscall.S_IFLNK | 0o777
 		out.Nlink = 1
+	case rec.Type != 0:
+		// A special file: the VFS handles the FIFO or socket itself once
+		// getattr tells it what the inode is. All this layer owes it is
+		// the type, the permissions, the device number — and the real
+		// link count, because link(2) works on a FIFO exactly as it does
+		// on a regular file.
+		out.Mode = rec.Type | permBits(rec.Mode, mutable)
+		out.Nlink = nlinkOf(rec)
 	default:
-		mode := uint32(0o444)
-		if mutable {
-			mode = 0o644
-		}
-		out.Mode = syscall.S_IFREG | mode
-		out.Nlink = 1
+		out.Mode = syscall.S_IFREG | permBits(rec.Mode, mutable)
+		out.Nlink = nlinkOf(rec)
 	}
+}
+
+// nsecOf is the sub-second part of a timestamp. utimensat sets
+// nanoseconds and stat reports them, so dropping them makes every
+// timestamp look rounded to the second — which is what a filesystem that
+// stores only seconds looks like, and this one does not.
+func nsecOf(t time.Time) uint32 {
+	if t.IsZero() {
+		return 0
+	}
+	return uint32(t.Nanosecond())
+}
+
+// unixOrZero converts a timestamp for fuse.Attr, mapping the zero time
+// to 0 rather than to a negative epoch value.
+func unixOrZero(t time.Time) uint64 {
+	if t.IsZero() {
+		return 0
+	}
+	return uint64(t.Unix())
+}
+
+// nlinkOf is the stored link count, never a constant: `ls -l` and
+// `find -links` read it, and a hard-linked file reporting 1 would tell a
+// caller it is safe to delete the last name when it is not. Records
+// written before link counts were tracked read back as 0 and mean one
+// link.
+func nlinkOf(rec metadb.InodeRecord) uint32 {
+	if rec.NLink == 0 {
+		if rec.IsDir {
+			return 2 // "." plus the parent's entry
+		}
+		return 1
+	}
+	return uint32(rec.NLink)
+}
+
+// permBits reports the permission bits to advertise: the record's own,
+// which is what preserves an executable published from a source tree or
+// set by a later chmod. There is deliberately no "0 means default"
+// fallback: mode 0 is a legitimate thing to ask create(2) or mkdir(2)
+// for, and treating it as unset hands back a world-readable file to a
+// caller who asked for an unreadable one.
+//
+// On an immutable mount the write bits are cleared. That is presentation
+// rather than enforcement — the mount carries the `ro` option and Open
+// returns EROFS regardless — but advertising a writable file on a
+// filesystem that will refuse the write only invites a confusing error
+// later. The exec bit is deliberately *not* cleared: publishing a tree of
+// binaries read-only and then running them is the point.
+func permBits(mode uint32, mutable bool) uint32 {
+	perm := mode & 0o7777
+	if !mutable {
+		perm &^= 0o222
+	}
+	return perm
 }
 
 // direntMode is the raw type bits (S_IFDIR/S_IFLNK/S_IFREG) go-fuse
@@ -184,9 +282,38 @@ func direntMode(rec metadb.InodeRecord) uint32 {
 		return syscall.S_IFDIR
 	case rec.IsSymlink:
 		return syscall.S_IFLNK
+	case rec.Type != 0:
+		return rec.Type
 	default:
 		return syscall.S_IFREG
 	}
+}
+
+// Statfs answers df. See pkg/repo/statfs.go for why the numbers are the
+// quota's and not the backend's.
+func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	info, err := n.repo.Statfs()
+	if err != nil {
+		return syscall.EIO
+	}
+	fillStatfs(info, out)
+	return 0
+}
+
+// statfsBlockSize is the unit df divides by. It is a reporting unit, not
+// an allocation unit — this filesystem stores content-addressed chunks in
+// packed containers (§5.4), so there is no on-disk block to match.
+const statfsBlockSize = 4096
+
+func fillStatfs(info repo.StatfsInfo, out *fuse.StatfsOut) {
+	out.Bsize = statfsBlockSize
+	out.Frsize = statfsBlockSize
+	out.Blocks = info.Total / statfsBlockSize
+	free := info.Free() / statfsBlockSize
+	out.Bfree, out.Bavail = free, free
+	out.Files = info.Files
+	out.Ffree = info.FilesFree()
+	out.NameLen = 255
 }
 
 func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -195,6 +322,20 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 		return errno
 	}
 	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	// While a write session is open, the committed record's size is
+	// behind: this build commits content on flush (§16.1), so between a
+	// write(2) and the close that flushes it the inode still holds the
+	// old length. POSIX requires fstat to see the write immediately, and
+	// a caller that writes past EOF and then stats — fsx does this
+	// constantly, and so does any append-then-check loop — would
+	// otherwise read a size that contradicts the bytes it just wrote.
+	// The open handle knows the real length; nothing else does.
+	n.mu.Lock()
+	wh := n.activeWrite
+	n.mu.Unlock()
+	if wh != nil {
+		out.Attr.Size = wh.size()
+	}
 	return 0
 }
 
@@ -226,6 +367,12 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	}
 	if !rec.IsDir {
 		return nil, syscall.ENOTDIR
+	}
+
+	if len(name) > metadb.MaxNameLen {
+		// POSIX requires ENAMETOOLONG rather than a plain miss, and the
+		// kernel does not enforce NAME_MAX for a FUSE filesystem.
+		return nil, syscall.ENAMETOOLONG
 	}
 
 	dirKey := repo.DirCoherenceKey(n.ino)
@@ -343,6 +490,11 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if err != nil {
 		return nil, nil, 0, errnoFor(err)
 	}
+	// The kernel has already applied the caller's umask to mode, so this
+	// is the mode the file should end up with.
+	h.SetMode(mode)
+	h.SetOwner(callerOwner(ctx))
+	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, mode: mode & 0o7777, modeSet: true}
 	id, err := h.Commit(ctx)
 	if err != nil {
 		return nil, nil, 0, errnoFor(err)
@@ -358,7 +510,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	stable := fs.StableAttr{Mode: direntMode(rec), Ino: uint64(id)}
 	inode := n.NewInode(ctx, child, stable)
 
-	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, node: child}
+	fh.node = child
 	child.activeWrite = fh // no lock needed: child isn't reachable by any other goroutine yet
 	return inode, fh, fuse.FOPEN_KEEP_CACHE, 0
 }
@@ -368,7 +520,7 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	id, err := n.repo.Mkdir(n.ino, name)
+	id, err := n.repo.Mkdir(n.ino, name, mode, callerOwner(ctx))
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -387,17 +539,108 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return errnoFor(n.repo.Rmdir(n.ino, name))
 }
 
+// Rename moves name out of this directory and into newParent under
+// newName. The metadata move is one metadb transaction; what happens
+// here on top of it is rebinding the moved Node, so an already-open
+// write handle for the file commits to where the file now lives.
+func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	if !n.repo.Class.Mutable() {
+		return syscall.EROFS
+	}
+	if flags != 0 {
+		// renameat2's RENAME_EXCHANGE and RENAME_NOREPLACE need atomicity
+		// repo.Rename does not offer, and honouring the call while
+		// ignoring the flag would turn a "don't clobber" request into a
+		// clobber. EINVAL is what a filesystem without renameat2 support
+		// returns, and what glibc's fallback path expects.
+		return syscall.EINVAL
+	}
+	dst, ok := newParent.(*Node)
+	if !ok {
+		return syscall.EXDEV
+	}
+	child := n.GetChild(name)
+	if err := n.repo.Rename(n.ino, name, dst.ino, newName); err != nil {
+		return errnoFor(err)
+	}
+	if child != nil {
+		if cn, ok := child.Operations().(*Node); ok {
+			cn.mu.Lock()
+			cn.parent, cn.name = dst.ino, newName
+			cn.mu.Unlock()
+		}
+	}
+	return 0
+}
+
+// Link binds name in this directory to an already-existing inode. The
+// returned *fs.Inode is the existing node, not a new one — two names for
+// one inode is the entire point, and handing back a fresh node would
+// give the kernel two inode identities for the same file.
+func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	tn, ok := target.(*Node)
+	if !ok {
+		return nil, syscall.EXDEV
+	}
+	rec, err := n.repo.Link(n.ino, name, tn.ino)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	tn.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return tn.EmbeddedInode(), 0
+}
+
+// Mknod creates a FIFO, socket or device node. Regular files arrive
+// through Create, not here, so S_IFREG is refused: a caller using mknod
+// for a regular file is doing something this path would silently get
+// wrong (no content pointer, no write handle).
+func (n *Node) Mknod(ctx context.Context, name string, mode, rdev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	typ := mode & syscall.S_IFMT
+	switch typ {
+	case syscall.S_IFIFO, syscall.S_IFSOCK, syscall.S_IFCHR, syscall.S_IFBLK:
+	default:
+		return nil, syscall.EINVAL
+	}
+	id, err := n.repo.Mknod(n.ino, name, typ, rdev, mode&0o7777, callerOwner(ctx))
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	rec, err := n.repo.DB.GetInode(id)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	child := &Node{repo: n.repo, ino: id, parent: n.ino, name: name}
+	child.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return n.NewInode(ctx, child, fs.StableAttr{Mode: typ, Ino: uint64(id)}), 0
+}
+
+func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	id, err := n.repo.Symlink(n.ino, name, target, callerOwner(ctx))
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	rec, err := n.repo.DB.GetInode(id)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	child := &Node{repo: n.repo, ino: id, parent: n.ino, name: name}
+	child.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return n.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFLNK, Ino: uint64(id)}), 0
+}
+
 // Setattr handles truncate (via truncate(2)/ftruncate(2), and the
 // O_TRUNC-on-an-existing-file case that a plain open(2) also routes
 // through this — not through Node.Open's flags — on Linux's FUSE
-// implementation). Every other attribute change (mode, times, owner) is
-// accepted but not persisted: this build's InodeRecord doesn't track a
-// separate mode from the class-derived default (fillAttrOut), and there
-// is no uid/gid model yet (DESIGN.md §20 is a later phase) — silently
-// accepting rather than returning ENOSYS matches what most FUSE
-// filesystems do for attributes they don't materially support, since
-// returning an error here breaks a surprising amount of ordinary
-// software (cp, rsync, tar) that always tries to restore them.
+// implementation), plus mode and timestamp changes, which persist in the
+// inode record.
+//
+// Ownership changes persist too (DESIGN.md §20). Enforcement of who may
+// make them is the kernel's: the mount carries `default_permissions`, so
+// the VFS checks the mode/uid/gid this filesystem reports before the
+// request ever arrives.
 func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	rec, errno := n.currentRec()
 	if errno != 0 {
@@ -407,6 +650,12 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 	if sz, ok := in.GetSize(); ok {
 		if !n.repo.Class.Mutable() {
 			return syscall.EROFS
+		}
+		if sz > repo.MaxFileSize {
+			// Bounded before anything allocates: the resize below sizes a
+			// buffer from sz, so an absurd truncate would OOM the mount
+			// rather than fail.
+			return syscall.EFBIG
 		}
 		if rec.IsDir {
 			return syscall.EISDIR
@@ -453,7 +702,8 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		} else {
 			data = data[:sz]
 		}
-		repoWH, err := n.repo.CreateFile(n.parent, n.name)
+		parent, name := n.binding()
+		repoWH, err := n.repo.CreateFile(parent, name)
 		if err != nil {
 			return errnoFor(err)
 		}
@@ -470,6 +720,36 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		}
 	}
 
+	// Mode, ownership and times are all pure metadata and persist here
+	// (DESIGN.md §20).
+	var mut metadb.AttrMutation
+	if mode, ok := in.GetMode(); ok {
+		mut.Mode = &mode
+	}
+	if uid, ok := in.GetUID(); ok {
+		mut.Uid = &uid
+	}
+	if atime, ok := in.GetATime(); ok {
+		mut.ATime = &atime
+	}
+	if gid, ok := in.GetGID(); ok {
+		mut.Gid = &gid
+	}
+	if mtime, ok := in.GetMTime(); ok {
+		mut.MTime = &mtime
+	}
+	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil || mut.ATime != nil {
+		if !n.repo.Class.Mutable() {
+			return syscall.EROFS
+		}
+		updated, err := n.repo.SetAttr(n.ino, mut)
+		if err != nil {
+			return errnoFor(err)
+		}
+		n.setCached(updated)
+		rec = updated
+	}
+
 	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
 	return 0
 }
@@ -480,19 +760,42 @@ func errnoFor(err error) syscall.Errno {
 	switch {
 	case err == nil:
 		return 0
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The kernel interrupts a FUSE request when the calling thread
+		// takes a signal — under load Go's own async-preemption SIGURG is
+		// enough — and go-fuse then cancels the handler's context.
+		// Reporting EIO would surface a spurious I/O error for a syscall
+		// that was merely interrupted.
+		return syscall.EINTR
 	case errors.Is(err, repo.ErrReadOnly):
 		return syscall.EROFS
 	case errors.Is(err, metadb.ErrNotFound):
 		return syscall.ENOENT
 	case errors.Is(err, repo.ErrExists), errors.Is(err, metadb.ErrExists):
 		return syscall.EEXIST
-	case errors.Is(err, repo.ErrIsDirectory):
+	case errors.Is(err, repo.ErrIsDirectory), errors.Is(err, metadb.ErrIsDirectory):
 		return syscall.EISDIR
 	case errors.Is(err, repo.ErrNotDir), errors.Is(err, metadb.ErrNotDir):
 		return syscall.ENOTDIR
-	case errors.Is(err, repo.ErrNotEmpty):
+	case errors.Is(err, repo.ErrNotEmpty), errors.Is(err, metadb.ErrNotEmpty):
 		return syscall.ENOTEMPTY
-	case errors.Is(err, repo.ErrQuotaExceeded):
+	case errors.Is(err, metadb.ErrInvalidRename):
+		return syscall.EINVAL
+	case errors.Is(err, metadb.ErrNameTooLong):
+		return syscall.ENAMETOOLONG
+	case errors.Is(err, repo.ErrFileTooBig):
+		return syscall.EFBIG
+	case errors.Is(err, syscall.ENOSPC):
+		// The object backend ran out of room. Surfacing that as EIO tells
+		// an application its data is corrupt when in fact the disk is
+		// full — and ENOSPC is the one write error most callers already
+		// handle. Found by an fsx soak that filled the volume: every
+		// commit rewrites a file's chunks, so a long random-write
+		// workload grows storage until GC (§19) reclaims it.
+		return syscall.ENOSPC
+	case errors.Is(err, syscall.EDQUOT):
+		return syscall.EDQUOT
+	case errors.Is(err, repo.ErrQuotaExceeded), errors.Is(err, metadb.ErrQuotaExceeded):
 		return syscall.EDQUOT
 	default:
 		return syscall.EIO
@@ -506,12 +809,20 @@ type fileHandle struct {
 	fr *repo.FileReader
 }
 
-var _ fs.FileReader = (*fileHandle)(nil)
+var (
+	_ fs.FileReader  = (*fileHandle)(nil)
+	_ fs.FileFsyncer = (*fileHandle)(nil)
+)
+
+// Fsync on a read-only handle has nothing to flush, but must still
+// succeed: fsync(2) on an O_RDONLY fd is legal, and returning ENOSYS
+// would surface as an error to callers that sync every fd they hold.
+func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno { return 0 }
 
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := h.fr.ReadAt(dest, off)
 	if err != nil && err != io.EOF {
-		return nil, syscall.EIO
+		return nil, errnoFor(err)
 	}
 	return fuse.ReadResultData(dest[:n]), 0
 }
@@ -527,7 +838,14 @@ type writeFileHandle struct {
 	repo   *repo.Repo
 	parent metadb.InodeID
 	name   string
-	node   *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
+	// mode/modeSet is what a create(2) asked for, carried to the first
+	// commit so a file created executable is executable. Mode 0 is a
+	// legitimate request, so "not given" is a separate flag; a handle
+	// opened against an existing file leaves both unset, and the stored
+	// mode wins anyway.
+	mode    uint32
+	modeSet bool
+	node    *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
 
 	mu    sync.Mutex
 	buf   []byte
@@ -539,7 +857,44 @@ var (
 	_ fs.FileReader   = (*writeFileHandle)(nil)
 	_ fs.FileFlusher  = (*writeFileHandle)(nil)
 	_ fs.FileReleaser = (*writeFileHandle)(nil)
+	_ fs.FileFsyncer  = (*writeFileHandle)(nil)
 )
+
+// Fsync commits whatever is buffered, which is exactly DESIGN.md §16.2's
+// contract for it: durable in the home region — chunks in the object
+// store, manifest committed in metadata. It does not wait on any
+// cross-region replication; §16.2 is explicit that a checkpoint writer
+// calling fsync in a training loop must not stall for one, and a caller
+// wanting that guarantee asks for it separately.
+//
+// Without this the kernel gets ENOSYS and stops sending FSYNC, so a
+// process that wrote, fsynced and then died would lose the write even
+// though fsync returned success — the buffer would still be waiting for
+// a close(2) that never came.
+func (h *writeFileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	return h.commitIfDirty(ctx)
+}
+
+// target is the dentry this handle commits into. It prefers the node's
+// current binding over the pair captured at Open time, because a rename
+// while the file is open moves the dentry: committing to the captured
+// name would recreate the name the rename just removed.
+func (h *writeFileHandle) target() (metadb.InodeID, string) {
+	if h.node != nil {
+		if parent, name := h.node.binding(); name != "" {
+			return parent, name
+		}
+	}
+	return h.parent, h.name
+}
+
+// size is the in-flight length of the file this handle is writing,
+// which is ahead of the committed record until flush.
+func (h *writeFileHandle) size() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return uint64(len(h.buf))
+}
 
 // resize truncates or zero-extends the handle's buffer to sz bytes and
 // marks it dirty, so a subsequent Flush commits the resized content —
@@ -631,9 +986,13 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	}
 	h.dirty = false
 
-	wh, err := h.repo.CreateFile(h.parent, h.name)
+	parent, name := h.target()
+	wh, err := h.repo.CreateFile(parent, name)
 	if err != nil {
 		return errnoFor(err)
+	}
+	if h.modeSet {
+		wh.SetMode(h.mode)
 	}
 	if _, err := wh.Write(h.buf); err != nil {
 		return syscall.EIO
@@ -650,11 +1009,47 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	return 0
 }
 
+// MountOption tunes a mount. Options are variadic so adding one does not
+// disturb existing callers.
+type MountOption func(*mountConfig)
+
+type mountConfig struct {
+	allowOther bool
+	fsName     string
+}
+
+// FsName sets the source name the mount reports in /proc/mounts.
+//
+// It defaults to "atlasfs". A mount(8) helper needs to control it,
+// because mount(8) and findmnt identify a mount by the device string
+// they were given — an xfstests run, for one, cannot find its own test
+// filesystem otherwise.
+func FsName(name string) MountOption { return func(c *mountConfig) { c.fsName = name } }
+
+// AllowOther lets users other than the one who mounted reach the
+// filesystem.
+//
+// Without it the kernel refuses every access from a different uid before
+// any permission check runs — not EACCES from the mode bits, EACCES
+// because FUSE only trusts the mounting user. That default is right for
+// a personal mount and wrong for the two cases this project cares about:
+// a CSI volume, where kubelet mounts as root and the pod runs as
+// something else (DESIGN.md §22), and a POSIX conformance run, which
+// does most of its work as an unprivileged uid.
+//
+// It requires root or `user_allow_other` in /etc/fuse.conf, so it is
+// opt-in rather than the default.
+func AllowOther() MountOption { return func(c *mountConfig) { c.allowOther = true } }
+
 // Mount mounts r at mountpoint — read-only for an immutable repo,
 // read-write otherwise — and blocks until unmounted. onMounted, if
 // non-nil, is invoked with the *fuse.Server once mounted so the caller
 // can wire up signal-triggered unmount.
-func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(*fuse.Server)) error {
+func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(*fuse.Server), options ...MountOption) error {
+	var cfg mountConfig
+	for _, o := range options {
+		o(&cfg)
+	}
 	_, rootRec, err := r.Resolve("/")
 	if err != nil {
 		return err
@@ -666,9 +1061,48 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 	if !r.Class.Mutable() {
 		opts = append(opts, "ro")
 	}
+	// default_permissions hands POSIX access checking to the kernel,
+	// which applies the mode/uid/gid this filesystem reports. Without it
+	// FUSE performs no permission check at all beyond the mount owner's,
+	// so a world-unreadable file is readable by anyone who can see the
+	// mount — and every rule §20 cares about is unenforced. Re-deriving
+	// the access rules in userspace would be more code and more ways to
+	// be subtly wrong.
+	opts = append(opts, "default_permissions")
+	if cfg.allowOther {
+		opts = append(opts, "allow_other")
+	}
+	fsName := cfg.fsName
+	if fsName == "" {
+		fsName = "atlasfs"
+	}
+	// Let the kernel cache attrs and dentries for exactly this class's
+	// D (repo.Class.KernelCacheTTL). Leaving these nil — go-fuse's
+	// default — means a zero timeout, so every getattr and every lookup
+	// becomes a userspace round trip even on an `immutable` mount where
+	// nothing can change. That is not a stricter guarantee than §10
+	// promises, just a slower way to provide the same one: measured at
+	// 124µs per stat before this was set (pkg/fuseserver/bench_test.go).
+	ttl := r.Class.KernelCacheTTL()
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
+		EntryTimeout: &ttl,
+		AttrTimeout:  &ttl,
+		// NullPermissions: this filesystem sets every mode itself, so a
+		// zero one is a real answer. Without it go-fuse substitutes 0644
+		// whenever the permission bits are zero — a convenience for
+		// filesystems that do not track modes, and here it silently hands
+		// a world-readable file to a caller who asked create(2) for an
+		// unreadable one.
+		NullPermissions: true,
+		// NegativeTimeout is deliberately left at zero rather than set to
+		// ttl. §10.4 validates a negative entry against a directory
+		// version, which pkg/coherence implements and consults on every
+		// Lookup; a kernel-side negative cache cannot participate in that
+		// check, so a create-after-ENOENT on another holder would be
+		// masked for up to ttl with no way to invalidate it. Paying the
+		// round trip on misses is the cost of keeping §10.4's guarantee.
 		MountOptions: fuse.MountOptions{
-			FsName: "atlasfs",
+			FsName: fsName,
 			Name:   "atlasfs",
 			// DirectMount: call mount(2) ourselves instead of shelling
 			// out to fusermount, which is frequently absent (e.g.
