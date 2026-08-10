@@ -168,12 +168,83 @@ unimplemented; a content-addressed store has no preallocation to do, but
 minutes. What they establish is that the write path survives sustained
 random overlapping I/O with mmap, not that it survives a day of it.
 
+## xfstests
+
+xfstests has first-class FUSE support (its own `README.fuse`), so this is a
+supported configuration rather than a hack: `FSTYP=fuse`, `FUSE_SUBTYP`, and
+a `/sbin/mount.fuse.atlasfs` helper that mount(8) invokes.
+
+Getting there needed one product change and one one-line change to xfstests
+itself, both disclosed rather than buried:
+
+- **`atlas mount -fsname`.** mount(8) and `findmnt` identify a mount by the
+  device string they were given, and both mounts hardcoded their source name,
+  so xfstests could not find its own test filesystem. A mount helper has to
+  be able to set it; that is now a flag.
+- **One line in `common/rc`.** `_fs_type` maps `fuse.glusterfs` → `glusterfs`
+  and `fuse.ceph-fuse` → `ceph-fuse` for out-of-tree FUSE filesystems.
+  `fuse.atlasfs` → `fuse` is the same entry for a filesystem that is not
+  upstream. Nothing else in xfstests was modified.
+
+Run so far, against a `relaxed`-class in-process mount:
+
+```
+generic/001 generic/002 generic/005 generic/006 generic/007   — all pass
+```
+
+`generic/002` failed the first time, and it found a coherence bug that
+DESIGN.md had already specified: §10.5 puts `nlink` in the *inode's* lease
+domain — "bumped by ... link/unlink (via nlink)" — and `Unlink` bumped only
+the directory, so a holder that reached the file by another name kept serving
+the pre-unlink link count. The test creates twenty links and removes them one
+at a time, which is exactly the shape that exposes it.
+
+A `./check -g quick` run was started and stopped part-way (see below). Of the
+49 tests it reached, 38 were `[not run]` — and xfstests states its own reason
+for each, which is the N/A justification §27 asks for rather than a silent
+skip:
+
+| Reason | Count |
+|---|---|
+| `require non2 to be valid block disk` | 10 |
+| `xfs_io fpunch failed` (no `FALLOC_FL_PUNCH_HOLE`) | 8 |
+| `xfs_io fzero failed` (no `FALLOC_FL_ZERO_RANGE`) | 3 |
+| `fuse does not support shutdown` | 3 |
+| `attr` / `chacl` command not installed | 5 |
+| `kernel doesn't support renameat2` | 2 |
+| other | 7 |
+
+The block-device ones are structurally N/A for a filesystem with no block
+device; the `fpunch`/`fzero` ones are the `fallocate` gap named above.
+
+**This is not §27's bar either.** §27 asks for "the `generic/` groups
+applicable to a network filesystem", which is hundreds of tests. What ran
+here is a handful plus a partial quick group.
+
+## What the long fsx soak found
+
+A one-hour `fsx --duration=3600` run was started and did **not** complete: it
+stopped with `domapwrite: ftruncate: Input/output error` after filling the
+volume. The repo had grown to **21 GB** for a file fsx keeps under 256 KB.
+
+That is not a leak, it is the write path's shape, and it is worth stating
+plainly: every commit rewrites the modified file's chunks, and nothing
+reclaims the superseded ones until §19's GC runs — which nothing runs
+automatically. A long random-write workload therefore grows storage without
+bound. `atlas gc` exists and reclaims it; a mount that never calls it does
+not.
+
+The soak also exposed a real errno bug: a full backend surfaced as **EIO**
+rather than **ENOSPC**, which tells an application its data is corrupt when
+the disk is merely full. Fixed on both mounts.
+
 ## What has not been run
 
-- **`fsx` for 24 hours** — see above. The runs here are minutes, not a day.
-- **xfstests** — not run. It needs a scratch device and a much larger
-  harness, and the `generic/` subset applicable to a network filesystem would
-  need the N/A justifications §27 asks for.
+- **`fsx` for 24 hours** — the clean runs here are minutes. The one long run
+  attempted ended in ENOSPC after an hour, for the reason above.
+- **The full applicable `generic/` set** — a handful of tests and a partial
+  quick group is not §27's "generic groups applicable to a network
+  filesystem".
 - **The distributed correctness harness** (§27's Jepsen-style bounded-staleness
   checker) — not built. The coherence properties have unit and multi-mount
   end-to-end tests, and the protocol has a Quint model, but not a real-time

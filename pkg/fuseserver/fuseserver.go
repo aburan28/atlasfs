@@ -785,6 +785,16 @@ func errnoFor(err error) syscall.Errno {
 		return syscall.ENAMETOOLONG
 	case errors.Is(err, repo.ErrFileTooBig):
 		return syscall.EFBIG
+	case errors.Is(err, syscall.ENOSPC):
+		// The object backend ran out of room. Surfacing that as EIO tells
+		// an application its data is corrupt when in fact the disk is
+		// full — and ENOSPC is the one write error most callers already
+		// handle. Found by an fsx soak that filled the volume: every
+		// commit rewrites a file's chunks, so a long random-write
+		// workload grows storage until GC (§19) reclaims it.
+		return syscall.ENOSPC
+	case errors.Is(err, syscall.EDQUOT):
+		return syscall.EDQUOT
 	case errors.Is(err, repo.ErrQuotaExceeded), errors.Is(err, metadb.ErrQuotaExceeded):
 		return syscall.EDQUOT
 	default:

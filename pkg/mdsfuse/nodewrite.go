@@ -91,6 +91,15 @@ func errnoFor(err error) syscall.Errno {
 	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
 		return syscall.EINTR
 	}
+	// A local errno from the object backend — the client uploads chunks
+	// itself (§11), so these never cross the RPC. ENOSPC in particular
+	// must not become EIO: that tells an application its data is corrupt
+	// when the disk is merely full.
+	for _, e := range []syscall.Errno{syscall.ENOSPC, syscall.EDQUOT, syscall.EROFS} {
+		if errors.Is(err, e) {
+			return e
+		}
+	}
 	if e, ok := mds.ErrnoOf(err); ok {
 		return e
 	}
