@@ -60,6 +60,35 @@ func (c Class) leaseDuration() time.Duration {
 	}
 }
 
+// KernelCacheTTL is how long a kernel-side attribute or dentry cache
+// entry may be trusted for this class — the `D` of DESIGN.md §10 applied
+// to the one cache holder the design never names explicitly: the kernel
+// itself. A FUSE mount that leaves the kernel's attr/entry timeouts at
+// zero has not made itself more correct, only slower; it has moved every
+// getattr into a userspace round trip while §10's lease machinery sits
+// unused one layer down. Handing the kernel exactly the class's own D
+// makes it a well-behaved holder under the same bound every other holder
+// obeys.
+//
+// ClassImmutable gets a long but finite TTL rather than an infinite one,
+// because §8.2 is explicit that `immutable` means "this content does not
+// change", not "this path never rebinds" — republishing over a path is
+// legal, and a client that cached the old binding forever would never
+// see it.
+func (c Class) KernelCacheTTL() time.Duration {
+	if c == ClassImmutable || c == "" {
+		return immutableKernelCacheTTL
+	}
+	return c.leaseDuration()
+}
+
+// immutableKernelCacheTTL bounds how stale an `immutable` binding may be
+// after a republish (DESIGN.md §8.2). One minute is a judgement call, not
+// a figure from the design: long enough that a tree walk over a published
+// dataset is served from the kernel, short enough that a republish shows
+// up without an unmount.
+const immutableKernelCacheTTL = time.Minute
+
 // Mutable reports whether this class permits Create/Write/Unlink/Mkdir
 // after initial publish. Only ClassImmutable is not.
 func (c Class) Mutable() bool { return c != ClassImmutable && c != "" }

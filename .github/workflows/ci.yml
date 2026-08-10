@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The FUSE tests (pkg/fuseserver, pkg/csidriver) skip themselves when
+      # /dev/fuse is missing. That is the right behavior for a developer
+      # laptop and the wrong behavior for CI: a silent skip of the only
+      # tests that exercise a real kernel mount is indistinguishable from a
+      # pass. Fail loudly here instead, so losing /dev/fuse on the runner
+      # shows up as a broken build rather than a quietly narrower one.
+      - name: Require /dev/fuse
+        run: |
+          test -c /dev/fuse || {
+            echo "::error::/dev/fuse missing — the FUSE tests would silently skip"
+            exit 1
+          }
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+      - name: go test -race
+        run: go test ./... -count=1 -race
+
+      # Benchmarks are compiled and run for one iteration only: this is a
+      # correctness gate (a benchmark that no longer builds or panics is a
+      # broken benchmark), not a performance gate. Timing on a shared CI
+      # runner is too noisy to threshold against — the real numbers in
+      # README.md come from a dedicated run, not from here.
+      - name: benchmarks compile and run
+        run: go test ./... -run '^$' -bench . -benchtime 1x

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aburan28/atlasfs/pkg/pack"
 	"github.com/aburan28/atlasfs/pkg/store/local"
@@ -454,5 +455,34 @@ func TestFetchVerifiesHash(t *testing.T) {
 	badLoc.Length = loc.Length - 1
 	if _, err := pack.Fetch(ctx, r.Backend, rec.InlineChunk, badLoc); err == nil {
 		t.Fatal("expected Fetch to reject a truncated read")
+	}
+}
+
+// TestKernelCacheTTLMatchesLeaseDuration pins the kernel-side attr/entry
+// timeout to each mutable class's own lease duration D. These are the
+// same bound expressed at two layers (pkg/coherence's leases and the
+// kernel's attr cache), and DESIGN.md §8.1's staleness guarantee only
+// holds if they agree — a kernel TTL longer than D would serve a stale
+// attr past the window the design promises, with nothing able to
+// invalidate it.
+func TestKernelCacheTTLMatchesLeaseDuration(t *testing.T) {
+	for _, c := range []Class{ClassRelaxed, ClassSession} {
+		if got, want := c.KernelCacheTTL(), c.leaseDuration(); got != want {
+			t.Fatalf("%s: KernelCacheTTL() = %s, want lease duration %s", c, got, want)
+		}
+	}
+}
+
+// TestImmutableKernelCacheTTLIsFinite guards DESIGN.md §8.2: `immutable`
+// means the content behind a binding never changes, not that a path can
+// never be republished. An infinite kernel TTL would make a republish
+// invisible to an already-running mount forever.
+func TestImmutableKernelCacheTTLIsFinite(t *testing.T) {
+	ttl := ClassImmutable.KernelCacheTTL()
+	if ttl <= 0 {
+		t.Fatalf("immutable kernel TTL = %s; a zero/negative TTL defeats caching entirely", ttl)
+	}
+	if ttl > time.Hour {
+		t.Fatalf("immutable kernel TTL = %s; too long for a republish to ever become visible (§8.2)", ttl)
 	}
 }

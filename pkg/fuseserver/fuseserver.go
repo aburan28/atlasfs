@@ -666,7 +666,24 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 	if !r.Class.Mutable() {
 		opts = append(opts, "ro")
 	}
+	// Let the kernel cache attrs and dentries for exactly this class's
+	// D (repo.Class.KernelCacheTTL). Leaving these nil — go-fuse's
+	// default — means a zero timeout, so every getattr and every lookup
+	// becomes a userspace round trip even on an `immutable` mount where
+	// nothing can change. That is not a stricter guarantee than §10
+	// promises, just a slower way to provide the same one: measured at
+	// 124µs per stat before this was set (pkg/fuseserver/bench_test.go).
+	ttl := r.Class.KernelCacheTTL()
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
+		EntryTimeout: &ttl,
+		AttrTimeout:  &ttl,
+		// NegativeTimeout is deliberately left at zero rather than set to
+		// ttl. §10.4 validates a negative entry against a directory
+		// version, which pkg/coherence implements and consults on every
+		// Lookup; a kernel-side negative cache cannot participate in that
+		// check, so a create-after-ENOENT on another holder would be
+		// masked for up to ttl with no way to invalidate it. Paying the
+		// round trip on misses is the cost of keeping §10.4's guarantee.
 		MountOptions: fuse.MountOptions{
 			FsName: "atlasfs",
 			Name:   "atlasfs",
