@@ -95,8 +95,12 @@ func TestChmodThroughAuthority(t *testing.T) {
 	if err := os.Chmod(path, 0o755); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o755 {
-		t.Fatalf("writer sees mode %v err=%v, want 0755", fi.Mode().Perm(), err)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after chmod: %v", err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("writer sees mode %v, want 0755", fi.Mode().Perm())
 	}
 
 	awaitOrFail(t, "the other mount never saw the chmod", func() bool {
@@ -108,8 +112,12 @@ func TestChmodThroughAuthority(t *testing.T) {
 	if err := os.WriteFile(path, []byte("#!/bin/sh\necho hi again\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o755 {
-		t.Fatalf("overwrite reset the mode to %v err=%v", fi.Mode().Perm(), err)
+	fi, err = os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after overwrite: %v", err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("overwrite reset the mode to %v", fi.Mode().Perm())
 	}
 }
 

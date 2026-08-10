@@ -421,15 +421,21 @@ func TestMutatingHolderSeesItsOwnChangesImmediately(t *testing.T) {
 	if err := os.WriteFile(p, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if st, err := os.Stat(p); err != nil || st.Size() != 2 {
-		t.Fatalf("own create not immediately visible: %v size=%v", err, st)
+	// Split rather than combined: dereferencing st on the error path is a
+	// nil panic, which hides the real failure behind a crash.
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("own create not immediately visible: %v", err)
+	}
+	if st.Size() != 2 {
+		t.Fatalf("own create visible with size %d, want 2", st.Size())
 	}
 
 	// overwrite -> new size immediately, not the cached one
 	if err := os.WriteFile(p, []byte("much longer content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st, err := os.Stat(p)
+	st, err = os.Stat(p)
 	if err != nil {
 		t.Fatal(err)
 	}

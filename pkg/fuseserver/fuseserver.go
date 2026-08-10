@@ -700,6 +700,13 @@ func errnoFor(err error) syscall.Errno {
 	switch {
 	case err == nil:
 		return 0
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The kernel interrupts a FUSE request when the calling thread
+		// takes a signal — under load Go's own async-preemption SIGURG is
+		// enough — and go-fuse then cancels the handler's context.
+		// Reporting EIO would surface a spurious I/O error for a syscall
+		// that was merely interrupted.
+		return syscall.EINTR
 	case errors.Is(err, repo.ErrReadOnly):
 		return syscall.EROFS
 	case errors.Is(err, metadb.ErrNotFound):
@@ -741,7 +748,7 @@ func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno { re
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := h.fr.ReadAt(dest, off)
 	if err != nil && err != io.EOF {
-		return nil, syscall.EIO
+		return nil, errnoFor(err)
 	}
 	return fuse.ReadResultData(dest[:n]), 0
 }

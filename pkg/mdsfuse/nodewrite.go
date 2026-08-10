@@ -2,6 +2,7 @@ package mdsfuse
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"syscall"
@@ -58,6 +59,21 @@ var (
 func errnoFor(err error) syscall.Errno {
 	if err == nil {
 		return 0
+	}
+	// A cancelled request is not a failure of the filesystem. The kernel
+	// interrupts a FUSE request when the calling thread takes a signal —
+	// and under load Go's own async-preemption SIGURG is enough to do it
+	// — after which go-fuse cancels the handler's context. Reporting EIO
+	// there surfaces a spurious I/O error to an application whose syscall
+	// was merely interrupted; EINTR is what actually happened, and what
+	// callers already know how to retry. This was a real intermittent
+	// failure, not a theoretical one: it showed up as EIO from open(2)
+	// under `go test -race`.
+	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+		return syscall.EINTR
+	}
+	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		return syscall.EINTR
 	}
 	if e, ok := mds.ErrnoOf(err); ok {
 		return e
@@ -186,7 +202,10 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 		return nil, nil, 0, errnoFor(err)
 	}
 	resp, err := n.cfg.Client.Lookup(ctx, n.ino, name)
-	if err != nil || !resp.Found {
+	if err != nil {
+		return nil, nil, 0, errnoFor(err)
+	}
+	if !resp.Found {
 		return nil, nil, 0, syscall.EIO
 	}
 	child := &Node{cfg: n.cfg, ino: resp.Inode, rec: resp.Record, parent: n.ino, name: name}
@@ -216,7 +235,7 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	}
 	rec, err := n.cfg.Client.GetInode(ctx, id)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, errnoFor(err)
 	}
 	child := &Node{cfg: n.cfg, ino: id, rec: rec, parent: n.ino, name: name}
 	fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
@@ -444,12 +463,12 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		sess := &writeSession{cfg: n.cfg, dir: dir, name: name}
 		rd, err := newReader(ctx, n.cfg, rec)
 		if err != nil {
-			return syscall.EIO
+			return errnoFor(err)
 		}
 		cur := make([]byte, rec.Size)
 		if rec.Size > 0 {
 			if _, err := rd.ReadAt(ctx, cur, 0); err != nil {
-				return syscall.EIO
+				return errnoFor(err)
 			}
 		}
 		sess.buf.Write(cur)
@@ -484,11 +503,11 @@ func (n *Node) openForWrite(ctx context.Context, truncate bool) (fs.FileHandle, 
 		if rec.Size > 0 {
 			rd, err := newReader(ctx, n.cfg, rec)
 			if err != nil {
-				return nil, syscall.EIO
+				return nil, errnoFor(err)
 			}
 			cur := make([]byte, rec.Size)
 			if _, err := rd.ReadAt(ctx, cur, 0); err != nil {
-				return nil, syscall.EIO
+				return nil, errnoFor(err)
 			}
 			sess.buf.Write(cur)
 		}

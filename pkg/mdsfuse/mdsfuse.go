@@ -181,7 +181,7 @@ var (
 func (n *Node) current(ctx context.Context) (metadb.InodeRecord, syscall.Errno) {
 	rec, err := n.cfg.Client.GetInode(ctx, n.ino)
 	if err != nil {
-		return metadb.InodeRecord{}, syscall.EIO
+		return metadb.InodeRecord{}, errnoFor(err)
 	}
 	return rec, 0
 }
@@ -261,7 +261,7 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	resp, err := n.cfg.Client.Lookup(ctx, n.ino, name)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, errnoFor(err)
 	}
 	if !resp.Found {
 		return nil, syscall.ENOENT
@@ -277,13 +277,13 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	entries, err := n.cfg.Client.Readdir(ctx, n.ino)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, errnoFor(err)
 	}
 	out := make([]fuse.DirEntry, 0, len(entries))
 	for _, e := range entries {
 		rec, err := n.cfg.Client.GetInode(ctx, e.Inode)
 		if err != nil {
-			return nil, syscall.EIO
+			return nil, errnoFor(err)
 		}
 		out = append(out, fuse.DirEntry{
 			Name: e.Name,
@@ -320,7 +320,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	}
 	rd, err := newReader(ctx, n.cfg, rec)
 	if err != nil {
-		return nil, 0, syscall.EIO
+		return nil, 0, errnoFor(err)
 	}
 	return &fileHandle{rd: rd}, 0, 0
 }
@@ -339,7 +339,7 @@ func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno { re
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := h.rd.ReadAt(ctx, dest, off)
 	if err != nil && err != io.EOF {
-		return nil, syscall.EIO
+		return nil, errnoFor(err)
 	}
 	return fuse.ReadResultData(dest[:n]), 0
 }
