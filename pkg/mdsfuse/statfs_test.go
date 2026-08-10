@@ -112,3 +112,32 @@ func TestChmodThroughAuthority(t *testing.T) {
 		t.Fatalf("overwrite reset the mode to %v err=%v", fi.Mode().Perm(), err)
 	}
 }
+
+// TestCreateHonoursTheRequestedModeThroughAuthority: the create mode has
+// to survive the RPC to the authority too, or a program that creates an
+// executable directly gets a 0644 file.
+func TestCreateHonoursTheRequestedModeThroughAuthority(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
+	mnt := c.mountAt(t, "writer", 0)
+
+	for _, mode := range []os.FileMode{0o755, 0o600} {
+		name := filepath.Join(mnt, "created-"+mode.String())
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY, mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte("content")); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != mode {
+			t.Errorf("O_CREAT with mode %v produced %v", mode, fi.Mode().Perm())
+		}
+	}
+}

@@ -39,7 +39,7 @@ func TestImmutableRepoRejectsWrites(t *testing.T) {
 	if err := r.Unlink(metadb.RootInode, "f.txt"); !errors.Is(err, ErrReadOnly) {
 		t.Fatalf("expected ErrReadOnly, got %v", err)
 	}
-	if _, err := r.Mkdir(metadb.RootInode, "d"); !errors.Is(err, ErrReadOnly) {
+	if _, err := r.Mkdir(metadb.RootInode, "d", 0o755); !errors.Is(err, ErrReadOnly) {
 		t.Fatalf("expected ErrReadOnly, got %v", err)
 	}
 	if err := r.Rmdir(metadb.RootInode, "d"); !errors.Is(err, ErrReadOnly) {
@@ -196,7 +196,7 @@ func TestUnlinkNonexistentFails(t *testing.T) {
 func TestMkdirRmdir(t *testing.T) {
 	r := openRelaxed(t)
 
-	id, err := r.Mkdir(metadb.RootInode, "sub")
+	id, err := r.Mkdir(metadb.RootInode, "sub", 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestRmdirRefusesNonEmpty(t *testing.T) {
 	r := openRelaxed(t)
 	ctx := context.Background()
 
-	if _, err := r.Mkdir(metadb.RootInode, "sub"); err != nil {
+	if _, err := r.Mkdir(metadb.RootInode, "sub", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	subInode, _, err := r.Resolve("/sub")
@@ -265,7 +265,7 @@ func TestCommitRefusesToOverwriteADirectory(t *testing.T) {
 	r := openRelaxed(t)
 	ctx := context.Background()
 
-	if _, err := r.Mkdir(metadb.RootInode, "d"); err != nil {
+	if _, err := r.Mkdir(metadb.RootInode, "d", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	h, _ := r.CreateFile(metadb.RootInode, "d")
@@ -284,14 +284,14 @@ func TestMkdirRefusesExistingName(t *testing.T) {
 	if _, err := h.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Mkdir(metadb.RootInode, "f.txt"); err == nil {
+	if _, err := r.Mkdir(metadb.RootInode, "f.txt", 0o755); err == nil {
 		t.Fatal("expected Mkdir to refuse a name that already exists as a file")
 	}
 
-	if _, err := r.Mkdir(metadb.RootInode, "d"); err != nil {
+	if _, err := r.Mkdir(metadb.RootInode, "d", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Mkdir(metadb.RootInode, "d"); err == nil {
+	if _, err := r.Mkdir(metadb.RootInode, "d", 0o755); err == nil {
 		t.Fatal("expected Mkdir to refuse a name that already exists as a directory")
 	}
 }
@@ -402,10 +402,10 @@ func TestQuotaRejectsMkdirOverInodeLimit(t *testing.T) {
 	if err := r.SetQuota(0, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Mkdir(metadb.RootInode, "first"); err != nil {
+	if _, err := r.Mkdir(metadb.RootInode, "first", 0o755); err != nil {
 		t.Fatalf("first mkdir within the inode limit should succeed, got %v", err)
 	}
-	if _, err := r.Mkdir(metadb.RootInode, "second"); !errors.Is(err, ErrQuotaExceeded) {
+	if _, err := r.Mkdir(metadb.RootInode, "second", 0o755); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("expected ErrQuotaExceeded, got %v", err)
 	}
 	if _, _, err := r.Resolve("/second"); !errors.Is(err, metadb.ErrNotFound) {
@@ -472,7 +472,7 @@ func TestQuotaUsageMatchesContentAcrossWritesAndUnlinks(t *testing.T) {
 
 	write("a.txt", 5)
 	write("b.txt", 7)
-	if _, err := r.Mkdir(metadb.RootInode, "d"); err != nil {
+	if _, err := r.Mkdir(metadb.RootInode, "d", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	bytesUsed, inodesUsed, err := r.QuotaUsage()

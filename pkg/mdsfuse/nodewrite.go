@@ -161,7 +161,9 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if n.cfg.ReadOnly {
 		return nil, nil, 0, syscall.EROFS
 	}
-	h := &writeHandle{sess: &writeSession{cfg: n.cfg, dir: n.ino, name: name}}
+	// The kernel has already applied the caller's umask, so mode is what
+	// the file should end up with.
+	h := &writeHandle{sess: &writeSession{cfg: n.cfg, dir: n.ino, name: name, mode: mode}}
 	// Commit immediately so the name exists as soon as create(2) returns,
 	// which is what a caller that stats it straight afterwards expects.
 	// The empty record is replaced on the first real flush.

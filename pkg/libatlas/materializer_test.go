@@ -175,7 +175,7 @@ func TestOpenMappedEmptyFile(t *testing.T) {
 
 func TestOpenMappedRejectsDirectoryAndSymlink(t *testing.T) {
 	r, _ := newCountingRepo(t, repo.ClassRelaxed)
-	if _, err := r.Mkdir(metadb.RootInode, "d"); err != nil {
+	if _, err := r.Mkdir(metadb.RootInode, "d", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	m := mustNewMaterializer(t, 1<<20)

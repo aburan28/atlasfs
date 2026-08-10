@@ -414,6 +414,10 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if err != nil {
 		return nil, nil, 0, errnoFor(err)
 	}
+	// The kernel has already applied the caller's umask to mode, so this
+	// is the mode the file should end up with.
+	h.SetMode(mode)
+	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, mode: mode & 0o7777}
 	id, err := h.Commit(ctx)
 	if err != nil {
 		return nil, nil, 0, errnoFor(err)
@@ -429,7 +433,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	stable := fs.StableAttr{Mode: direntMode(rec), Ino: uint64(id)}
 	inode := n.NewInode(ctx, child, stable)
 
-	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, node: child}
+	fh.node = child
 	child.activeWrite = fh // no lock needed: child isn't reachable by any other goroutine yet
 	return inode, fh, fuse.FOPEN_KEEP_CACHE, 0
 }
@@ -439,7 +443,7 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	id, err := n.repo.Mkdir(n.ino, name)
+	id, err := n.repo.Mkdir(n.ino, name, mode)
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -702,7 +706,11 @@ type writeFileHandle struct {
 	repo   *repo.Repo
 	parent metadb.InodeID
 	name   string
-	node   *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
+	// mode is what a create(2) asked for; it survives to the first commit
+	// so a file created executable is executable. Zero on a handle opened
+	// against an existing file, where the stored mode wins anyway.
+	mode uint32
+	node *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
 
 	mu    sync.Mutex
 	buf   []byte
@@ -840,6 +848,7 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	if err != nil {
 		return errnoFor(err)
 	}
+	wh.SetMode(h.mode)
 	if _, err := wh.Write(h.buf); err != nil {
 		return syscall.EIO
 	}

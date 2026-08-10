@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aburan28/atlasfs/pkg/repo"
 )
@@ -120,5 +121,77 @@ func TestChmodOnImmutableIsReadOnly(t *testing.T) {
 
 	if err := os.Chmod(filepath.Join(mnt, "f"), 0o777); err == nil {
 		t.Fatal("expected chmod on an immutable mount to fail")
+	}
+}
+
+// TestUtimesPersists: touch -d has to stick. tar -p and cp -p both
+// restore mtimes, and a filesystem that accepts and drops them makes
+// every incremental build tool think nothing ever changed.
+func TestUtimesPersists(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "dated")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	want := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(path, want, want); err != nil {
+		t.Fatalf("utimes: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(want) {
+		t.Fatalf("mtime after utimes = %v, want %v", fi.ModTime().UTC(), want)
+	}
+}
+
+// TestCreateHonoursTheRequestedMode: open(2) with O_CREAT carries the
+// mode the file should get, already umask-applied by the kernel.
+// Ignoring it makes every program that creates an executable directly —
+// install, tar restoring an archive, a build emitting a script — produce
+// a 0644 file, and whether that is noticed depends on whether the
+// program bothers to chmod afterwards. (CI caught this: as root, GNU tar
+// issued a follow-up chmod and the bug was invisible; as the runner's
+// non-root user it relied on the create mode and the test failed.)
+func TestCreateHonoursTheRequestedMode(t *testing.T) {
+	_, mnt := mountWritable(t)
+
+	for _, mode := range []os.FileMode{0o755, 0o600, 0o444} {
+		name := filepath.Join(mnt, "created-"+mode.String())
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY, mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte("content")); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != mode {
+			t.Errorf("O_CREAT with mode %v produced %v", mode, fi.Mode().Perm())
+		}
+	}
+}
+
+// TestMkdirHonoursTheRequestedMode: the same for mkdir(2).
+func TestMkdirHonoursTheRequestedMode(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "d")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("mkdir 0700 produced %v", fi.Mode().Perm())
 	}
 }

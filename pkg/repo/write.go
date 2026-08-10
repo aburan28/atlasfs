@@ -67,9 +67,20 @@ type WriteHandle struct {
 	repo *Repo
 	dir  metadb.InodeID
 	name string
+	mode uint32
 	buf  bytes.Buffer
 	done bool
 }
+
+// SetMode records the permission bits a create(2) asked for. It applies
+// only when Commit binds a *new* name: an overwrite keeps the existing
+// inode's mode, because the caller is supplying content, not
+// permissions (see metadb.CommitFile).
+//
+// Without this an open(2) with O_CREAT and mode 0755 produces a 0644
+// file, and every program that creates an executable directly — install,
+// tar restoring an archive, a build emitting a script — loses the bit.
+func (h *WriteHandle) SetMode(mode uint32) { h.mode = mode & 0o7777 }
 
 // CreateFile opens a buffered write handle for name within dir. Fails
 // with ErrReadOnly outside a mutable class. Does not touch the
@@ -163,7 +174,11 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 		return 0, err
 	}
 
-	rec := metadb.InodeRecord{Mode: 0o644, MTime: time.Now(), NLink: 1}
+	mode := h.mode
+	if mode == 0 {
+		mode = 0o644
+	}
+	rec := metadb.InodeRecord{Mode: mode, MTime: time.Now(), NLink: 1}
 	content.apply(&rec)
 
 	id, err := r.DB.CommitFile(h.dir, h.name, rec)
@@ -209,11 +224,15 @@ func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 // Mkdir creates a new, empty directory named name under dir. Fails with
 // EEXIST-equivalent if name is already bound to anything — unlike
 // WriteHandle.Commit, mkdir(2) never silently overwrites.
-func (r *Repo) Mkdir(dir metadb.InodeID, name string) (metadb.InodeID, error) {
+func (r *Repo) Mkdir(dir metadb.InodeID, name string, mode uint32) (metadb.InodeID, error) {
 	if !r.Class.Mutable() {
 		return 0, ErrReadOnly
 	}
-	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2})
+	perm := mode & 0o7777
+	if perm == 0 {
+		perm = 0o755
+	}
+	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{IsDir: true, Mode: perm, MTime: time.Now(), NLink: 2})
 	if err != nil {
 		switch {
 		case errors.Is(err, metadb.ErrExists):

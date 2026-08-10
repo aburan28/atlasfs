@@ -45,7 +45,11 @@ type writeSession struct {
 	// dir/name, and committing to the captured pair would recreate the
 	// name the rename just removed. dir/name remain the fallback for a
 	// session that has no node yet (Create, before the child exists).
-	node   *Node
+	node *Node
+	// mode is what a create(2) asked for, carried to the first commit so
+	// a file created executable is executable. Zero means "use the
+	// default"; an overwrite keeps the stored mode regardless.
+	mode   uint32
 	buf    bytes.Buffer
 	dirty  bool
 	closed bool
@@ -104,8 +108,12 @@ func (w *writeSession) commit(ctx context.Context) error {
 		return err
 	}
 
+	mode := w.mode & 0o7777
+	if mode == 0 {
+		mode = 0o644
+	}
 	rec := metadb.InodeRecord{
-		Mode:  0o644,
+		Mode:  mode,
 		Size:  uint64(len(content)),
 		MTime: time.Now(),
 		NLink: 1,
