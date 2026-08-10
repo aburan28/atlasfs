@@ -29,6 +29,8 @@ type MetadataServer interface {
 	HasLocator(context.Context, *HasLocatorRequest) (*HasLocatorResponse, error)
 	Mkdir(context.Context, *MkdirRequest) (*MkdirResponse, error)
 	Rmdir(context.Context, *RmdirRequest) (*RmdirResponse, error)
+	Rename(context.Context, *RenameRequest) (*RenameResponse, error)
+	Symlink(context.Context, *SymlinkRequest) (*SymlinkResponse, error)
 	Subscribe(*SubscribeRequest, grpc.ServerStream) error
 }
 
@@ -76,6 +78,8 @@ var serviceDesc = grpc.ServiceDesc{
 		{MethodName: "HasLocator", Handler: unaryHandler(MetadataServer.HasLocator, MethodHasLocator)},
 		{MethodName: "Mkdir", Handler: unaryHandler(MetadataServer.Mkdir, MethodMkdir)},
 		{MethodName: "Rmdir", Handler: unaryHandler(MetadataServer.Rmdir, MethodRmdir)},
+		{MethodName: "Rename", Handler: unaryHandler(MetadataServer.Rename, MethodRename)},
+		{MethodName: "Symlink", Handler: unaryHandler(MetadataServer.Symlink, MethodSymlink)},
 	},
 	Streams: []grpc.StreamDesc{
 		{StreamName: "Subscribe", Handler: subscribeHandler, ServerStreams: true},

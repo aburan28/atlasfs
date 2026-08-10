@@ -44,6 +44,16 @@ type Client struct {
 	// makes the inode lease cache nearly unreachable through a
 	// filesystem: the kernel does a LOOKUP before almost everything.
 	dentries map[string]map[string]metadb.InodeID
+	// negatives[dirObj][name] — names known absent as of the directory's
+	// lease (§10.4). Validated against the directory rather than per
+	// name, which is what lets one dirver bump clear every miss at once.
+	negatives map[string]map[string]struct{}
+	// epochs[obj] counts invalidations of obj. A response that was in
+	// flight while obj was invalidated carries a pre-invalidation view,
+	// and storing it would resurrect exactly what the invalidation
+	// removed — so every store captures the epoch before its RPC and
+	// drops the result if the counter moved underneath it.
+	epochs map[string]uint64
 
 	// onRecall, when set, runs before the client acks a recall. Tests use
 	// it to observe ordering; a real client drops any derived state here.
@@ -71,11 +81,13 @@ func NewClient(cc *grpc.ClientConn, holder string, clock coherence.Clock) *Clien
 		clock = coherence.RealClock{}
 	}
 	return &Client{
-		cc:       cc,
-		holder:   holder,
-		clock:    clock,
-		cache:    map[string]*cacheEntry{},
-		dentries: map[string]map[string]metadb.InodeID{},
+		cc:        cc,
+		holder:    holder,
+		clock:     clock,
+		cache:     map[string]*cacheEntry{},
+		dentries:  map[string]map[string]metadb.InodeID{},
+		negatives: map[string]map[string]struct{}{},
+		epochs:    map[string]uint64{},
 	}
 }
 
@@ -117,11 +129,12 @@ func (c *Client) GetInode(ctx context.Context, id metadb.InodeID) (metadb.InodeR
 	if rec, ok := c.CachedInode(id); ok {
 		return rec, nil
 	}
+	since := c.epochOf(inodeObj(id))
 	var resp GetInodeResponse
 	if err := c.cc.Invoke(ctx, MethodGetInode, &GetInodeRequest{Holder: c.holder, Inode: id}, &resp); err != nil {
 		return metadb.InodeRecord{}, err
 	}
-	c.store(inodeObj(id), resp.Record, resp.Lease)
+	c.store(inodeObj(id), resp.Record, resp.Lease, since)
 	return resp.Record, nil
 }
 
@@ -133,13 +146,21 @@ func (c *Client) Lookup(ctx context.Context, dir metadb.InodeID, name string) (L
 	if ino, rec, ok := c.cachedDentry(dir, name); ok {
 		return LookupResponse{Found: true, Inode: ino, Record: rec}, nil
 	}
+	if c.cachedNegative(dir, name) {
+		return LookupResponse{}, nil
+	}
+	sinceDir := c.epochOf(dirObj(dir))
 	var resp LookupResponse
 	err := c.cc.Invoke(ctx, MethodLookup, &LookupRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
-	if err == nil && resp.Found {
-		c.store(inodeObj(resp.Inode), resp.Record, resp.Lease)
+	switch {
+	case err != nil:
+	case resp.Found:
+		c.store(inodeObj(resp.Inode), resp.Record, resp.Lease, c.epochOf(inodeObj(resp.Inode)))
 		if resp.DirLease.TTL > 0 {
-			c.storeDentry(dir, name, resp.Inode, resp.DirLease)
+			c.storeDentry(dir, name, resp.Inode, resp.DirLease, sinceDir)
 		}
+	case resp.DirLease.TTL > 0:
+		c.storeNegative(dir, name, resp.DirLease, sinceDir)
 	}
 	return resp, err
 }
@@ -168,16 +189,58 @@ func (c *Client) cachedDentry(dir metadb.InodeID, name string) (metadb.InodeID, 
 	return ino, rec, true
 }
 
-func (c *Client) storeDentry(dir metadb.InodeID, name string, ino metadb.InodeID, dirLease Lease) {
-	c.store(dirObj(dir), metadb.InodeRecord{IsDir: true}, dirLease)
+func (c *Client) storeDentry(dir metadb.InodeID, name string, ino metadb.InodeID, dirLease Lease, since uint64) {
+	c.store(dirObj(dir), metadb.InodeRecord{IsDir: true}, dirLease, since)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.epochs[dirObj(dir)] != since {
+		return
+	}
 	m := c.dentries[dirObj(dir)]
 	if m == nil {
 		m = map[string]metadb.InodeID{}
 		c.dentries[dirObj(dir)] = m
 	}
 	m[name] = ino
+}
+
+// cachedNegative answers "this name is absent" locally, for as long as
+// the directory's own lease holds. DESIGN.md §10.4: a miss is cached
+// against the directory version, so any mutation under the directory
+// clears every negative entry at once rather than needing a message per
+// name.
+func (c *Client) cachedNegative(dir metadb.InodeID, name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.cache[dirObj(dir)]
+	if e == nil || (!e.noExpiry && c.clock.Now().After(e.expiry)) {
+		return false
+	}
+	_, ok := c.negatives[dirObj(dir)][name]
+	return ok
+}
+
+func (c *Client) storeNegative(dir metadb.InodeID, name string, dirLease Lease, since uint64) {
+	c.store(dirObj(dir), metadb.InodeRecord{IsDir: true}, dirLease, since)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.epochs[dirObj(dir)] != since {
+		return
+	}
+	m := c.negatives[dirObj(dir)]
+	if m == nil {
+		m = map[string]struct{}{}
+		c.negatives[dirObj(dir)] = m
+	}
+	m[name] = struct{}{}
+}
+
+// epochOf reads obj's invalidation counter, to be captured before an RPC
+// and handed back to store: see the epochs field.
+func (c *Client) epochOf(obj string) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.epochs[obj]
 }
 
 func (c *Client) Readdir(ctx context.Context, dir metadb.InodeID) ([]metadb.DirEntry, error) {
@@ -221,9 +284,14 @@ func (c *Client) invalidateOwnMutation(dir metadb.InodeID) {
 	c.invalidate(dirObj(dir))
 }
 
-func (c *Client) store(obj string, rec metadb.InodeRecord, l Lease) {
+func (c *Client) store(obj string, rec metadb.InodeRecord, l Lease, since uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.epochs[obj] != since {
+		// Invalidated while this response was in flight: the lease it
+		// carries was granted against a view that no longer exists.
+		return
+	}
 	e := &cacheEntry{record: rec, version: l.Version}
 	if l.TTL <= 0 {
 		e.noExpiry = true
@@ -238,11 +306,13 @@ func (c *Client) store(obj string, rec metadb.InodeRecord, l Lease) {
 func (c *Client) invalidate(obj string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.epochs[obj]++
 	delete(c.cache, obj)
 	// A directory invalidation drops every dentry cached under it in one
-	// step — the same bulk property §10.4 relies on for negative entries,
-	// applied to positive ones.
+	// step — the bulk property §10.4 relies on, applied to both the
+	// positive bindings and the negative ones.
 	delete(c.dentries, obj)
+	delete(c.negatives, obj)
 }
 
 // Subscribe opens the push stream and services it until the context is
@@ -402,4 +472,27 @@ func (c *Client) Rmdir(ctx context.Context, dir metadb.InodeID, name string) err
 		c.invalidateOwnMutation(dir)
 	}
 	return err
+}
+
+func (c *Client) Rename(ctx context.Context, oldDir metadb.InodeID, oldName string, newDir metadb.InodeID, newName string) error {
+	var resp RenameResponse
+	err := c.cc.Invoke(ctx, MethodRename, &RenameRequest{
+		Holder: c.holder, OldDir: oldDir, OldName: oldName, NewDir: newDir, NewName: newName,
+	}, &resp)
+	if err == nil {
+		c.invalidateOwnMutation(oldDir)
+		if newDir != oldDir {
+			c.invalidateOwnMutation(newDir)
+		}
+	}
+	return err
+}
+
+func (c *Client) Symlink(ctx context.Context, dir metadb.InodeID, name, target string) (metadb.InodeID, error) {
+	var resp SymlinkResponse
+	err := c.cc.Invoke(ctx, MethodSymlink, &SymlinkRequest{Holder: c.holder, Dir: dir, Name: name, Target: target}, &resp)
+	if err == nil {
+		c.invalidateOwnMutation(dir)
+	}
+	return resp.Inode, err
 }

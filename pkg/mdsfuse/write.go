@@ -37,12 +37,29 @@ import (
 
 // writeSession accumulates a file's content until flush.
 type writeSession struct {
-	cfg    Config
-	dir    metadb.InodeID
-	name   string
+	cfg  Config
+	dir  metadb.InodeID
+	name string
+	// node, when set, is the authority on where this session commits. A
+	// rename while the file is open moves the dentry out from under
+	// dir/name, and committing to the captured pair would recreate the
+	// name the rename just removed. dir/name remain the fallback for a
+	// session that has no node yet (Create, before the child exists).
+	node   *Node
 	buf    bytes.Buffer
 	dirty  bool
 	closed bool
+}
+
+// target is the dentry this session commits into, re-read at commit time
+// rather than captured at open time — see the node field.
+func (w *writeSession) target() (metadb.InodeID, string) {
+	if w.node != nil {
+		if dir, name := w.node.binding(); name != "" {
+			return dir, name
+		}
+	}
+	return w.dir, w.name
 }
 
 func (w *writeSession) writeAt(p []byte, off int64) (int, error) {
@@ -95,7 +112,8 @@ func (w *writeSession) commit(ctx context.Context) error {
 	}
 	ref.apply(&rec)
 
-	if _, err := w.cfg.Client.Commit(ctx, w.dir, w.name, rec); err != nil {
+	dir, name := w.target()
+	if _, err := w.cfg.Client.Commit(ctx, dir, name, rec); err != nil {
 		w.dirty = true
 		return err
 	}

@@ -12,9 +12,9 @@
 //
 // That is the mount's current limit, stated plainly: pkg/mds serves
 // leases to real remote holders and implements §10.6's recall against
-// them, but this mount does not go through it — a mountpoint backed by
-// the metadata service is unbuilt, which is why `posix` is reachable
-// via pkg/mds and not via Mount.
+// them, but this mount does not go through it. `posix` is reachable by
+// mounting through pkg/mdsfuse instead, where the mount is a genuine
+// remote holder and a recall against it crosses a process boundary.
 //
 // This is a plain go-fuse mount (splice/passthrough tuning from
 // DESIGN.md §21.2 is not implemented here — that is a later-phase
@@ -89,7 +89,19 @@ var (
 	_ fs.NodeMkdirer    = (*Node)(nil)
 	_ fs.NodeRmdirer    = (*Node)(nil)
 	_ fs.NodeSetattrer  = (*Node)(nil)
+	_ fs.NodeRenamer    = (*Node)(nil)
+	_ fs.NodeSymlinker  = (*Node)(nil)
 )
+
+// binding reads the dentry this node is currently bound to. Rename
+// rewrites it under mu, so a write path that captured the pair at open
+// time must re-read it rather than close over the fields — committing to
+// the pre-rename name would recreate the name the rename removed.
+func (n *Node) binding() (metadb.InodeID, string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.parent, n.name
+}
 
 // currentRec returns the Node's current InodeRecord, consulting the
 // repo's coherence.Manager (when non-nil) to decide whether the cached
@@ -393,6 +405,55 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return errnoFor(n.repo.Rmdir(n.ino, name))
 }
 
+// Rename moves name out of this directory and into newParent under
+// newName. The metadata move is one metadb transaction; what happens
+// here on top of it is rebinding the moved Node, so an already-open
+// write handle for the file commits to where the file now lives.
+func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	if !n.repo.Class.Mutable() {
+		return syscall.EROFS
+	}
+	if flags != 0 {
+		// renameat2's RENAME_EXCHANGE and RENAME_NOREPLACE need atomicity
+		// repo.Rename does not offer, and honouring the call while
+		// ignoring the flag would turn a "don't clobber" request into a
+		// clobber. EINVAL is what a filesystem without renameat2 support
+		// returns, and what glibc's fallback path expects.
+		return syscall.EINVAL
+	}
+	dst, ok := newParent.(*Node)
+	if !ok {
+		return syscall.EXDEV
+	}
+	child := n.GetChild(name)
+	if err := n.repo.Rename(n.ino, name, dst.ino, newName); err != nil {
+		return errnoFor(err)
+	}
+	if child != nil {
+		if cn, ok := child.Operations().(*Node); ok {
+			cn.mu.Lock()
+			cn.parent, cn.name = dst.ino, newName
+			cn.mu.Unlock()
+		}
+	}
+	return 0
+}
+
+func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	id, err := n.repo.Symlink(n.ino, name, target)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	rec, err := n.repo.DB.GetInode(id)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	child := &Node{repo: n.repo, ino: id, parent: n.ino, name: name}
+	child.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return n.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFLNK, Ino: uint64(id)}), 0
+}
+
 // Setattr handles truncate (via truncate(2)/ftruncate(2), and the
 // O_TRUNC-on-an-existing-file case that a plain open(2) also routes
 // through this — not through Node.Open's flags — on Linux's FUSE
@@ -459,7 +520,8 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		} else {
 			data = data[:sz]
 		}
-		repoWH, err := n.repo.CreateFile(n.parent, n.name)
+		parent, name := n.binding()
+		repoWH, err := n.repo.CreateFile(parent, name)
 		if err != nil {
 			return errnoFor(err)
 		}
@@ -492,13 +554,15 @@ func errnoFor(err error) syscall.Errno {
 		return syscall.ENOENT
 	case errors.Is(err, repo.ErrExists), errors.Is(err, metadb.ErrExists):
 		return syscall.EEXIST
-	case errors.Is(err, repo.ErrIsDirectory):
+	case errors.Is(err, repo.ErrIsDirectory), errors.Is(err, metadb.ErrIsDirectory):
 		return syscall.EISDIR
 	case errors.Is(err, repo.ErrNotDir), errors.Is(err, metadb.ErrNotDir):
 		return syscall.ENOTDIR
-	case errors.Is(err, repo.ErrNotEmpty):
+	case errors.Is(err, repo.ErrNotEmpty), errors.Is(err, metadb.ErrNotEmpty):
 		return syscall.ENOTEMPTY
-	case errors.Is(err, repo.ErrQuotaExceeded):
+	case errors.Is(err, metadb.ErrInvalidRename):
+		return syscall.EINVAL
+	case errors.Is(err, repo.ErrQuotaExceeded), errors.Is(err, metadb.ErrQuotaExceeded):
 		return syscall.EDQUOT
 	default:
 		return syscall.EIO
@@ -546,6 +610,19 @@ var (
 	_ fs.FileFlusher  = (*writeFileHandle)(nil)
 	_ fs.FileReleaser = (*writeFileHandle)(nil)
 )
+
+// target is the dentry this handle commits into. It prefers the node's
+// current binding over the pair captured at Open time, because a rename
+// while the file is open moves the dentry: committing to the captured
+// name would recreate the name the rename just removed.
+func (h *writeFileHandle) target() (metadb.InodeID, string) {
+	if h.node != nil {
+		if parent, name := h.node.binding(); name != "" {
+			return parent, name
+		}
+	}
+	return h.parent, h.name
+}
 
 // resize truncates or zero-extends the handle's buffer to sz bytes and
 // marks it dirty, so a subsequent Flush commits the resized content —
@@ -637,7 +714,8 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	}
 	h.dirty = false
 
-	wh, err := h.repo.CreateFile(h.parent, h.name)
+	parent, name := h.target()
+	wh, err := h.repo.CreateFile(parent, name)
 	if err != nil {
 		return errnoFor(err)
 	}

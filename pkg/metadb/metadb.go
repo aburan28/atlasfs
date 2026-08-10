@@ -339,6 +339,155 @@ func (db *DB) RemoveEntry(dir InodeID, name string, deletedAt time.Time) error {
 	})
 }
 
+// Rename moves the binding at (oldDir, oldName) to (newDir, newName),
+// atomically. POSIX requires the whole thing to be one step — an
+// observer must never see the name at neither location nor at both — so
+// it is a single bbolt transaction rather than a remove and a create.
+//
+// Semantics implemented, and the reasoning where POSIX allows choices:
+//
+//   - Renaming onto an existing *file* replaces it, and the replaced
+//     inode goes to the graveyard rather than being deleted, exactly as
+//     unlink does (§19.3) — GC is what eventually reclaims it, and its
+//     quota is released here.
+//   - Renaming onto an existing *directory* requires that directory to
+//     be empty, and renaming a non-directory onto a directory (or the
+//     reverse) is refused. Those are POSIX's rules, and the emptiness
+//     check has to happen inside this transaction or it races a create.
+//   - Renaming a directory into its own subtree would detach that
+//     subtree from the root, so it is refused with ErrInvalidRename.
+//     Nothing else in the system would notice — the entries would simply
+//     become unreachable and GC would eventually eat them.
+//
+// Quota is unchanged for a plain move: the same bytes and inode stay
+// bound, just under a different name.
+func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName string, deletedAt time.Time) error {
+	if oldDir == newDir && oldName == newName {
+		return nil
+	}
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		srcID, err := lookupTx(tx, oldDir, oldName)
+		if err != nil {
+			return err
+		}
+		srcRec, err := getInodeTx(tx, srcID)
+		if err != nil {
+			return err
+		}
+		if newDirRec, err := getInodeTx(tx, newDir); err != nil {
+			return err
+		} else if !newDirRec.IsDir {
+			return ErrNotDir
+		}
+		if srcRec.IsDir {
+			if err := checkNotDescendantTx(tx, srcID, newDir); err != nil {
+				return err
+			}
+		}
+
+		if dstID, err := lookupTx(tx, newDir, newName); err == nil {
+			dstRec, err := getInodeTx(tx, dstID)
+			if err != nil {
+				return err
+			}
+			switch {
+			case dstRec.IsDir && !srcRec.IsDir:
+				return ErrIsDirectory
+			case !dstRec.IsDir && srcRec.IsDir:
+				return ErrNotDir
+			case dstRec.IsDir && srcRec.IsDir:
+				kids, err := readdirTx(tx, dstID)
+				if err != nil {
+					return err
+				}
+				if len(kids) > 0 {
+					return ErrNotEmpty
+				}
+			}
+			// Displace the target: release its quota and grave it, the
+			// same treatment an explicit unlink would give.
+			if err := applyQuotaDeltaTx(tx, -int64(dstRec.Size), -1); err != nil {
+				return err
+			}
+			if err := addToGraveyardTx(tx, dstID, deletedAt); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+
+		if err := tx.Bucket(bucketDentry).Delete(dentryKey(oldDir, oldName)); err != nil {
+			return err
+		}
+		return setDentryTx(tx, newDir, newName, srcID)
+	})
+}
+
+// ErrNotEmpty is returned when an operation requires an empty directory.
+var ErrNotEmpty = errors.New("metadb: directory not empty")
+
+// ErrInvalidRename is returned for a rename that would detach a subtree
+// from the root by moving a directory inside itself.
+var ErrInvalidRename = errors.New("metadb: cannot rename a directory into its own subtree")
+
+// checkNotDescendantTx walks up from start to the root, refusing if it
+// meets ancestor. Walking up is O(depth); walking down from ancestor
+// would be O(subtree), and depth is the smaller number by a wide margin
+// for the trees this filesystem targets.
+func checkNotDescendantTx(tx *bbolt.Tx, ancestor, start InodeID) error {
+	for cur := start; cur != RootInode; {
+		if cur == ancestor {
+			return ErrInvalidRename
+		}
+		parent, err := parentOfTx(tx, cur)
+		if err != nil {
+			// No parent link found: treat as reaching the top rather than
+			// failing the rename, since an unparented inode cannot be
+			// inside ancestor's subtree either.
+			return nil
+		}
+		if parent == cur {
+			return nil
+		}
+		cur = parent
+	}
+	return nil
+}
+
+// parentOfTx finds a directory's parent by scanning dentries for the one
+// binding that points at it.
+//
+// This is a scan because the schema has no parent pointer: DESIGN.md
+// §6's inode record is attrs plus a content pointer, and adding a parent
+// field would be a second place for the truth to live. Rename is rare
+// and directory depth is small, so paying a scan here is cheaper than
+// maintaining a denormalized link on every mutation.
+func parentOfTx(tx *bbolt.Tx, child InodeID) (InodeID, error) {
+	c := tx.Bucket(bucketDentry).Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if InodeID(binary.BigEndian.Uint64(v)) == child {
+			return InodeID(binary.BigEndian.Uint64(k[:8])), nil
+		}
+	}
+	return 0, ErrNotFound
+}
+
+// CreateSymlink binds a new symlink at (dir, name). A symlink's target
+// is stored verbatim in the inode record rather than chunked — its
+// "content" is a short string, the same way a real filesystem treats a
+// fast symlink (see InodeRecord.SymlinkTarget).
+func (db *DB) CreateSymlink(dir InodeID, name, target string) (InodeID, error) {
+	rec := InodeRecord{
+		Mode:          0o777,
+		Size:          uint64(len(target)),
+		MTime:         time.Now(),
+		NLink:         1,
+		IsSymlink:     true,
+		SymlinkTarget: target,
+	}
+	return db.PublishFile(dir, name, rec)
+}
+
 // DeleteInode removes id's record outright. The only caller is
 // pkg/repo.Sweep, and only for a graveyard entry already past DESIGN.md
 // §19.2's grace period — by then nothing can still resolve to id via a
@@ -447,17 +596,24 @@ func (db *DB) Lookup(dir InodeID, name string) (InodeID, error) {
 func (db *DB) Readdir(dir InodeID) ([]DirEntry, error) {
 	var out []DirEntry
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		c := tx.Bucket(bucketDentry).Cursor()
-		prefix := dentryPrefix(dir)
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			out = append(out, DirEntry{
-				Name:  string(k[len(prefix):]),
-				Inode: InodeID(binary.BigEndian.Uint64(v)),
-			})
-		}
-		return nil
+		var err error
+		out, err = readdirTx(tx, dir)
+		return err
 	})
 	return out, err
+}
+
+func readdirTx(tx *bbolt.Tx, dir InodeID) ([]DirEntry, error) {
+	var out []DirEntry
+	c := tx.Bucket(bucketDentry).Cursor()
+	prefix := dentryPrefix(dir)
+	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		out = append(out, DirEntry{
+			Name:  string(k[len(prefix):]),
+			Inode: InodeID(binary.BigEndian.Uint64(v)),
+		})
+	}
+	return out, nil
 }
 
 // EnsureDir walks path from root, creating any missing directory inodes,

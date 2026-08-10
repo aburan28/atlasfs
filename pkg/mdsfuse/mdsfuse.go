@@ -23,17 +23,22 @@
 // behind a Dragonfly peer (pkg/store/dragonfly) for the bytes while
 // still talking to one authority for the metadata.
 //
-// # Scope: read-only, deliberately
+// # Scope
 //
-// This mount serves lookup, getattr, readdir, readlink, open, and read.
-// It does not write. That is a real limit and not a stub: the write path
-// through an authority is DESIGN.md §16.1's upload-then-commit — the
-// client chunks and uploads to the backend itself, then calls Commit —
-// and it needs its own packer, quota round trip, and failure handling on
-// this side of the RPC. pkg/fuseserver's in-process mount remains the
-// writable one. Unifying the two mounts behind one node implementation
-// is follow-up work; duplicating only the read half was the smaller,
-// safer increment.
+// This mount serves the POSIX surface this build implements: lookup,
+// getattr, readdir, readlink, open, read, create, write, truncate,
+// unlink, mkdir, rmdir, rename and symlink. Writes follow DESIGN.md
+// §16.1's upload-then-commit — the client chunks and uploads to the
+// backend itself, then calls Commit — so the bytes still never cross the
+// authority.
+//
+// What it does not do is §16.3's in-place random-access writes: a file's
+// content is buffered and committed as a unit on flush, the same cut
+// pkg/repo/write.go makes. Hard links (§6's NLink is written but never
+// exceeds 1) and a uid/gid model (§20) are likewise unimplemented on
+// both mounts. Unifying this mount and pkg/fuseserver behind one node
+// implementation remains follow-up work; they are two node types sharing
+// a design, not one shared implementation.
 package mdsfuse
 
 import (

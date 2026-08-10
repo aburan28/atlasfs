@@ -9,6 +9,9 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/aburan28/atlasfs/pkg/mds"
+	"github.com/aburan28/atlasfs/pkg/metadb"
 )
 
 // The mutating half of the mount. Every operation here is a round trip
@@ -22,15 +25,26 @@ var (
 	_ fs.NodeMkdirer   = (*Node)(nil)
 	_ fs.NodeRmdirer   = (*Node)(nil)
 	_ fs.NodeSetattrer = (*Node)(nil)
+	_ fs.NodeRenamer   = (*Node)(nil)
+	_ fs.NodeSymlinker = (*Node)(nil)
 )
 
-// errnoFor maps the authority's gRPC status codes back to the errnos a
-// filesystem caller expects. Without this every failure would surface as
-// EIO, which tells a user nothing about whether they hit a quota, a
-// name collision, or a genuine fault.
+// errnoFor maps an authority failure back to the errno a filesystem
+// caller expects. Without this every failure would surface as EIO, which
+// tells a user nothing about whether they hit a quota, a name collision,
+// or a genuine fault.
+//
+// The authority tags its statuses with the exact errno (mds.ErrnoOf),
+// because gRPC's code space is coarser than errno's: ENOTDIR, EISDIR and
+// ENOTEMPTY share FailedPrecondition. The code-based switch below is the
+// fallback for anything untagged — a transport failure, or a status that
+// never passed through the authority's own error mapping.
 func errnoFor(err error) syscall.Errno {
 	if err == nil {
 		return 0
+	}
+	if e, ok := mds.ErrnoOf(err); ok {
+		return e
 	}
 	switch status.Code(err) {
 	case codes.NotFound:
@@ -38,10 +52,9 @@ func errnoFor(err error) syscall.Errno {
 	case codes.AlreadyExists:
 		return syscall.EEXIST
 	case codes.FailedPrecondition:
-		// Covers both "not a directory" and "directory not empty"; the
-		// latter is the common one and ENOTEMPTY is what shells expect
-		// from rmdir.
 		return syscall.ENOTEMPTY
+	case codes.InvalidArgument:
+		return syscall.EINVAL
 	case codes.ResourceExhausted:
 		return syscall.EDQUOT
 	case codes.PermissionDenied:
@@ -145,6 +158,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	child := &Node{cfg: n.cfg, ino: resp.Inode, rec: resp.Record, parent: n.ino, name: name}
 	child.activeWrite = h
 	h.node = child
+	h.sess.node = child
 	fillAttrMode(resp.Record, n.cfg.ReadOnly, &out.Attr)
 	inode := n.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: uint64(resp.Inode)})
 	return inode, h, 0, 0
@@ -179,6 +193,77 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.EROFS
 	}
 	return errnoFor(n.cfg.Client.Rmdir(ctx, n.ino, name))
+}
+
+// Rename moves name out of this directory and into newParent under
+// newName. Both directories' versions bump at the authority, so a holder
+// caching either listing — or a negative entry for newName — is told in
+// the same round trip that performs the move.
+func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	if n.cfg.ReadOnly {
+		return syscall.EROFS
+	}
+	if flags != 0 {
+		// renameat2's RENAME_EXCHANGE and RENAME_NOREPLACE both need
+		// atomicity the authority's Rename does not offer, and silently
+		// ignoring the flag would turn a "don't clobber" request into a
+		// clobber. EINVAL is what a filesystem without renameat2 support
+		// returns, and what glibc's fallback path expects.
+		return syscall.EINVAL
+	}
+	dst, ok := newParent.(*Node)
+	if !ok {
+		return syscall.EXDEV
+	}
+	child := n.GetChild(name)
+	if err := n.cfg.Client.Rename(ctx, n.ino, name, dst.ino, newName); err != nil {
+		return errnoFor(err)
+	}
+	rebind(child, dst.ino, newName)
+	return 0
+}
+
+// rebind points a moved Node at its new dentry. The (parent, name) pair
+// is what a commit rebinds — Commit takes a dentry, not an inode ID — so
+// leaving it on the pre-rename name would make the next write to an
+// already-open file recreate the name the rename just removed.
+func rebind(child *fs.Inode, newParent metadb.InodeID, newName string) {
+	if child == nil {
+		return
+	}
+	cn, ok := child.Operations().(*Node)
+	if !ok {
+		return
+	}
+	cn.mu.Lock()
+	cn.parent, cn.name = newParent, newName
+	cn.mu.Unlock()
+}
+
+// binding reads the dentry this node is currently bound to. Rename
+// mutates it under mu, so a write path that captured it earlier must
+// re-read rather than close over the fields.
+func (n *Node) binding() (metadb.InodeID, string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.parent, n.name
+}
+
+func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.cfg.ReadOnly {
+		return nil, syscall.EROFS
+	}
+	id, err := n.cfg.Client.Symlink(ctx, n.ino, name, target)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	rec, err := n.cfg.Client.GetInode(ctx, id)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	child := &Node{cfg: n.cfg, ino: id, rec: rec, parent: n.ino, name: name}
+	fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
+	return n.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFLNK, Ino: uint64(id)}), 0
 }
 
 // Setattr handles truncate. It reads the active write handle off the
@@ -222,10 +307,11 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		if errno != 0 {
 			return errno
 		}
-		sess := &writeSession{cfg: n.cfg, dir: n.parent, name: n.name}
-		if n.name == "" {
+		dir, name := n.binding()
+		if name == "" {
 			return syscall.EINVAL // root or an inode we cannot re-bind
 		}
+		sess := &writeSession{cfg: n.cfg, dir: dir, name: name}
 		rd, err := newReader(ctx, n.cfg, rec)
 		if err != nil {
 			return syscall.EIO
@@ -255,10 +341,11 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 // preloading its current content so a partial overwrite does not
 // truncate the rest.
 func (n *Node) openForWrite(ctx context.Context, truncate bool) (fs.FileHandle, syscall.Errno) {
-	if n.name == "" {
+	dir, name := n.binding()
+	if name == "" {
 		return nil, syscall.EINVAL
 	}
-	sess := &writeSession{cfg: n.cfg, dir: n.parent, name: n.name}
+	sess := &writeSession{cfg: n.cfg, dir: dir, name: name, node: n}
 	if !truncate {
 		rec, errno := n.current(ctx)
 		if errno != 0 {

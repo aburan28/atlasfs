@@ -246,4 +246,34 @@ const (
 	MethodHasLocator = "/" + ServiceName + "/HasLocator"
 	MethodMkdir      = "/" + ServiceName + "/Mkdir"
 	MethodRmdir      = "/" + ServiceName + "/Rmdir"
+	MethodRename     = "/" + ServiceName + "/Rename"
+	MethodSymlink    = "/" + ServiceName + "/Symlink"
 )
+
+// RenameRequest moves a binding. Both directories are named because a
+// rename can cross them, and both need their coherence versions bumped.
+//
+// DESIGN.md §9 would return EXDEV here for a rename spanning home
+// regions or consistency classes; this build serves one region and one
+// class per authority, so that boundary cannot be crossed and the check
+// belongs with the namespace map (§7.3) when it exists.
+type RenameRequest struct {
+	Holder  string         `json:"holder"`
+	OldDir  metadb.InodeID `json:"oldDir"`
+	OldName string         `json:"oldName"`
+	NewDir  metadb.InodeID `json:"newDir"`
+	NewName string         `json:"newName"`
+}
+
+type RenameResponse struct{}
+
+type SymlinkRequest struct {
+	Holder string         `json:"holder"`
+	Dir    metadb.InodeID `json:"dir"`
+	Name   string         `json:"name"`
+	Target string         `json:"target"`
+}
+
+type SymlinkResponse struct {
+	Inode metadb.InodeID `json:"inode"`
+}

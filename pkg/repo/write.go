@@ -263,3 +263,42 @@ func (r *Repo) Rmdir(dir metadb.InodeID, name string) error {
 	}
 	return nil
 }
+
+// Rename moves oldName in oldDir to newName in newDir (DESIGN.md §16.1's
+// namespace mutations). The metadata move is one transaction in metadb;
+// what this adds is the coherence side effect — both directories'
+// versions bump, since a name appeared in one and vanished from the
+// other, and any holder caching either listing must be told.
+func (r *Repo) Rename(oldDir metadb.InodeID, oldName string, newDir metadb.InodeID, newName string) error {
+	if !r.Class.Mutable() {
+		return ErrReadOnly
+	}
+	if err := r.DB.Rename(oldDir, oldName, newDir, newName, r.Clock.Now()); err != nil {
+		return err
+	}
+	if r.Coherence != nil {
+		r.Coherence.BumpDir(DirCoherenceKey(oldDir))
+		r.Coherence.Bump(DirCoherenceKey(oldDir))
+		if newDir != oldDir {
+			r.Coherence.BumpDir(DirCoherenceKey(newDir))
+			r.Coherence.Bump(DirCoherenceKey(newDir))
+		}
+	}
+	return nil
+}
+
+// Symlink creates a symlink at (dir, name) pointing at target.
+func (r *Repo) Symlink(dir metadb.InodeID, name, target string) (metadb.InodeID, error) {
+	if !r.Class.Mutable() {
+		return 0, ErrReadOnly
+	}
+	id, err := r.DB.CreateSymlink(dir, name, target)
+	if err != nil {
+		return 0, err
+	}
+	if r.Coherence != nil {
+		r.Coherence.BumpDir(DirCoherenceKey(dir))
+		r.Coherence.Bump(DirCoherenceKey(dir))
+	}
+	return id, nil
+}

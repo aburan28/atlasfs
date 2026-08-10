@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -312,13 +313,19 @@ func (s *Server) AckRecall(ctx context.Context, req *AckRecallRequest) (*AckReca
 func toStatus(err error) error {
 	switch {
 	case errors.Is(err, metadb.ErrNotFound):
-		return status.Error(codes.NotFound, err.Error())
+		return withErrno(codes.NotFound, syscall.ENOENT, err)
 	case errors.Is(err, metadb.ErrExists):
-		return status.Error(codes.AlreadyExists, err.Error())
-	case errors.Is(err, metadb.ErrNotDir), errors.Is(err, metadb.ErrIsDirectory):
-		return status.Error(codes.FailedPrecondition, err.Error())
+		return withErrno(codes.AlreadyExists, syscall.EEXIST, err)
+	case errors.Is(err, metadb.ErrNotDir):
+		return withErrno(codes.FailedPrecondition, syscall.ENOTDIR, err)
+	case errors.Is(err, metadb.ErrIsDirectory):
+		return withErrno(codes.FailedPrecondition, syscall.EISDIR, err)
+	case errors.Is(err, metadb.ErrNotEmpty):
+		return withErrno(codes.FailedPrecondition, syscall.ENOTEMPTY, err)
+	case errors.Is(err, metadb.ErrInvalidRename):
+		return withErrno(codes.InvalidArgument, syscall.EINVAL, err)
 	case errors.Is(err, metadb.ErrQuotaExceeded):
-		return status.Error(codes.ResourceExhausted, err.Error())
+		return withErrno(codes.ResourceExhausted, syscall.EDQUOT, err)
 	default:
 		return status.Error(codes.Internal, err.Error())
 	}
@@ -375,14 +382,14 @@ func (s *Server) Rmdir(ctx context.Context, req *RmdirRequest) (*RmdirResponse, 
 		return nil, toStatus(err)
 	}
 	if !rec.IsDir {
-		return nil, status.Errorf(codes.FailedPrecondition, "%q is not a directory", req.Name)
+		return nil, toStatus(fmt.Errorf("%w: %q", metadb.ErrNotDir, req.Name))
 	}
 	entries, err := s.db.Readdir(id)
 	if err != nil {
 		return nil, toStatus(err)
 	}
 	if len(entries) > 0 {
-		return nil, status.Errorf(codes.FailedPrecondition, "directory %q not empty", req.Name)
+		return nil, toStatus(fmt.Errorf("%w: %q", metadb.ErrNotEmpty, req.Name))
 	}
 	if s.posix && s.coh != nil {
 		if _, err := s.coh.Recall(ctx, inodeObj(id), req.Holder, s.drecall); err != nil {
@@ -397,4 +404,35 @@ func (s *Server) Rmdir(ctx context.Context, req *RmdirRequest) (*RmdirResponse, 
 	}
 	s.bumpDir(req.Dir)
 	return &RmdirResponse{}, nil
+}
+
+// Rename moves a binding and bumps both directories, since a name
+// appeared in one and vanished from the other.
+func (s *Server) Rename(ctx context.Context, req *RenameRequest) (*RenameResponse, error) {
+	if s.posix && s.coh != nil {
+		// The displaced target, if any, is the inode whose holders must
+		// give up their copies before the rebind is visible.
+		if dstID, err := s.db.Lookup(req.NewDir, req.NewName); err == nil {
+			if _, err := s.coh.Recall(ctx, inodeObj(dstID), req.Holder, s.drecall); err != nil {
+				return nil, status.FromContextError(err).Err()
+			}
+		}
+	}
+	if err := s.db.Rename(req.OldDir, req.OldName, req.NewDir, req.NewName, time.Now()); err != nil {
+		return nil, toStatus(err)
+	}
+	s.bumpDir(req.OldDir)
+	if req.NewDir != req.OldDir {
+		s.bumpDir(req.NewDir)
+	}
+	return &RenameResponse{}, nil
+}
+
+func (s *Server) Symlink(ctx context.Context, req *SymlinkRequest) (*SymlinkResponse, error) {
+	id, err := s.db.CreateSymlink(req.Dir, req.Name, req.Target)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	s.bumpDir(req.Dir)
+	return &SymlinkResponse{Inode: id}, nil
 }
