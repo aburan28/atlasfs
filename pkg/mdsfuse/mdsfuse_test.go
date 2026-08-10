@@ -36,6 +36,10 @@ type env struct {
 }
 
 func setup(t *testing.T, build func(t *testing.T, r *repo.Repo)) env {
+	return setupCfg(t, false, build)
+}
+
+func setupCfg(t *testing.T, readOnly bool, build func(t *testing.T, r *repo.Repo)) env {
 	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("no /dev/fuse in this environment")
@@ -92,6 +96,8 @@ func setup(t *testing.T, build func(t *testing.T, r *repo.Repo)) env {
 		errCh <- Mount(context.Background(), Config{
 			Client:         client,
 			Backend:        backend,
+			ReadOnly:       readOnly,
+			ChunkSize:      4096,
 			KernelCacheTTL: repo.ClassRelaxed.KernelCacheTTL(),
 		}, mountpoint, func(s *fuse.Server) { mounted <- s })
 	}()
@@ -188,7 +194,7 @@ func TestMountBackedByAuthorityReadsThroughKernel(t *testing.T) {
 // must say so with EROFS rather than failing somewhere deeper with a
 // confusing error.
 func TestMountIsReadOnly(t *testing.T) {
-	e := setup(t, func(t *testing.T, r *repo.Repo) {
+	e := setupCfg(t, true, func(t *testing.T, r *repo.Repo) {
 		src := t.TempDir()
 		writeSrc(t, src, "f.txt", []byte("read only"))
 		if _, _, _, err := r.PublishTree(context.Background(), src, nil); err != nil {

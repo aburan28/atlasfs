@@ -76,6 +76,14 @@ type LookupResponse struct {
 	// and revalidate against a single directory version rather than per
 	// name (DESIGN.md §10.4).
 	DirVersion uint64 `json:"dirVersion"`
+
+	// DirLease is the lease on the *directory*, which is what makes a
+	// positive dentry cacheable. §10.5 keeps directory and inode leases
+	// in separate domains precisely so that "this name maps to this
+	// inode" and "this inode has these attrs" can be invalidated
+	// independently — a create in a directory invalidates the former for
+	// every holder without touching the latter.
+	DirLease Lease `json:"dirLease"`
 }
 
 type ReaddirRequest struct {
@@ -176,6 +184,54 @@ type GetLocatorResponse struct {
 	Locator pack.Locator `json:"locator"`
 }
 
+// PutLocatorRequest registers where a chunk's bytes live. The client has
+// already sealed a container to object storage; this is the metadata
+// half of that (DESIGN.md §16.1 step 2).
+//
+// §7.5 calls this write commutative and safe without home-region
+// arbitration: two clients racing to register the same content-addressed
+// chunk are both correct, because they are asserting the same fact.
+type PutLocatorRequest struct {
+	Holder  string       `json:"holder"`
+	ChunkID chunk.ID     `json:"chunkId"`
+	Locator pack.Locator `json:"locator"`
+}
+
+type PutLocatorResponse struct{}
+
+// HasLocatorRequest is the write-path dedup check (§16.1 step 2:
+// "uploaded only if absent"). Asking before uploading is what makes
+// republishing an unchanged dataset nearly free.
+type HasLocatorRequest struct {
+	Holder  string   `json:"holder"`
+	ChunkID chunk.ID `json:"chunkId"`
+}
+
+type HasLocatorResponse struct {
+	Found bool `json:"found"`
+}
+
+type MkdirRequest struct {
+	Holder string         `json:"holder"`
+	Dir    metadb.InodeID `json:"dir"`
+	Name   string         `json:"name"`
+}
+
+type MkdirResponse struct {
+	Inode metadb.InodeID `json:"inode"`
+}
+
+// RmdirRequest removes an empty directory. Emptiness is checked by the
+// authority, not the client: a client-side check would be a TOCTOU race
+// against another holder creating an entry.
+type RmdirRequest struct {
+	Holder string         `json:"holder"`
+	Dir    metadb.InodeID `json:"dir"`
+	Name   string         `json:"name"`
+}
+
+type RmdirResponse struct{}
+
 // Full method names, as they appear on the wire.
 const (
 	MethodGetInode   = "/" + ServiceName + "/GetInode"
@@ -186,4 +242,8 @@ const (
 	MethodSubscribe  = "/" + ServiceName + "/Subscribe"
 	MethodAckRecall  = "/" + ServiceName + "/AckRecall"
 	MethodGetLocator = "/" + ServiceName + "/GetLocator"
+	MethodPutLocator = "/" + ServiceName + "/PutLocator"
+	MethodHasLocator = "/" + ServiceName + "/HasLocator"
+	MethodMkdir      = "/" + ServiceName + "/Mkdir"
+	MethodRmdir      = "/" + ServiceName + "/Rmdir"
 )

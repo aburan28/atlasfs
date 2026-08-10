@@ -23,7 +23,9 @@ func cmdMount(ctx context.Context, args []string) error {
 	var bf backendFlags
 	addBackendFlags(fs, &bf)
 	mdsAddr := fs.String("mds", "",
-		"mount against a remote metadata authority (cmd/atlas-mds) at this address instead of opening the repo's metadata locally. Read-only; the repo-dir argument then supplies only the object backend.")
+		"mount against a remote metadata authority (cmd/atlas-mds) at this address instead of opening the repo's metadata locally. The repo-dir argument then supplies only the object backend.")
+	mdsReadOnly := fs.Bool("mds-read-only", false,
+		"refuse writes on an -mds mount. Use it for an immutable subtree; otherwise the mount is read-write and commits through the authority (DESIGN.md §16.1).")
 	fs.Usage = func() {
 		fmt.Println("usage: atlas mount [flags] <repo-dir> <mountpoint>")
 		fs.PrintDefaults()
@@ -43,7 +45,7 @@ func cmdMount(ctx context.Context, args []string) error {
 	}
 
 	if *mdsAddr != "" {
-		return mountViaMDS(ctx, *mdsAddr, repoDir, mountpoint, bf)
+		return mountViaMDS(ctx, *mdsAddr, repoDir, mountpoint, bf, *mdsReadOnly)
 	}
 
 	r, err := openRepo(ctx, repoDir, bf)
@@ -74,7 +76,7 @@ func cmdMount(ctx context.Context, args []string) error {
 // keeps chunk bytes out of the authority's path entirely — the mount
 // talks to atlas-mds for inodes, dentries and locators, and to object
 // storage for everything else.
-func mountViaMDS(ctx context.Context, addr, repoDir, mountpoint string, bf backendFlags) error {
+func mountViaMDS(ctx context.Context, addr, repoDir, mountpoint string, bf backendFlags, readOnly bool) error {
 	cc, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()), mds.DialOption())
 	if err != nil {
@@ -107,16 +109,22 @@ func mountViaMDS(ctx context.Context, addr, repoDir, mountpoint string, bf backe
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	onMounted := func(server *fuse.Server) {
-		fmt.Printf("atlasfs mounted read-only via authority %s as holder %q: %s (Ctrl-C to unmount)\n",
-			addr, holder, mountpoint)
+		mode := "read-write"
+		if readOnly {
+			mode = "read-only"
+		}
+		fmt.Printf("atlasfs mounted %s via authority %s as holder %q: %s (Ctrl-C to unmount)\n",
+			mode, addr, holder, mountpoint)
 		go func() {
 			<-sigCh
 			_ = server.Unmount()
 		}()
 	}
 	return mdsfuse.Mount(ctx, mdsfuse.Config{
-		Client:  client,
-		Backend: backend,
+		Client:   client,
+		Backend:  backend,
+		ReadOnly: readOnly,
+		Region:   bf.region,
 		// Conservative: without asking the authority for the subtree's
 		// class, assume the strictest thing a mount might be serving and
 		// let the kernel cache nothing. Plumbing the class through the

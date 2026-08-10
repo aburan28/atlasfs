@@ -38,6 +38,12 @@ type Client struct {
 
 	mu    sync.Mutex
 	cache map[string]*cacheEntry
+	// dentries[dirObj][name] — cached name->inode bindings, held under
+	// the *directory's* lease rather than the inode's (§10.5's two
+	// domains). Without this every path resolution round-trips, which
+	// makes the inode lease cache nearly unreachable through a
+	// filesystem: the kernel does a LOOKUP before almost everything.
+	dentries map[string]map[string]metadb.InodeID
 
 	// onRecall, when set, runs before the client acks a recall. Tests use
 	// it to observe ordering; a real client drops any derived state here.
@@ -64,7 +70,13 @@ func NewClient(cc *grpc.ClientConn, holder string, clock coherence.Clock) *Clien
 	if clock == nil {
 		clock = coherence.RealClock{}
 	}
-	return &Client{cc: cc, holder: holder, clock: clock, cache: map[string]*cacheEntry{}}
+	return &Client{
+		cc:       cc,
+		holder:   holder,
+		clock:    clock,
+		cache:    map[string]*cacheEntry{},
+		dentries: map[string]map[string]metadb.InodeID{},
+	}
 }
 
 // DialOption returns the call options a connection to this service needs.
@@ -113,13 +125,59 @@ func (c *Client) GetInode(ctx context.Context, id metadb.InodeID) (metadb.InodeR
 	return resp.Record, nil
 }
 
+// Lookup resolves a name in a directory, answering from cache when both
+// halves are still leased: the dentry binding under the directory's
+// lease and the inode's record under its own. Either one lapsing or
+// being invalidated sends the call back to the authority.
 func (c *Client) Lookup(ctx context.Context, dir metadb.InodeID, name string) (LookupResponse, error) {
+	if ino, rec, ok := c.cachedDentry(dir, name); ok {
+		return LookupResponse{Found: true, Inode: ino, Record: rec}, nil
+	}
 	var resp LookupResponse
 	err := c.cc.Invoke(ctx, MethodLookup, &LookupRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
 	if err == nil && resp.Found {
 		c.store(inodeObj(resp.Inode), resp.Record, resp.Lease)
+		if resp.DirLease.TTL > 0 {
+			c.storeDentry(dir, name, resp.Inode, resp.DirLease)
+		}
 	}
 	return resp, err
+}
+
+// cachedDentry answers a lookup locally only if the directory's lease
+// still covers the binding *and* the target inode's own lease still
+// covers its record. Trusting the binding alone would serve a stale
+// record for a file whose attrs were invalidated but whose name never
+// moved.
+func (c *Client) cachedDentry(dir metadb.InodeID, name string) (metadb.InodeID, metadb.InodeRecord, bool) {
+	c.mu.Lock()
+	dirEntry := c.cache[dirObj(dir)]
+	if dirEntry == nil || (!dirEntry.noExpiry && c.clock.Now().After(dirEntry.expiry)) {
+		c.mu.Unlock()
+		return 0, metadb.InodeRecord{}, false
+	}
+	ino, ok := c.dentries[dirObj(dir)][name]
+	c.mu.Unlock()
+	if !ok {
+		return 0, metadb.InodeRecord{}, false
+	}
+	rec, ok := c.CachedInode(ino)
+	if !ok {
+		return 0, metadb.InodeRecord{}, false
+	}
+	return ino, rec, true
+}
+
+func (c *Client) storeDentry(dir metadb.InodeID, name string, ino metadb.InodeID, dirLease Lease) {
+	c.store(dirObj(dir), metadb.InodeRecord{IsDir: true}, dirLease)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.dentries[dirObj(dir)]
+	if m == nil {
+		m = map[string]metadb.InodeID{}
+		c.dentries[dirObj(dir)] = m
+	}
+	m[name] = ino
 }
 
 func (c *Client) Readdir(ctx context.Context, dir metadb.InodeID) ([]metadb.DirEntry, error) {
@@ -165,6 +223,10 @@ func (c *Client) invalidate(obj string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.cache, obj)
+	// A directory invalidation drops every dentry cached under it in one
+	// step — the same bulk property §10.4 relies on for negative entries,
+	// applied to positive ones.
+	delete(c.dentries, obj)
 }
 
 // Subscribe opens the push stream and services it until the context is
@@ -290,4 +352,31 @@ func splitPath(p string) []string {
 		return nil
 	}
 	return strings.Split(p, "/")
+}
+
+// PutLocator registers a sealed chunk's placement with the authority.
+func (c *Client) PutLocator(ctx context.Context, id chunk.ID, loc pack.Locator) error {
+	var resp PutLocatorResponse
+	return c.cc.Invoke(ctx, MethodPutLocator, &PutLocatorRequest{Holder: c.holder, ChunkID: id, Locator: loc}, &resp)
+}
+
+// HasLocator is the write path's dedup check: skip uploading a chunk the
+// region already has (DESIGN.md §16.1 step 2).
+func (c *Client) HasLocator(ctx context.Context, id chunk.ID) (bool, error) {
+	var resp HasLocatorResponse
+	if err := c.cc.Invoke(ctx, MethodHasLocator, &HasLocatorRequest{Holder: c.holder, ChunkID: id}, &resp); err != nil {
+		return false, err
+	}
+	return resp.Found, nil
+}
+
+func (c *Client) Mkdir(ctx context.Context, dir metadb.InodeID, name string) (metadb.InodeID, error) {
+	var resp MkdirResponse
+	err := c.cc.Invoke(ctx, MethodMkdir, &MkdirRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	return resp.Inode, err
+}
+
+func (c *Client) Rmdir(ctx context.Context, dir metadb.InodeID, name string) error {
+	var resp RmdirResponse
+	return c.cc.Invoke(ctx, MethodRmdir, &RmdirRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
 }

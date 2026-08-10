@@ -61,6 +61,21 @@ type Config struct {
 	Client  *mds.Client
 	Backend store.Backend
 
+	// ReadOnly refuses every mutation with EROFS. Writes go through
+	// DESIGN.md §16.1's upload-then-commit (write.go); a mount serving an
+	// `immutable` subtree should set this.
+	ReadOnly bool
+
+	// Region is the locator keyspace, and must match the authority's
+	// (-region on cmd/atlas-mds). Empty means "local".
+	Region string
+
+	// ChunkSize / ChunkAlignment mirror repo.Repo's. Alignment is
+	// pack.GDSAlignment when the data is read by GPUs; zero packs
+	// tightly.
+	ChunkSize      int
+	ChunkAlignment int
+
 	// KernelCacheTTL is how long the kernel may trust an attr or dentry,
 	// and it must be the class's own D (repo.Class.KernelCacheTTL). For
 	// `posix` that is zero: the kernel's cache cannot participate in
@@ -80,6 +95,10 @@ func Mount(ctx context.Context, cfg Config, mountpoint string, onMounted func(*f
 	}
 	root := &Node{cfg: cfg, ino: metadb.RootInode, rec: rootRec}
 
+	opts := []string{}
+	if cfg.ReadOnly {
+		opts = append(opts, "ro")
+	}
 	ttl := cfg.KernelCacheTTL
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
 		EntryTimeout: &ttl,
@@ -92,7 +111,7 @@ func Mount(ctx context.Context, cfg Config, mountpoint string, onMounted func(*f
 			FsName:      "atlasfs-mds",
 			Name:        "atlasfs",
 			DirectMount: true,
-			Options:     []string{"ro"},
+			Options:     opts,
 		},
 	})
 	if err != nil {
@@ -118,6 +137,15 @@ type Node struct {
 	cfg Config
 	ino metadb.InodeID
 	rec metadb.InodeRecord
+
+	// parent and name are what a write commits against: the authority's
+	// Commit takes a (dir, name) pair, not an inode ID, because that is
+	// the dentry the mutation actually rebinds.
+	parent metadb.InodeID
+	name   string
+
+	mu          sync.Mutex
+	activeWrite *writeHandle
 }
 
 var (
@@ -136,7 +164,7 @@ func (n *Node) current(ctx context.Context) (metadb.InodeRecord, syscall.Errno) 
 	return rec, 0
 }
 
-func fillAttr(rec metadb.InodeRecord, out *fuse.Attr) {
+func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 	out.Size = rec.Size
 	sec := uint64(0)
 	if !rec.MTime.IsZero() {
@@ -149,9 +177,13 @@ func fillAttr(rec metadb.InodeRecord, out *fuse.Attr) {
 	case rec.IsSymlink:
 		out.Mode, out.Nlink = syscall.S_IFLNK|0o777, 1
 	default:
-		// 0o444 throughout: this mount is read-only, so advertising write
-		// bits would only invite an EROFS later.
-		out.Mode, out.Nlink = syscall.S_IFREG|0o444, 1
+		mode := uint32(0o644)
+		if readOnly {
+			// Advertising write bits on a read-only mount would only
+			// invite an EROFS later.
+			mode = 0o444
+		}
+		out.Mode, out.Nlink = syscall.S_IFREG|mode, 1
 	}
 }
 
@@ -171,7 +203,7 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 	if errno != 0 {
 		return errno
 	}
-	fillAttr(rec, &out.Attr)
+	fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
 	return 0
 }
 
@@ -183,8 +215,8 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	if !resp.Found {
 		return nil, syscall.ENOENT
 	}
-	child := &Node{cfg: n.cfg, ino: resp.Inode, rec: resp.Record}
-	fillAttr(resp.Record, &out.Attr)
+	child := &Node{cfg: n.cfg, ino: resp.Inode, rec: resp.Record, parent: n.ino, name: name}
+	fillAttrMode(resp.Record, n.cfg.ReadOnly, &out.Attr)
 	return n.NewInode(ctx, child, fs.StableAttr{
 		Mode: direntMode(resp.Record),
 		Ino:  uint64(resp.Inode),
@@ -223,8 +255,13 @@ func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 }
 
 func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	if flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_APPEND|syscall.O_CREAT|syscall.O_TRUNC) != 0 {
-		return nil, 0, syscall.EROFS
+	wantsWrite := flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_APPEND|syscall.O_CREAT|syscall.O_TRUNC) != 0
+	if wantsWrite {
+		if n.cfg.ReadOnly {
+			return nil, 0, syscall.EROFS
+		}
+		h, errno := n.openForWrite(ctx, flags&syscall.O_TRUNC != 0)
+		return h, 0, errno
 	}
 	rec, errno := n.current(ctx)
 	if errno != 0 {
@@ -384,4 +421,15 @@ func (r *reader) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
 		return 0, io.EOF
 	}
 	return total, nil
+}
+
+// regionOf is the locator keyspace this mount writes into. It must match
+// the authority's own region (cmd/atlas-mds -region), since the
+// authority stores locators under its region key and a mismatch would
+// leave a written chunk unresolvable.
+func regionOf(cfg Config) string {
+	if cfg.Region == "" {
+		return "local"
+	}
+	return cfg.Region
 }

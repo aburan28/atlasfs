@@ -119,6 +119,19 @@ func (s *Server) grant(holder, obj string) Lease {
 	return Lease{Object: obj, Version: v, TTL: s.leaseTTL}
 }
 
+// bumpDir advances both the directory's negative-cache version (§10.4)
+// and its lease version, the latter firing every subscriber so holders
+// drop cached dentries for this directory. Both are needed: dirver
+// invalidates cached *misses*, the object bump invalidates cached
+// *hits*.
+func (s *Server) bumpDir(dir metadb.InodeID) {
+	if s.coh == nil {
+		return
+	}
+	s.coh.BumpDir(dirObj(dir))
+	s.coh.Bump(dirObj(dir))
+}
+
 func (s *Server) push(holder string, ev Event) {
 	s.mu.Lock()
 	hs := s.streams[holder]
@@ -144,6 +157,11 @@ func (s *Server) Lookup(ctx context.Context, req *LookupRequest) (*LookupRespons
 	resp := &LookupResponse{}
 	if s.coh != nil {
 		resp.DirVersion = s.coh.DirVersion(dirObj(req.Dir))
+		// Lease the directory too: without it a holder could cache a
+		// dentry with nothing able to invalidate it, and every path
+		// resolution would have to round-trip forever (§10.1 lists
+		// dentries as cached state, §10.5 gives them their own domain).
+		resp.DirLease = s.grant(req.Holder, dirObj(req.Dir))
 	}
 	id, err := s.db.Lookup(req.Dir, req.Name)
 	if errors.Is(err, metadb.ErrNotFound) {
@@ -205,8 +223,8 @@ func (s *Server) Commit(ctx context.Context, req *CommitRequest) (*CommitRespons
 	resp.Inode = id
 	if s.coh != nil {
 		resp.Version = s.coh.Bump(inodeObj(id))
-		s.coh.BumpDir(dirObj(req.Dir))
 	}
+	s.bumpDir(req.Dir)
 	return resp, nil
 }
 
@@ -228,8 +246,8 @@ func (s *Server) Unlink(ctx context.Context, req *UnlinkRequest) (*UnlinkRespons
 	}
 	if s.coh != nil {
 		resp.Version = s.coh.Bump(inodeObj(id))
-		s.coh.BumpDir(dirObj(req.Dir))
 	}
+	s.bumpDir(req.Dir)
 	return resp, nil
 }
 
@@ -311,3 +329,72 @@ func toStatus(err error) error {
 // the mds-backed mount will, and an authority needing the client's
 // package to name its own keyspace would be backwards.
 const defaultRegion = "local"
+
+// PutLocator registers a chunk's placement after the client has sealed
+// its container to object storage.
+func (s *Server) PutLocator(ctx context.Context, req *PutLocatorRequest) (*PutLocatorResponse, error) {
+	if err := s.db.PutLocator(s.region, req.ChunkID, req.Locator); err != nil {
+		return nil, toStatus(err)
+	}
+	return &PutLocatorResponse{}, nil
+}
+
+// HasLocator answers the write path's dedup question before the client
+// spends bandwidth uploading (DESIGN.md §16.1 step 2).
+func (s *Server) HasLocator(ctx context.Context, req *HasLocatorRequest) (*HasLocatorResponse, error) {
+	found, err := s.db.HasLocator(s.region, req.ChunkID)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &HasLocatorResponse{Found: found}, nil
+}
+
+// Mkdir binds a new directory. Like Commit it bumps the parent's
+// directory version, which is what invalidates every holder's negative
+// cache entry for this name in one step (§10.4).
+func (s *Server) Mkdir(ctx context.Context, req *MkdirRequest) (*MkdirResponse, error) {
+	rec := metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}
+	id, err := s.db.CommitMkdir(req.Dir, req.Name, rec)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	s.bumpDir(req.Dir)
+	return &MkdirResponse{Inode: id}, nil
+}
+
+// Rmdir removes an empty directory. The emptiness check happens here
+// rather than on the client because only the authority sees every
+// holder's creates — a client-side check would race.
+func (s *Server) Rmdir(ctx context.Context, req *RmdirRequest) (*RmdirResponse, error) {
+	id, err := s.db.Lookup(req.Dir, req.Name)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	rec, err := s.db.GetInode(id)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	if !rec.IsDir {
+		return nil, status.Errorf(codes.FailedPrecondition, "%q is not a directory", req.Name)
+	}
+	entries, err := s.db.Readdir(id)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	if len(entries) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition, "directory %q not empty", req.Name)
+	}
+	if s.posix && s.coh != nil {
+		if _, err := s.coh.Recall(ctx, inodeObj(id), req.Holder, s.drecall); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+	}
+	if err := s.db.RemoveEntry(req.Dir, req.Name, time.Now()); err != nil {
+		return nil, toStatus(err)
+	}
+	if s.coh != nil {
+		s.coh.Bump(inodeObj(id))
+	}
+	s.bumpDir(req.Dir)
+	return &RmdirResponse{}, nil
+}

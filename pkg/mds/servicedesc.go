@@ -25,6 +25,10 @@ type MetadataServer interface {
 	Unlink(context.Context, *UnlinkRequest) (*UnlinkResponse, error)
 	AckRecall(context.Context, *AckRecallRequest) (*AckRecallResponse, error)
 	GetLocator(context.Context, *GetLocatorRequest) (*GetLocatorResponse, error)
+	PutLocator(context.Context, *PutLocatorRequest) (*PutLocatorResponse, error)
+	HasLocator(context.Context, *HasLocatorRequest) (*HasLocatorResponse, error)
+	Mkdir(context.Context, *MkdirRequest) (*MkdirResponse, error)
+	Rmdir(context.Context, *RmdirRequest) (*RmdirResponse, error)
 	Subscribe(*SubscribeRequest, grpc.ServerStream) error
 }
 
@@ -68,6 +72,10 @@ var serviceDesc = grpc.ServiceDesc{
 		{MethodName: "Unlink", Handler: unaryHandler(MetadataServer.Unlink, MethodUnlink)},
 		{MethodName: "AckRecall", Handler: unaryHandler(MetadataServer.AckRecall, MethodAckRecall)},
 		{MethodName: "GetLocator", Handler: unaryHandler(MetadataServer.GetLocator, MethodGetLocator)},
+		{MethodName: "PutLocator", Handler: unaryHandler(MetadataServer.PutLocator, MethodPutLocator)},
+		{MethodName: "HasLocator", Handler: unaryHandler(MetadataServer.HasLocator, MethodHasLocator)},
+		{MethodName: "Mkdir", Handler: unaryHandler(MetadataServer.Mkdir, MethodMkdir)},
+		{MethodName: "Rmdir", Handler: unaryHandler(MetadataServer.Rmdir, MethodRmdir)},
 	},
 	Streams: []grpc.StreamDesc{
 		{StreamName: "Subscribe", Handler: subscribeHandler, ServerStreams: true},
