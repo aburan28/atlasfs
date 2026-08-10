@@ -235,24 +235,18 @@ func (r *Repo) PublishTree(ctx context.Context, srcDir string, destPath []string
 		}
 
 		if d.IsDir() {
-			id, err := r.DB.AllocInode()
-			if err != nil {
-				return err
-			}
 			info, err := d.Info()
 			if err != nil {
 				return err
 			}
-			if err := r.DB.PutInode(id, metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: info.ModTime(), NLink: 2}); err != nil {
-				return err
-			}
-			if err := r.DB.CreateDentry(parentInode, d.Name(), id); err != nil && !errors.Is(err, metadb.ErrExists) {
-				return err
-			} else if errors.Is(err, metadb.ErrExists) {
-				id, err = r.DB.Lookup(parentInode, d.Name())
-				if err != nil {
+			rec := metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: info.ModTime(), NLink: 2}
+			id, err := r.DB.CommitMkdir(parentInode, d.Name(), rec)
+			if errors.Is(err, metadb.ErrExists) {
+				if id, err = r.DB.Lookup(parentInode, d.Name()); err != nil {
 					return err
 				}
+			} else if err != nil {
+				return err
 			}
 			dirInodes[rel] = id
 			dirs++
@@ -301,10 +295,6 @@ func (r *Repo) publishSymlink(dir metadb.InodeID, name, srcPath string) error {
 	if err != nil {
 		return err
 	}
-	id, err := r.DB.AllocInode()
-	if err != nil {
-		return err
-	}
 	rec := metadb.InodeRecord{
 		Mode:          0o777,
 		Size:          uint64(len(target)),
@@ -313,10 +303,10 @@ func (r *Repo) publishSymlink(dir metadb.InodeID, name, srcPath string) error {
 		IsSymlink:     true,
 		SymlinkTarget: target,
 	}
-	if err := r.DB.PutInode(id, rec); err != nil {
-		return err
+	if _, err := r.DB.PublishFile(dir, name, rec); err != nil {
+		return publishBindErr(name, err)
 	}
-	return r.createDentryAllowExists(dir, name, id)
+	return nil
 }
 
 func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPath string) (int64, error) {
@@ -331,21 +321,16 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 	}
 	size := info.Size()
 
-	id, err := r.DB.AllocInode()
-	if err != nil {
-		return 0, err
-	}
-
 	content, err := r.storeContent(ctx, f, size)
 	if err != nil {
 		return 0, err
 	}
 	rec := metadb.InodeRecord{Mode: 0o644, MTime: info.ModTime(), NLink: 1}
 	content.apply(&rec)
-	if err := r.DB.PutInode(id, rec); err != nil {
-		return 0, err
+	if _, err := r.DB.PublishFile(dir, name, rec); err != nil {
+		return 0, publishBindErr(name, err)
 	}
-	return size, r.createDentryAllowExists(dir, name, id)
+	return size, nil
 }
 
 // contentRef is the chunk/manifest-shaped part of an InodeRecord, the
@@ -399,8 +384,12 @@ func (r *Repo) storeContent(ctx context.Context, rd io.Reader, size int64) (cont
 	return contentRef{size: uint64(size), hasManifest: true, manifestID: mid}, nil
 }
 
-func (r *Repo) createDentryAllowExists(dir metadb.InodeID, name string, id metadb.InodeID) error {
-	err := r.DB.CreateDentry(dir, name, id)
+// publishBindErr turns metadb's sentinel into the message the publish
+// path has always given for a name collision, and passes everything else
+// (notably ErrQuotaExceeded, which publish can now return since it
+// charges the quota it consumes) through unwrapped so callers can still
+// match on it.
+func publishBindErr(name string, err error) error {
 	if errors.Is(err, metadb.ErrExists) {
 		return fmt.Errorf("repo: %q already published in this directory (immutable class: republish under a new path or version)", name)
 	}

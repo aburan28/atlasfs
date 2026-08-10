@@ -61,6 +61,7 @@ var (
 	bucketMeta    = []byte("meta")      // "next_inode" -> uint64
 	bucketQuota   = []byte("quota")     // "root" -> gob(quotaRecord), see package doc
 	bucketGravey  = []byte("graveyard") // (deleteTsNano||inodeID) -> empty, see package doc
+	bucketDeadCnt = []byte("deadcontainer")
 )
 
 var ErrNotFound = errors.New("metadb: not found")
@@ -107,7 +108,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("metadb: open: %w", err)
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey} {
+		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey, bucketDeadCnt} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -556,6 +557,88 @@ func (db *DB) HasLocator(region string, id chunk.ID) (bool, error) {
 	return found, err
 }
 
+// LocatorEntry pairs a chunk with where it currently lives, for callers
+// that need to reason about containers rather than individual chunks.
+type LocatorEntry struct {
+	ChunkID chunk.ID
+	Locator pack.Locator
+}
+
+// ListLocators returns every locator bound in region. Compaction
+// (DESIGN.md §19.1 step 3) needs this because liveness is a property of
+// a *container* — "which chunks does this container still hold that
+// anyone references" is not answerable from a per-chunk lookup.
+func (db *DB) ListLocators(region string) ([]LocatorEntry, error) {
+	prefix := append([]byte(region), 0x00)
+	var out []LocatorEntry
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		c := tx.Bucket(bucketLocator).Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			var e LocatorEntry
+			copy(e.ChunkID[:], k[len(prefix):])
+			if err := gob.NewDecoder(bytes.NewReader(v)).Decode(&e.Locator); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// DeadContainer is a container object that compaction has rewritten and
+// which is therefore no longer referenced by any locator — but which is
+// not deleted immediately. See MarkContainerDead.
+type DeadContainer struct {
+	Key       string
+	RetiredAt time.Time
+}
+
+// MarkContainerDead records that key's contents have been rewritten
+// elsewhere and it may be deleted from the backend once past grace.
+//
+// Compaction deliberately does not delete the old object inline. A
+// reader that resolved a locator just before the rewrite is still
+// holding the old (container, offset) pair and may be mid-Get; deleting
+// underneath it would turn a GC run into a read error. Deferring the
+// delete behind the same T_grace the graveyard uses (DESIGN.md §19.2)
+// costs only storage, and storage is exactly what that invariant already
+// trades away for safety.
+func (db *DB) MarkContainerDead(key string, at time.Time) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(at); err != nil {
+		return err
+	}
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketDeadCnt).Put([]byte(key), buf.Bytes())
+	})
+}
+
+// ListDeadContainers returns every container awaiting deletion.
+func (db *DB) ListDeadContainers() ([]DeadContainer, error) {
+	var out []DeadContainer
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		c := tx.Bucket(bucketDeadCnt).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			d := DeadContainer{Key: string(k)}
+			if err := gob.NewDecoder(bytes.NewReader(v)).Decode(&d.RetiredAt); err != nil {
+				return err
+			}
+			out = append(out, d)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// RemoveDeadContainer drops the bookkeeping entry for key, once the
+// backend object itself has actually been deleted.
+func (db *DB) RemoveDeadContainer(key string) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketDeadCnt).Delete([]byte(key))
+	})
+}
+
 // --- quotas (DESIGN.md §18.3) --------------------------------------------
 
 // quotaKeyRoot is the sole key in bucketQuota — see the package doc
@@ -658,6 +741,98 @@ func (db *DB) GetQuotaUsage() (bytesUsed, inodesUsed uint64, err error) {
 			return err
 		}
 		bytesUsed, inodesUsed = q.BytesUsed, q.InodesUsed
+		return nil
+	})
+	return
+}
+
+// PublishFile binds a brand-new file inode at (dir, name) and charges
+// the quota for it, in one transaction — the publish-path counterpart to
+// CommitFile.
+//
+// It differs from CommitFile in exactly one way, and deliberately:
+// rebinding an existing name is ErrExists rather than an in-place
+// overwrite, because DESIGN.md §8 says an `immutable` subtree is not
+// rewritten in place. That is why this cannot simply call CommitFile.
+//
+// Publish used to allocate, write, and bind outside any quota
+// transaction, which meant the primary ingest path consumed no quota at
+// all: a repo could be filled past a set byte limit by publishing, and
+// `atlas quota` would report 0 used (DESIGN.md §18.3, and §22.3's
+// capacity-is-a-quota claim for CSI).
+func (db *DB) PublishFile(dir InodeID, name string, rec InodeRecord) (id InodeID, err error) {
+	err = db.bolt.Update(func(tx *bbolt.Tx) error {
+		dirRec, err := getInodeTx(tx, dir)
+		if err != nil {
+			return err
+		}
+		if !dirRec.IsDir {
+			return ErrNotDir
+		}
+		if _, err := lookupTx(tx, dir, name); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+
+		id, err = allocInodeTx(tx)
+		if err != nil {
+			return err
+		}
+		if err := applyQuotaDeltaTx(tx, int64(rec.Size), 1); err != nil {
+			return err
+		}
+		if err := putInode(tx, id, rec); err != nil {
+			return err
+		}
+		return setDentryTx(tx, dir, name, id)
+	})
+	return id, err
+}
+
+// EnsureDirCharged is EnsureDir with quota accounting: each directory it
+// actually creates costs one inode, and each is created inside its own
+// transaction alongside that charge. Directories already present cost
+// nothing, so it stays idempotent — publish walks the same parent
+// directories repeatedly and must not be charged twice for them.
+func (db *DB) EnsureDirCharged(path []string) (InodeID, error) {
+	cur := RootInode
+	for _, name := range path {
+		if name == "" {
+			continue
+		}
+		id, err := db.Lookup(cur, name)
+		if err == nil {
+			cur = id
+			continue
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return 0, err
+		}
+		rec := InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}
+		id, err = db.CommitMkdir(cur, name, rec)
+		if errors.Is(err, ErrExists) {
+			// Raced with another writer creating the same directory;
+			// theirs is as good as ours.
+			if id, err = db.Lookup(cur, name); err != nil {
+				return 0, err
+			}
+		} else if err != nil {
+			return 0, err
+		}
+		cur = id
+	}
+	return cur, nil
+}
+
+// GetQuotaLimits reports the configured limits; 0 means unlimited.
+func (db *DB) GetQuotaLimits() (bytesLimit, inodesLimit uint64, err error) {
+	err = db.bolt.View(func(tx *bbolt.Tx) error {
+		q, err := getQuotaTx(tx)
+		if err != nil {
+			return err
+		}
+		bytesLimit, inodesLimit = q.BytesLimit, q.InodesLimit
 		return nil
 	})
 	return

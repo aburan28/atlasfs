@@ -3,9 +3,11 @@
 // an unlinked inode into metadb's graveyard instead of deleting it;
 // Sweep here is the second half — it walks the graveyard and reclaims
 // an entry's chunks once they are provably unreferenced and the entry
-// is past DESIGN.md §19.2's grace period.
+// is past DESIGN.md §19.2's grace period, then compacts the containers
+// those chunks left half-empty (§19.1 step 3) so the reclaim actually
+// reaches backend storage rather than stopping at the locator index.
 //
-// Two simplifications from the full design, stated plainly:
+// One simplification from the full design, stated plainly:
 //
 //   - §19.1 gates sweeping on a *container's* seal time ("its container
 //     was sealed before V − T_grace"), which lets one timestamp cover
@@ -14,12 +16,7 @@
 //     for the same reason: a chunk that survives the mark phase (still
 //     reachable from the live tree or a not-yet-expired graveyard
 //     entry) is never swept regardless of which timestamp gated the
-//     scan. What DESIGN.md §19.1 step 3 ("compact") would additionally
-//     buy — reclaiming a partially-live container's actual backend
-//     bytes — is not implemented here: Sweep removes locator entries
-//     (metadb bucketLocator), not container objects (store.Backend),
-//     so backend storage is not actually shrunk by a Sweep run. That is
-//     real remaining scope, not a hidden gap.
+//     scan.
 //   - §19.3's "open-but-unlinked" guarantee — an inode staying reachable
 //     while any client holds an open handle, via a leased open-handle
 //     registry — is not implemented. This build has no open-file-handle
@@ -47,6 +44,8 @@ import (
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
 	"github.com/aburan28/atlasfs/pkg/metadb"
+	"github.com/aburan28/atlasfs/pkg/pack"
+	"github.com/aburan28/atlasfs/pkg/store"
 )
 
 // DESIGN.md §19.2's Invariant GC-1 inputs, defaults as stated there.
@@ -155,7 +154,225 @@ func (r *Repo) Sweep(ctx context.Context, graceDuration time.Duration) (collecte
 			return len(removed), err
 		}
 	}
+
+	// Deleting locators frees nothing on its own: the bytes are still
+	// sitting inside sealed container objects. Compact is what turns a
+	// sweep into an actual reclaim.
+	if _, err := r.Compact(ctx, DefaultLivenessThreshold); err != nil {
+		return len(removed), fmt.Errorf("repo: sweep: compact phase: %w", err)
+	}
+	if err := r.reapDeadContainers(ctx, cutoff); err != nil {
+		return len(removed), fmt.Errorf("repo: sweep: reap phase: %w", err)
+	}
 	return len(removed), nil
+}
+
+// DefaultLivenessThreshold is DESIGN.md §19.1 step 3's stated default:
+// containers below 50% live bytes are repacked.
+const DefaultLivenessThreshold = 0.5
+
+// Compact implements DESIGN.md §19.1 step 3. A container whose live
+// fraction has fallen below threshold is rewritten to hold only the
+// chunks still referenced; the chunks' locators are repointed at the new
+// container and the old one is retired for later deletion. Only locators
+// change (§5.4) — no manifest, inode, or chunk ID is touched, which is
+// the entire reason identity and location are separate in the first
+// place.
+//
+// Returns the number of containers rewritten. A container with no live
+// chunks left is retired without writing a replacement.
+//
+// Ordering here is what makes it crash-safe, and it is deliberate:
+// write the replacement first, then repoint locators, then retire the
+// original. A crash between steps 1 and 2 leaks an unreferenced object
+// (harmless; the next run rewrites it again). A crash between 2 and 3
+// leaves the original retired-but-present, which is exactly the state
+// the reap phase already handles. The one ordering that would lose data
+// — retiring the original before its locators are repointed — never
+// happens.
+func (r *Repo) Compact(ctx context.Context, threshold float64) (rewritten int, err error) {
+	locs, err := r.DB.ListLocators(r.Region)
+	if err != nil {
+		return 0, err
+	}
+
+	// Group surviving chunks by the container they live in, and total up
+	// how many bytes of each container are still referenced.
+	type containerState struct {
+		entries   []metadb.LocatorEntry
+		liveBytes int64
+		extent    int64 // highest offset+length seen: the container's size floor
+	}
+	byContainer := map[string]*containerState{}
+	for _, e := range locs {
+		cs := byContainer[e.Locator.Container]
+		if cs == nil {
+			cs = &containerState{}
+			byContainer[e.Locator.Container] = cs
+		}
+		cs.entries = append(cs.entries, e)
+		cs.liveBytes += e.Locator.Length
+		if end := e.Locator.Offset + e.Locator.Length; end > cs.extent {
+			cs.extent = end
+		}
+	}
+
+	// Enumerate containers from the *backend*, not from byContainer.
+	// Iterating the locator index alone would never see a container whose
+	// chunks were all collected — it has no surviving locators, so it
+	// appears nowhere in the index — and those fully-dead containers are
+	// exactly the ones with the most bytes to reclaim.
+	containers, err := r.listContainers(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	now := r.Clock.Now()
+	pendingDead, err := r.deadContainerSet()
+	if err != nil {
+		return 0, err
+	}
+	for _, c := range containers {
+		if c.Size <= 0 {
+			continue
+		}
+		if _, alreadyDead := pendingDead[c.Key]; alreadyDead {
+			continue // retired by an earlier run, awaiting reap
+		}
+		var live int64
+		var entries []metadb.LocatorEntry
+		if cs := byContainer[c.Key]; cs != nil {
+			live, entries = cs.liveBytes, cs.entries
+		}
+		if float64(live)/float64(c.Size) >= threshold {
+			continue // still dense enough to leave alone
+		}
+
+		// entries is empty for a fully-dead container, and rewriteContainer
+		// is a no-op on it — nothing is written, the original is simply
+		// retired.
+		if err := r.rewriteContainer(ctx, entries); err != nil {
+			return rewritten, err
+		}
+		if err := r.DB.MarkContainerDead(c.Key, now); err != nil {
+			return rewritten, err
+		}
+		rewritten++
+	}
+	return rewritten, nil
+}
+
+// listContainers returns every container object in this region. The
+// prefix keeps it to containers: manifests live under atlas/m/ (see
+// manifestKey) and must never be considered for compaction.
+func (r *Repo) listContainers(ctx context.Context) ([]store.ObjectInfo, error) {
+	prefix := fmt.Sprintf("atlas/c/%s/", r.Region)
+	var out []store.ObjectInfo
+	cursor := ""
+	for {
+		page, err := r.Backend.List(ctx, prefix, cursor, 0)
+		if err != nil {
+			return nil, fmt.Errorf("repo: compact: list containers: %w", err)
+		}
+		out = append(out, page.Keys...)
+		if page.NextCursor == "" {
+			return out, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func (r *Repo) deadContainerSet() (map[string]struct{}, error) {
+	dead, err := r.DB.ListDeadContainers()
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{}, len(dead))
+	for _, d := range dead {
+		set[d.Key] = struct{}{}
+	}
+	return set, nil
+}
+
+// rewriteContainer packs entries into a fresh container and repoints
+// each chunk's locator at it. Chunks are refetched through pack.Fetch,
+// so every byte moved is hash-verified on the way out (DESIGN.md §24.4)
+// — compaction is exactly the moment a silent corruption would otherwise
+// be laundered into a new container and forgotten.
+func (r *Repo) rewriteContainer(ctx context.Context, entries []metadb.LocatorEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	packer := pack.NewPacker(r.Backend, r.Region, 0)
+	for _, e := range entries {
+		data, err := pack.Fetch(ctx, r.Backend, e.ChunkID, e.Locator)
+		if err != nil {
+			return fmt.Errorf("repo: compact: refetch chunk %s: %w", e.ChunkID, err)
+		}
+		packer.Add(chunk.Chunk{ID: e.ChunkID, Data: data})
+	}
+	newLocs, err := packer.Seal(ctx)
+	if err != nil {
+		return fmt.Errorf("repo: compact: seal replacement container: %w", err)
+	}
+	for id, loc := range newLocs {
+		if err := r.DB.PutLocator(r.Region, id, loc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reapDeadContainers deletes the backend objects that compaction retired,
+// once they are past the same grace period the graveyard uses. This is
+// the step that actually shrinks storage.
+//
+// Deletes are issued in batches of the backend's advertised BatchDelete
+// size (DESIGN.md §24.3: a backend without batch delete degrades to
+// slower GC, never to incorrect GC), and the bookkeeping entry for a
+// container is only dropped once that container's own delete reported
+// success — a failed delete stays on the list and is retried next run
+// rather than being forgotten with the object still in the bucket.
+func (r *Repo) reapDeadContainers(ctx context.Context, cutoff time.Time) error {
+	dead, err := r.DB.ListDeadContainers()
+	if err != nil {
+		return err
+	}
+
+	var keys []string
+	for _, d := range dead {
+		if d.RetiredAt.After(cutoff) {
+			continue // still within grace: a reader may hold the old locator
+		}
+		keys = append(keys, d.Key)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	batch := r.Backend.Caps().BatchDelete
+	if batch <= 0 {
+		batch = 1
+	}
+	for start := 0; start < len(keys); start += batch {
+		end := min(start+batch, len(keys))
+		results, err := r.Backend.Delete(ctx, keys[start:end])
+		if err != nil {
+			return fmt.Errorf("repo: reap containers: %w", err)
+		}
+		for _, res := range results {
+			// An object already absent is the success case, not a
+			// failure: a previous run may have deleted it and crashed
+			// before clearing the bookkeeping entry.
+			if res.Err != nil && !errors.Is(res.Err, store.ErrNotFound) {
+				return fmt.Errorf("repo: reap container %s: %w", res.Key, res.Err)
+			}
+			if err := r.DB.RemoveDeadContainer(res.Key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // markLive is DESIGN.md §19.1 step 1: the set of chunk IDs reachable at

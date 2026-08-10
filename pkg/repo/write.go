@@ -55,6 +55,12 @@ func (r *Repo) QuotaUsage() (bytesUsed, inodesUsed uint64, err error) {
 	return r.DB.GetQuotaUsage()
 }
 
+// QuotaLimits reports this repo's configured quota limits; 0 means
+// unlimited (DESIGN.md §18.3).
+func (r *Repo) QuotaLimits() (bytesLimit, inodesLimit uint64, err error) {
+	return r.DB.GetQuotaLimits()
+}
+
 // WriteHandle buffers a new or replacement file's content. Nothing is
 // visible in the namespace until Commit.
 type WriteHandle struct {
