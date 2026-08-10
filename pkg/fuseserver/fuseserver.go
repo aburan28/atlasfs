@@ -880,11 +880,36 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	return 0
 }
 
+// MountOption tunes a mount. Options are variadic so adding one does not
+// disturb existing callers.
+type MountOption func(*mountConfig)
+
+type mountConfig struct{ allowOther bool }
+
+// AllowOther lets users other than the one who mounted reach the
+// filesystem.
+//
+// Without it the kernel refuses every access from a different uid before
+// any permission check runs — not EACCES from the mode bits, EACCES
+// because FUSE only trusts the mounting user. That default is right for
+// a personal mount and wrong for the two cases this project cares about:
+// a CSI volume, where kubelet mounts as root and the pod runs as
+// something else (DESIGN.md §22), and a POSIX conformance run, which
+// does most of its work as an unprivileged uid.
+//
+// It requires root or `user_allow_other` in /etc/fuse.conf, so it is
+// opt-in rather than the default.
+func AllowOther() MountOption { return func(c *mountConfig) { c.allowOther = true } }
+
 // Mount mounts r at mountpoint — read-only for an immutable repo,
 // read-write otherwise — and blocks until unmounted. onMounted, if
 // non-nil, is invoked with the *fuse.Server once mounted so the caller
 // can wire up signal-triggered unmount.
-func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(*fuse.Server)) error {
+func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(*fuse.Server), options ...MountOption) error {
+	var cfg mountConfig
+	for _, o := range options {
+		o(&cfg)
+	}
 	_, rootRec, err := r.Resolve("/")
 	if err != nil {
 		return err
@@ -904,6 +929,9 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 	// the access rules in userspace would be more code and more ways to
 	// be subtly wrong.
 	opts = append(opts, "default_permissions")
+	if cfg.allowOther {
+		opts = append(opts, "allow_other")
+	}
 	// Let the kernel cache attrs and dentries for exactly this class's
 	// D (repo.Class.KernelCacheTTL). Leaving these nil — go-fuse's
 	// default — means a zero timeout, so every getattr and every lookup

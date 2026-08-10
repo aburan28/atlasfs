@@ -83,6 +83,14 @@ type Config struct {
 	ChunkSize      int
 	ChunkAlignment int
 
+	// AllowOther lets users other than the mounting one reach the
+	// filesystem. Without it the kernel refuses every access from a
+	// different uid before any permission check runs. A CSI volume needs
+	// it — kubelet mounts as root and the pod runs as something else
+	// (DESIGN.md §22) — and it requires root or `user_allow_other` in
+	// /etc/fuse.conf, so it is opt-in.
+	AllowOther bool
+
 	// KernelCacheTTL is how long the kernel may trust an attr or dentry,
 	// and it must be the class's own D (repo.Class.KernelCacheTTL). For
 	// `posix` that is zero: the kernel's cache cannot participate in
@@ -110,6 +118,9 @@ func Mount(ctx context.Context, cfg Config, mountpoint string, onMounted func(*f
 	// against the mode/uid/gid the authority reports. Without it FUSE
 	// checks nothing, so §20's rules would be advisory.
 	opts = append(opts, "default_permissions")
+	if cfg.AllowOther {
+		opts = append(opts, "allow_other")
+	}
 	ttl := cfg.KernelCacheTTL
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
 		EntryTimeout: &ttl,

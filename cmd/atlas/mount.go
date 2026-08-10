@@ -24,6 +24,8 @@ func cmdMount(ctx context.Context, args []string) error {
 	addBackendFlags(fs, &bf)
 	mdsAddr := fs.String("mds", "",
 		"mount against a remote metadata authority (cmd/atlas-mds) at this address instead of opening the repo's metadata locally. The repo-dir argument then supplies only the object backend.")
+	allowOther := fs.Bool("allow-other", false,
+		"let users other than the one mounting reach the filesystem. Without it the kernel refuses every access from a different uid before any permission check runs. Needs root or user_allow_other in /etc/fuse.conf.")
 	mdsReadOnly := fs.Bool("mds-read-only", false,
 		"refuse writes on an -mds mount. Use it for an immutable subtree; otherwise the mount is read-write and commits through the authority (DESIGN.md §16.1).")
 	fs.Usage = func() {
@@ -45,7 +47,7 @@ func cmdMount(ctx context.Context, args []string) error {
 	}
 
 	if *mdsAddr != "" {
-		return mountViaMDS(ctx, *mdsAddr, repoDir, mountpoint, bf, *mdsReadOnly)
+		return mountViaMDS(ctx, *mdsAddr, repoDir, mountpoint, bf, *mdsReadOnly, *allowOther)
 	}
 
 	r, err := openRepo(ctx, repoDir, bf)
@@ -68,7 +70,11 @@ func cmdMount(ctx context.Context, args []string) error {
 			_ = server.Unmount()
 		}()
 	}
-	return fuseserver.Mount(ctx, r, mountpoint, onMounted)
+	var mountOpts []fuseserver.MountOption
+	if *allowOther {
+		mountOpts = append(mountOpts, fuseserver.AllowOther())
+	}
+	return fuseserver.Mount(ctx, r, mountpoint, onMounted, mountOpts...)
 }
 
 // mountViaMDS mounts against a remote metadata authority. The repo
@@ -76,7 +82,7 @@ func cmdMount(ctx context.Context, args []string) error {
 // keeps chunk bytes out of the authority's path entirely — the mount
 // talks to atlas-mds for inodes, dentries and locators, and to object
 // storage for everything else.
-func mountViaMDS(ctx context.Context, addr, repoDir, mountpoint string, bf backendFlags, readOnly bool) error {
+func mountViaMDS(ctx context.Context, addr, repoDir, mountpoint string, bf backendFlags, readOnly, allowOther bool) error {
 	cc, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()), mds.DialOption())
 	if err != nil {
@@ -121,10 +127,11 @@ func mountViaMDS(ctx context.Context, addr, repoDir, mountpoint string, bf backe
 		}()
 	}
 	return mdsfuse.Mount(ctx, mdsfuse.Config{
-		Client:   client,
-		Backend:  backend,
-		ReadOnly: readOnly,
-		Region:   bf.region,
+		Client:     client,
+		Backend:    backend,
+		ReadOnly:   readOnly,
+		AllowOther: allowOther,
+		Region:     bf.region,
 		// Conservative: without asking the authority for the subtree's
 		// class, assume the strictest thing a mount might be serving and
 		// let the kernel cache nothing. Plumbing the class through the

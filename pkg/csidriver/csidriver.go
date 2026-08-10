@@ -180,9 +180,13 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	mountErr := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
+		// allow_other is not optional for a CSI volume: kubelet mounts as
+		// root and the pod's process runs as whatever the SecurityContext
+		// says, so without it every container access is refused before any
+		// permission check runs (DESIGN.md §22).
 		err := fuseserver.Mount(context.Background(), r, target, func(s *fuse.Server) {
 			mounted <- s
-		})
+		}, fuseserver.AllowOther())
 		if err != nil {
 			select {
 			case mountErr <- err:
@@ -323,6 +327,9 @@ func (n *NodeServer) publishViaMDS(
 			Backend:  backend,
 			ReadOnly: readOnly,
 			Region:   params.Region,
+			// See the local-mount path: kubelet mounts as root, the pod
+			// runs as something else.
+			AllowOther: true,
 			// Zero: without asking the authority for the subtree's class,
 			// assume the strictest one. A `posix` volume must not have the
 			// kernel answering getattr from a cache that cannot be recalled.

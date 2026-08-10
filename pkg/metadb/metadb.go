@@ -42,6 +42,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -169,7 +170,16 @@ func (db *DB) ensureRoot() error {
 		return err
 	}
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		if err := putInode(tx, RootInode, InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}); err != nil {
+		// The root belongs to whoever created the repo. Leaving it
+		// owned by uid 0 would make every mount by an ordinary user
+		// read-only in practice: with `default_permissions` the kernel
+		// refuses a create in a root-owned 0755 directory, so the first
+		// write at the mount root fails with EACCES.
+		if err := putInode(tx, RootInode, InodeRecord{
+			IsDir: true, Mode: 0o755,
+			Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
+			MTime: time.Now(), NLink: 2,
+		}); err != nil {
 			return err
 		}
 		return advanceSeqTo(tx, uint64(RootInode))
@@ -703,7 +713,11 @@ func (db *DB) EnsureDir(path []string) (InodeID, error) {
 			if err != nil {
 				return 0, err
 			}
-			if err := db.PutInode(id, InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}); err != nil {
+			if err := db.PutInode(id, InodeRecord{
+				IsDir: true, Mode: 0o755,
+				Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
+				MTime: time.Now(), NLink: 2,
+			}); err != nil {
 				return 0, err
 			}
 			if err := db.CreateDentry(cur, name, id); err != nil && !errors.Is(err, ErrExists) {
@@ -1040,7 +1054,11 @@ func (db *DB) EnsureDirCharged(path []string) (InodeID, error) {
 		if !errors.Is(err, ErrNotFound) {
 			return 0, err
 		}
-		rec := InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}
+		rec := InodeRecord{
+			IsDir: true, Mode: 0o755,
+			Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
+			MTime: time.Now(), NLink: 2,
+		}
 		id, err = db.CommitMkdir(cur, name, rec)
 		if errors.Is(err, ErrExists) {
 			// Raced with another writer creating the same directory;
