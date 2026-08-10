@@ -70,20 +70,22 @@ go build -o atlas ./cmd/atlas -o atlas-csi ./cmd/atlas-csi
 
 ## Measured performance
 
-DESIGN.md §21.1 states throughput targets. Nothing had ever measured them, so here is what this build actually does — on one shared cloud vCPU set (Xeon @ 2.10GHz, 4 cores), local-disk backend, `go test -bench`. These are honest numbers on modest hardware, not a claim about the design's ceiling:
+DESIGN.md §21.1 states throughput targets. Nothing had ever measured them, so here is what this build actually does — on one shared cloud vCPU set (Xeon @ 2.10GHz, 4 cores), local-disk backend, `go test -bench`.
 
-| Path | Measured | §21.1 target |
+**Read these as medians of 5–6 runs with the full range shown, not as single figures.** Run-to-run spread on a shared vCPU is up to 2×, so any one number is nearly meaningless; quoting the best run would be flattering and wrong.
+
+| Path | Median (range) | §21.1 target |
 |---|---|---|
-| FUSE sequential read, 64 MiB | 834 MB/s | ≥ 5 GB/s (cache-hit) |
-| FUSE read, 64-way concurrent | 345 MB/s | ≥ 2 GB/s (cold, 64-way) |
-| FUSE `stat`, kernel-cached | 718 ns, 2 allocs | — |
-| Library read, warm chunk cache | 4.2 GB/s | — |
-| Library read, cold (local disk) | 288–414 MB/s | — |
-| Publish (chunk + hash + pack) | 219 MB/s | — |
+| FUSE sequential read, 64 MiB | 897 MB/s (597–1147) | ≥ 5 GB/s (cache-hit) |
+| FUSE read, 64-way concurrent | 426 MB/s (374–717) | ≥ 2 GB/s (cold, 64-way) |
+| FUSE `stat`, kernel-cached | 800 ns (712–826), 2 allocs | — |
+| Library read, warm chunk cache | 4.05 GB/s (3.41–4.20) | — |
+| Library read, cold (local disk) | 555 MB/s (482–614) | — |
+| Publish (chunk + hash + pack) | 251 MB/s (153–312) | — |
 
-The FUSE numbers are **6–11× short of the targets**, and that gap is the honest size of the remaining §21.2 work: FUSE_PASSTHROUGH, writeback caching, large read sizes, and multi-queue are all listed there as the mechanisms the targets assume, and none of them is implemented. The targets are for a tuned client; this is the naive one.
+The FUSE numbers are **~5× short on sequential and ~5× short on concurrent**, and that gap is the honest size of the remaining §21.2 work: FUSE_PASSTHROUGH, writeback caching, large read sizes, and multi-queue are all listed there as the mechanisms the targets assume, and none of them is implemented. The targets are for a tuned client; this is the naive one.
 
-Adding the kernel attr/entry timeouts (above) was worth **~180×** on the metadata path — `stat` went from 130 µs and 269 allocations to 718 ns and 2, because before it there were no timeouts set at all and every `stat` round-tripped to userspace.
+Adding the kernel attr/entry timeouts (above) was worth **~170×** on the metadata path — `stat` went from ~130 µs and 269 allocations to ~800 ns and 2, because before it there were no timeouts set at all and every `stat` round-tripped to userspace. That one is a ratio between two configurations measured the same way, so the shared-vCPU noise largely cancels.
 
 Code layout:
 
