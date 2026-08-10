@@ -8,12 +8,14 @@
 // A repo's consistency class (DESIGN.md §8) is stored once, at creation,
 // and never changes for that repo's lifetime — this build's honest
 // simplification of "per-subtree" down to "per-repo", since there is no
-// subtree-boundary tracking here (one repo, one mount, one class). The
-// `posix` class (real locking, blocking recall, O_APPEND) is not
-// implemented; that needs a remote-holder recall protocol this
-// single-process build has no second holder to exercise (see
-// pkg/coherence's doc comment). `immutable`, `relaxed`, and `session`
-// are.
+// subtree-boundary tracking here (one repo, one mount, one class).
+//
+// The `posix` class's blocking recall is implemented, but not through
+// this file: it lives in pkg/coherence and is driven by pkg/mds, whose
+// remote holders are what make a recall mean anything. What `posix`
+// still lacks is byte-range locking (§17). A repo opened through
+// pkg/repo therefore offers `immutable`, `relaxed`, and `session`; a
+// `posix` subtree is served by cmd/atlas-mds.
 //
 // Quotas (DESIGN.md §18.3) are per-subtree in the general design, but
 // this build has exactly one subtree per repo (no subtree-boundary

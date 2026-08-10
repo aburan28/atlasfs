@@ -7,8 +7,14 @@
 // consumer this build has of pkg/coherence's per-holder leases and
 // negative cache — every Node caches its own metadb.InodeRecord and
 // negative-lookup results in memory, using a fixed holder ID ("local")
-// because a single mount is this build's only holder (see
-// pkg/coherence's package doc for why there is no second one yet).
+// because this mount talks to an in-process metadb rather than to a
+// metadata authority.
+//
+// That is the mount's current limit, stated plainly: pkg/mds serves
+// leases to real remote holders and implements §10.6's recall against
+// them, but this mount does not go through it — a mountpoint backed by
+// the metadata service is unbuilt, which is why `posix` is reachable
+// via pkg/mds and not via Mount.
 //
 // This is a plain go-fuse mount (splice/passthrough tuning from
 // DESIGN.md §21.2 is not implemented here — that is a later-phase
