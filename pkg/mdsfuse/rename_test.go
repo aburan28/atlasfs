@@ -65,6 +65,9 @@ func TestRenameAndSymlinkThroughAuthority(t *testing.T) {
 // that only bumped the source directory would leave the second mount
 // unable to see the new name until its lease expired.
 func TestRenameOnOneMountBecomesVisibleOnAnother(t *testing.T) {
+	// A 30s lease against a 5s deadline: if the destination bump did not
+	// happen, the reader would be entitled to serve its cached miss for
+	// the full 30s, so nothing but a real invalidation can satisfy this.
 	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
 	writer := c.mountAt(t, "writer", 0)
 	reader := c.mountAt(t, "reader", 0)
@@ -91,11 +94,33 @@ func TestRenameOnOneMountBecomesVisibleOnAnother(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, err := os.ReadFile(filepath.Join(reader, "dst", "moved.txt")); err != nil || string(got) != "payload" {
-		t.Fatalf("reader does not see the moved file: got %q err=%v", got, err)
-	}
-	if _, err := os.Stat(filepath.Join(reader, "moving.txt")); !os.IsNotExist(err) {
-		t.Fatalf("reader still sees the pre-rename name: %v", err)
+	// Push is asynchronous and best-effort (§10.2), so the assertion is a
+	// bounded wait rather than an immediate read — the bound, not the
+	// read, is what makes it an assertion about invalidation.
+	awaitOrFail(t, "reader never saw the moved file at its new name", func() bool {
+		got, err := os.ReadFile(filepath.Join(reader, "dst", "moved.txt"))
+		return err == nil && string(got) == "payload"
+	})
+	awaitOrFail(t, "reader still resolves the pre-rename name", func() bool {
+		_, err := os.Stat(filepath.Join(reader, "moving.txt"))
+		return os.IsNotExist(err)
+	})
+}
+
+// awaitOrFail polls cond until it holds or the deadline passes. The
+// deadline must stay well under the lease duration in use, or lease
+// expiry — not invalidation — would be what eventually satisfies it.
+func awaitOrFail(t *testing.T, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s (the push invalidation did not reach it)", msg)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
