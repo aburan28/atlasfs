@@ -290,7 +290,14 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 
 type fileHandle struct{ rd *reader }
 
-var _ fs.FileReader = (*fileHandle)(nil)
+var (
+	_ fs.FileReader  = (*fileHandle)(nil)
+	_ fs.FileFsyncer = (*fileHandle)(nil)
+)
+
+// Fsync on a read-only handle has nothing to flush but must still
+// succeed — fsync(2) on an O_RDONLY fd is legal.
+func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno { return 0 }
 
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := h.rd.ReadAt(ctx, dest, off)

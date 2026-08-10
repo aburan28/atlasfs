@@ -80,7 +80,22 @@ var (
 	_ fs.FileReader   = (*writeHandle)(nil)
 	_ fs.FileFlusher  = (*writeHandle)(nil)
 	_ fs.FileReleaser = (*writeHandle)(nil)
+	_ fs.FileFsyncer  = (*writeHandle)(nil)
 )
+
+// Fsync commits the buffered content — DESIGN.md §16.2's "durable in the
+// home region": chunks in the object store, manifest committed at the
+// authority. It never waits on cross-region replication, which §16.2
+// reserves for an explicit publish.
+//
+// Without it the kernel gets ENOSYS and stops sending FSYNC, so a
+// process that wrote, fsynced and then died would lose the write despite
+// fsync having returned success.
+func (h *writeHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return errnoFor(h.sess.commit(ctx))
+}
 
 func (h *writeHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	h.mu.Lock()

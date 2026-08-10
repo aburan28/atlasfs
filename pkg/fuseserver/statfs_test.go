@@ -69,3 +69,43 @@ func TestStatfsWithoutAQuotaIsNotFull(t *testing.T) {
 		t.Fatalf("df total = %d, want the placeholder %d", total, repo.UnboundedCapacity)
 	}
 }
+
+// TestFsyncMakesTheWriteVisible is DESIGN.md §16.2's fsync(fd) contract:
+// durable in the home region when it returns. Without a real Fsync the
+// content would sit in the handle's buffer until close(2), so a process
+// that wrote, fsynced and then died would lose it — with fsync having
+// returned success.
+func TestFsyncMakesTheWriteVisible(t *testing.T) {
+	r, mnt := mountWritable(t)
+
+	f, err := os.Create(filepath.Join(mnt, "synced"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte("committed by fsync")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+
+	// Read through the repo API rather than through the mount: a read via
+	// the same mount could be served from the still-open handle's buffer,
+	// which would pass whether or not anything was committed.
+	_, rec, err := r.Resolve("/synced")
+	if err != nil {
+		t.Fatalf("fsync returned success but nothing was committed: %v", err)
+	}
+	fr, err := r.OpenFile(t.Context(), rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fr.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "committed by fsync" {
+		t.Fatalf("committed content = %q, want %q", got, "committed by fsync")
+	}
+}

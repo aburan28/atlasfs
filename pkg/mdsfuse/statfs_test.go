@@ -44,3 +44,31 @@ func TestStatfsThroughAuthority(t *testing.T) {
 		t.Fatalf("free blocks did not fall after a 1 MiB write through the authority: %d -> %d", freeBefore, st.Bavail)
 	}
 }
+
+// TestFsyncThroughAuthority: §16.2's fsync(fd) commits at the authority
+// when it returns, rather than leaving the content buffered until
+// close(2). A second, independent mount is the observer — reading back
+// through the same mount could be served from the still-open handle's
+// own buffer and would pass either way.
+func TestFsyncThroughAuthority(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
+	writer := c.mountAt(t, "writer", 0)
+	reader := c.mountAt(t, "reader", 0)
+
+	f, err := os.Create(filepath.Join(writer, "synced"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte("committed by fsync")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+
+	awaitOrFail(t, "fsync returned success but the other mount never saw the content", func() bool {
+		got, err := os.ReadFile(filepath.Join(reader, "synced"))
+		return err == nil && string(got) == "committed by fsync"
+	})
+}

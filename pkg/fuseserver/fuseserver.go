@@ -629,7 +629,15 @@ type fileHandle struct {
 	fr *repo.FileReader
 }
 
-var _ fs.FileReader = (*fileHandle)(nil)
+var (
+	_ fs.FileReader  = (*fileHandle)(nil)
+	_ fs.FileFsyncer = (*fileHandle)(nil)
+)
+
+// Fsync on a read-only handle has nothing to flush, but must still
+// succeed: fsync(2) on an O_RDONLY fd is legal, and returning ENOSYS
+// would surface as an error to callers that sync every fd they hold.
+func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno { return 0 }
 
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := h.fr.ReadAt(dest, off)
@@ -662,7 +670,23 @@ var (
 	_ fs.FileReader   = (*writeFileHandle)(nil)
 	_ fs.FileFlusher  = (*writeFileHandle)(nil)
 	_ fs.FileReleaser = (*writeFileHandle)(nil)
+	_ fs.FileFsyncer  = (*writeFileHandle)(nil)
 )
+
+// Fsync commits whatever is buffered, which is exactly DESIGN.md §16.2's
+// contract for it: durable in the home region — chunks in the object
+// store, manifest committed in metadata. It does not wait on any
+// cross-region replication; §16.2 is explicit that a checkpoint writer
+// calling fsync in a training loop must not stall for one, and a caller
+// wanting that guarantee asks for it separately.
+//
+// Without this the kernel gets ENOSYS and stops sending FSYNC, so a
+// process that wrote, fsynced and then died would lose the write even
+// though fsync returned success — the buffer would still be waiting for
+// a close(2) that never came.
+func (h *writeFileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	return h.commitIfDirty(ctx)
+}
 
 // target is the dentry this handle commits into. It prefers the node's
 // current binding over the pair captured at Open time, because a rename
