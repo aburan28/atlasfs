@@ -49,10 +49,16 @@ misleading results before they were understood:
 | + ownership, `default_permissions`, `allow_other` | 5123 / 8792 | 58.3% |
 | + `mknod` (FIFOs, sockets, device nodes) | 8590 / 8792 | 97.7% |
 | + `posix` class via the authority | 8649 / 8792 | 98.4% |
-| + atime/ctime, mode 0, NAME_MAX, directory timestamps | see below | |
+| + atime/ctime and mode 0 | 8731 / 8798 | 99.24% |
+| + NAME_MAX and directory timestamps | 8788 / 8798 | 99.89% |
+| **+ subsecond times, directory nlink, truncate bound** | **8794 / 8798** | **99.95%** |
 
 The assertion count differs between rows because pjdfstest runs more
 assertions as more of them get far enough to matter.
+
+The four remaining failures are the two exceptions enumerated below —
+`unlink/14` (3 assertions) and `open/07` (1). Nothing else in the suite
+fails.
 
 The jump from 58% to 98% is almost entirely `mknod`. It is worth understanding
 why one missing call cost that much: a large number of the chmod, chown,
@@ -63,7 +69,10 @@ much works.
 
 ## Bugs this found
 
-Every one of these was a real defect, not a disagreement about semantics:
+Every one of these was a real defect, not a disagreement about semantics.
+The list is the argument for running the suite at all: none of them were
+found by this project's own tests, and two are worse than conformance
+failures.
 
 1. **No ownership model at all.** Every inode reported uid/gid 0 and `chown`
    was accepted and discarded, so a world-unreadable file was readable by
@@ -77,15 +86,26 @@ Every one of these was a real defect, not a disagreement about semantics:
 5. **Mode 0 was spelled as "no mode given"** in four places, so
    `open(path, O_CREAT, 0)` produced a 0644 file. The last of the four was in
    go-fuse itself (`NullPermissions`).
-6. **NAME_MAX was not enforced.** The kernel does not check it for a FUSE
-   filesystem, so names longer than 255 bytes were being created.
-7. **A directory's `mtime`/`ctime` never moved** when an entry was added or
+6. **A directory's `mtime`/`ctime` never moved** when an entry was added or
    removed — and the coherence layer was bumping only the directory's
    *version*, leaving its own inode record under a lease nothing invalidated.
+7. **NAME_MAX was not enforced.** The kernel does not check it for a FUSE
+   filesystem, so names longer than 255 bytes were being created.
+8. **A directory's `nlink` was a constant 2** rather than 2 plus its
+   subdirectory count. `find` uses `nlink-2` to decide a directory has no
+   subdirectories left to visit, so this could make it skip real subtrees.
+9. **`truncate` had no upper bound.** The write path buffers a whole file in
+    memory and sized that buffer from the requested length, so an
+    unprivileged `truncate(f, 1<<62)` was a local denial of service. This one
+    is a security bug, not a conformance detail.
+10. **Timestamps were reported to the second**, discarding the nanoseconds
+    the records already held.
 
-Two more were found by the same effort but outside pjdfstest itself: a crash
-from concurrent reads on one file handle, and EIO returned for interrupted
-requests. Both are described in the commit history.
+Three more were found by the same effort but outside pjdfstest itself: a
+crash from concurrent reads on one file handle (a Go fatal error, so the
+whole mount died), EIO returned for interrupted requests, and — from the
+fix for that one — a mutation being applied twice when the kernel resent an
+interrupted request. All three are in the commit history.
 
 ## Enumerated exceptions
 
@@ -104,12 +124,15 @@ content-addresses on commit, and there is no partial-file state to publish a
 size from. §16.3's in-place random-access writes are what would change it,
 and they are `posix`-class work this build does not do.
 
-### 2. `ctime` granularity on rapid metadata changes
+### 2. Open-but-unlinked files are not kept alive (`unlink/14`, 3 assertions)
 
-A few `link`/`unlink` cases compare `ctime` before and after an operation that
-completes well inside one second. `ctime` is stored with the resolution the
-inode record carries and compared at one-second `stat` granularity, so two
-changes in the same second are indistinguishable.
+POSIX requires an unlinked file to stay readable through an already-open
+descriptor until the last one closes. This build graves an inode as soon as
+its last *name* goes, without waiting for open handles — the gap
+`pkg/repo/gc.go` has documented since GC was written, and §19.3's
+leased-open-handle registry is what would close it. It needs open-handle
+tracking across process boundaries, which is authority work rather than a
+mount-local fix.
 
 ### 3. pjdfstest's own Linux deviations
 

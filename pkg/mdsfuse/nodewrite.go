@@ -28,6 +28,22 @@ func callerOwner(ctx context.Context) (uid, gid uint32) {
 	return uint32(os.Getuid()), uint32(os.Getgid())
 }
 
+// mutating returns the context to use for an operation that changes
+// state.
+//
+// It deliberately drops cancellation. The kernel cancels a FUSE request
+// when the calling thread takes a signal and then *resends* it, so a
+// mutation abandoned halfway is a mutation that runs twice: the first
+// attempt creates the directory, the reply is discarded, the retry
+// arrives and fails with EEXIST. That is precisely what CI caught — a
+// mkdir returning "file exists" as the very first operation on a fresh
+// mount.
+//
+// Reads keep their cancellation: abandoning a read costs nothing, and
+// the EINTR that comes with it is the honest answer. A mutation has to
+// finish and report what actually happened.
+func mutating(ctx context.Context) context.Context { return context.WithoutCancel(ctx) }
+
 // The mutating half of the mount. Every operation here is a round trip
 // to the authority, which is the point: this is where a write on one
 // mount becomes an invalidation — or, for `posix`, a blocking recall —
@@ -123,7 +139,7 @@ var (
 func (h *writeHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return errnoFor(h.sess.commit(ctx))
+	return errnoFor(h.sess.commit(mutating(ctx)))
 }
 
 func (h *writeHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
@@ -161,7 +177,7 @@ func (h *writeHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Re
 func (h *writeHandle) Flush(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.sess.commit(ctx); err != nil {
+	if err := h.sess.commit(mutating(ctx)); err != nil {
 		return errnoFor(err)
 	}
 	return 0
@@ -170,7 +186,7 @@ func (h *writeHandle) Flush(ctx context.Context) syscall.Errno {
 func (h *writeHandle) Release(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	err := h.sess.commit(ctx)
+	err := h.sess.commit(mutating(ctx))
 	h.sess.closed = true
 	if h.node != nil {
 		h.node.clearActiveWrite(h)
@@ -198,7 +214,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	// which is what a caller that stats it straight afterwards expects.
 	// The empty record is replaced on the first real flush.
 	h.sess.dirty = true
-	if err := h.sess.commit(ctx); err != nil {
+	if err := h.sess.commit(mutating(ctx)); err != nil {
 		return nil, nil, 0, errnoFor(err)
 	}
 	resp, err := n.cfg.Client.Lookup(ctx, n.ino, name)
@@ -221,7 +237,7 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if n.cfg.ReadOnly {
 		return syscall.EROFS
 	}
-	return errnoFor(n.cfg.Client.Unlink(ctx, n.ino, name))
+	return errnoFor(n.cfg.Client.Unlink(mutating(ctx), n.ino, name))
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -229,7 +245,7 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 		return nil, syscall.EROFS
 	}
 	uid, gid := callerOwner(ctx)
-	id, err := n.cfg.Client.Mkdir(ctx, n.ino, name, mode, uid, gid)
+	id, err := n.cfg.Client.Mkdir(mutating(ctx), n.ino, name, mode, uid, gid)
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -246,7 +262,7 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if n.cfg.ReadOnly {
 		return syscall.EROFS
 	}
-	return errnoFor(n.cfg.Client.Rmdir(ctx, n.ino, name))
+	return errnoFor(n.cfg.Client.Rmdir(mutating(ctx), n.ino, name))
 }
 
 // Rename moves name out of this directory and into newParent under
@@ -270,7 +286,7 @@ func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		return syscall.EXDEV
 	}
 	child := n.GetChild(name)
-	if err := n.cfg.Client.Rename(ctx, n.ino, name, dst.ino, newName); err != nil {
+	if err := n.cfg.Client.Rename(mutating(ctx), n.ino, name, dst.ino, newName); err != nil {
 		return errnoFor(err)
 	}
 	rebind(child, dst.ino, newName)
@@ -340,7 +356,7 @@ func (n *Node) Mknod(ctx context.Context, name string, mode, rdev uint32, out *f
 		return nil, syscall.EINVAL
 	}
 	uid, gid := callerOwner(ctx)
-	id, err := n.cfg.Client.Mknod(ctx, n.ino, name, typ, rdev, mode&0o7777, uid, gid)
+	id, err := n.cfg.Client.Mknod(mutating(ctx), n.ino, name, typ, rdev, mode&0o7777, uid, gid)
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -365,7 +381,7 @@ func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 	if !ok {
 		return nil, syscall.EXDEV
 	}
-	rec, err := n.cfg.Client.Link(ctx, n.ino, name, tn.ino)
+	rec, err := n.cfg.Client.Link(mutating(ctx), n.ino, name, tn.ino)
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -378,7 +394,7 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 		return nil, syscall.EROFS
 	}
 	uid, gid := callerOwner(ctx)
-	id, err := n.cfg.Client.Symlink(ctx, n.ino, name, target, uid, gid)
+	id, err := n.cfg.Client.Symlink(mutating(ctx), n.ino, name, target, uid, gid)
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -421,7 +437,7 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		mut.ATime = &atime
 	}
 	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil || mut.ATime != nil {
-		rec, err := n.cfg.Client.SetAttr(ctx, n.ino, mut)
+		rec, err := n.cfg.Client.SetAttr(mutating(ctx), n.ino, mut)
 		if err != nil {
 			return errnoFor(err)
 		}
@@ -453,7 +469,7 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 	if h != nil {
 		h.mu.Lock()
 		h.sess.resize(int64(size))
-		err := h.sess.commit(ctx)
+		err := h.sess.commit(mutating(ctx))
 		h.mu.Unlock()
 		if err != nil {
 			return errnoFor(err)
@@ -482,7 +498,7 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		}
 		sess.buf.Write(cur)
 		sess.resize(int64(size))
-		if err := sess.commit(ctx); err != nil {
+		if err := sess.commit(mutating(ctx)); err != nil {
 			return errnoFor(err)
 		}
 	}
