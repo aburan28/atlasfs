@@ -180,13 +180,13 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	mountErr := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
-		// allow_other is not optional for a CSI volume: kubelet mounts as
-		// root and the pod's process runs as whatever the SecurityContext
-		// says, so without it every container access is refused before any
-		// permission check runs (DESIGN.md §22).
+		var mountOpts []fuseserver.MountOption
+		if allowOtherPermitted() {
+			mountOpts = append(mountOpts, fuseserver.AllowOther())
+		}
 		err := fuseserver.Mount(context.Background(), r, target, func(s *fuse.Server) {
 			mounted <- s
-		}, fuseserver.AllowOther())
+		}, mountOpts...)
 		if err != nil {
 			select {
 			case mountErr <- err:
@@ -323,13 +323,11 @@ func (n *NodeServer) publishViaMDS(
 	done := make(chan struct{})
 	go func() {
 		err := mdsfuse.Mount(context.Background(), mdsfuse.Config{
-			Client:   client,
-			Backend:  backend,
-			ReadOnly: readOnly,
-			Region:   params.Region,
-			// See the local-mount path: kubelet mounts as root, the pod
-			// runs as something else.
-			AllowOther: true,
+			Client:     client,
+			Backend:    backend,
+			ReadOnly:   readOnly,
+			Region:     params.Region,
+			AllowOther: allowOtherPermitted(),
 			// Zero: without asking the authority for the subtree's class,
 			// assume the strictest one. A `posix` volume must not have the
 			// kernel answering getattr from a cache that cannot be recalled.
@@ -368,3 +366,20 @@ func (n *NodeServer) publishViaMDS(
 		return nil, status.Error(codes.DeadlineExceeded, "mount did not complete before context deadline")
 	}
 }
+
+// allowOtherPermitted reports whether this process may mount with
+// allow_other.
+//
+// A CSI volume needs it: kubelet mounts as root and the pod's process
+// runs as whatever the SecurityContext says, so without it every
+// container access is refused before any permission check runs
+// (DESIGN.md §22). But the kernel only permits allow_other for root
+// unless `user_allow_other` is set in /etc/fuse.conf, and asking for it
+// anyway turns the mount into a hard failure — which is what it did on a
+// non-root CI runner.
+//
+// Being root is exactly the condition under which it is guaranteed
+// permitted, and exactly the condition kubelet runs under, so that is
+// the test. A non-root driver serves only its own uid, which is a real
+// limitation but a strictly better outcome than refusing to mount.
+func allowOtherPermitted() bool { return os.Geteuid() == 0 }
