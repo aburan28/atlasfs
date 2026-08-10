@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -83,20 +84,31 @@ func benchMount(b *testing.B, size int64) string {
 
 // readWhole streams the file through the kernel with a fixed buffer,
 // rather than os.ReadFile, so the read size per syscall is explicit.
-func readWhole(b *testing.B, path string, buf []byte) {
-	b.Helper()
+//
+// It returns an error rather than calling b.Fatal, and that is not
+// style. b.Fatal calls runtime.Goexit, and a RunParallel worker that
+// exits that way never signals completion — so a single failed read
+// inside b.RunParallel turns into a benchmark that hangs until the test
+// binary's timeout rather than one that fails. Returning the error lets
+// the caller fail from the goroutine that owns the benchmark.
+func readWhole(path string, buf []byte) error {
 	f, err := os.Open(path)
 	if err != nil {
-		b.Fatal(err)
+		return err
 	}
 	defer f.Close()
 	for {
-		_, err := f.Read(buf)
+		n, err := f.Read(buf)
 		if err == io.EOF {
-			return
+			return nil
 		}
 		if err != nil {
-			b.Fatal(err)
+			return err
+		}
+		if n == 0 {
+			// A read that returns neither bytes nor an error would spin
+			// this loop forever; treat it as the end of the file.
+			return nil
 		}
 	}
 }
@@ -112,7 +124,9 @@ func BenchmarkFUSEReadSequential(b *testing.B) {
 			b.SetBytes(size)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				readWhole(b, path, buf)
+				if err := readWhole(path, buf); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
@@ -129,12 +143,19 @@ func BenchmarkFUSEReadConcurrent(b *testing.B) {
 	b.SetParallelism(64)
 	b.SetBytes(size)
 	b.ResetTimer()
+	var failed atomic.Pointer[error]
 	b.RunParallel(func(pb *testing.PB) {
 		buf := make([]byte, 1<<20)
 		for pb.Next() {
-			readWhole(b, path, buf)
+			if err := readWhole(path, buf); err != nil {
+				failed.CompareAndSwap(nil, &err)
+				return // never b.Fatal here — see readWhole's doc comment
+			}
 		}
 	})
+	if err := failed.Load(); err != nil {
+		b.Fatal(*err)
+	}
 }
 
 // BenchmarkFUSEStat measures metadata-path latency through the kernel —

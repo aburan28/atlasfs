@@ -62,4 +62,8 @@ jobs:
       # runner is too noisy to threshold against — the real numbers in
       # README.md come from a dedicated run, not from here.
       - name: benchmarks compile and run
-        run: go test ./... -run '^$' -bench . -benchtime 1x
+        # -timeout is the point: a benchmark that wedges should fail this
+        # step in minutes, not sit until the job's own hour-long ceiling.
+        # An unbounded benchmark step already cost one run that way.
+        timeout-minutes: 10
+        run: go test ./... -run '^$' -bench . -benchtime 1x -timeout 5m

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
@@ -140,17 +141,27 @@ func BenchmarkReadColdConcurrent(b *testing.B) {
 	b.SetBytes(size)
 	b.ReportAllocs()
 	b.ResetTimer()
+	// Errors are collected rather than fataled in place: b.Fatal calls
+	// runtime.Goexit, and a RunParallel worker that exits that way never
+	// signals completion, so a failure would hang the benchmark instead
+	// of failing it.
+	var failed atomic.Pointer[error]
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			fr, err := r.OpenFile(ctx, rec)
 			if err != nil {
-				b.Fatal(err)
+				failed.CompareAndSwap(nil, &err)
+				return
 			}
 			if _, err := fr.ReadAll(); err != nil {
-				b.Fatal(err)
+				failed.CompareAndSwap(nil, &err)
+				return
 			}
 		}
 	})
+	if err := failed.Load(); err != nil {
+		b.Fatal(*err)
+	}
 }
 
 // BenchmarkPublish measures the ingest side: chunking, BLAKE3 hashing,
