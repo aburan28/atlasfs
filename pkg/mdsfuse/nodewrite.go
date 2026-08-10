@@ -194,6 +194,14 @@ func (h *writeHandle) Release(ctx context.Context) syscall.Errno {
 	return errnoFor(err)
 }
 
+// size is the in-flight length of the file this handle is writing, which
+// runs ahead of the committed record until flush.
+func (h *writeHandle) size() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return uint64(h.sess.buf.Len())
+}
+
 func (n *Node) clearActiveWrite(h *writeHandle) {
 	n.mu.Lock()
 	if n.activeWrite == h {

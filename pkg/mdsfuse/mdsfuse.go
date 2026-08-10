@@ -289,6 +289,16 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 		return errno
 	}
 	fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
+	// While a write session is open the committed record's size is
+	// behind — content commits on flush (§16.1) — and POSIX requires
+	// fstat to see a write immediately. The open handle is the only thing
+	// that knows the in-flight length. See pkg/fuseserver's Getattr.
+	n.mu.Lock()
+	h := n.activeWrite
+	n.mu.Unlock()
+	if h != nil {
+		out.Attr.Size = h.size()
+	}
 	return 0
 }
 

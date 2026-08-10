@@ -418,3 +418,44 @@ func TestSubsecondTimestamps(t *testing.T) {
 		t.Errorf("mtime nsec = %d, want 200000000", st.Mtim.Nsec)
 	}
 }
+
+// TestFstatSeesAnUnflushedWrite: content commits on flush (§16.1), so
+// between a write(2) and the close that flushes it the committed record
+// still holds the old length. POSIX requires fstat to see the write
+// immediately, and any append-then-check loop reads a size that
+// contradicts the bytes it just wrote otherwise. fsx fails on its third
+// operation without this.
+func TestFstatSeesAnUnflushedWrite(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "growing")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if _, err := f.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 5 {
+		t.Fatalf("fstat after a 5-byte write reports size %d", fi.Size())
+	}
+
+	// And a write past EOF, which is what actually caught this: the file
+	// has to grow to cover the hole.
+	if _, err := f.WriteAt([]byte("x"), 4095); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 4096 {
+		t.Fatalf("fstat after a write past EOF reports size %d, want 4096", fi.Size())
+	}
+}

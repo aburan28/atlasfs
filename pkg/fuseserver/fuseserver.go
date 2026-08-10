@@ -322,6 +322,20 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 		return errno
 	}
 	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	// While a write session is open, the committed record's size is
+	// behind: this build commits content on flush (§16.1), so between a
+	// write(2) and the close that flushes it the inode still holds the
+	// old length. POSIX requires fstat to see the write immediately, and
+	// a caller that writes past EOF and then stats — fsx does this
+	// constantly, and so does any append-then-check loop — would
+	// otherwise read a size that contradicts the bytes it just wrote.
+	// The open handle knows the real length; nothing else does.
+	n.mu.Lock()
+	wh := n.activeWrite
+	n.mu.Unlock()
+	if wh != nil {
+		out.Attr.Size = wh.size()
+	}
 	return 0
 }
 
@@ -862,6 +876,14 @@ func (h *writeFileHandle) target() (metadb.InodeID, string) {
 		}
 	}
 	return h.parent, h.name
+}
+
+// size is the in-flight length of the file this handle is writing,
+// which is ahead of the committed record until flush.
+func (h *writeFileHandle) size() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return uint64(len(h.buf))
 }
 
 // resize truncates or zero-extends the handle's buffer to sz bytes and
