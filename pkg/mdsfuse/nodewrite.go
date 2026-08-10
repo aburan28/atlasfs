@@ -2,6 +2,7 @@ package mdsfuse
 
 import (
 	"context"
+	"os"
 	"sync"
 	"syscall"
 
@@ -14,6 +15,17 @@ import (
 	"github.com/aburan28/atlasfs/pkg/metadb"
 	"github.com/aburan28/atlasfs/pkg/repo"
 )
+
+// callerOwner is the uid/gid to stamp on an inode this syscall is
+// creating: the calling process's, which go-fuse carries on the request
+// context (DESIGN.md §20). The authority cannot derive it — the RPC comes
+// from the mount, not from the user — so the mount forwards it.
+func callerOwner(ctx context.Context) (uid, gid uint32) {
+	if c, ok := fuse.FromContext(ctx); ok {
+		return c.Uid, c.Gid
+	}
+	return uint32(os.Getuid()), uint32(os.Getgid())
+}
 
 // The mutating half of the mount. Every operation here is a round trip
 // to the authority, which is the point: this is where a write on one
@@ -163,7 +175,8 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	}
 	// The kernel has already applied the caller's umask, so mode is what
 	// the file should end up with.
-	h := &writeHandle{sess: &writeSession{cfg: n.cfg, dir: n.ino, name: name, mode: mode}}
+	uid, gid := callerOwner(ctx)
+	h := &writeHandle{sess: &writeSession{cfg: n.cfg, dir: n.ino, name: name, mode: mode, uid: uid, gid: gid}}
 	// Commit immediately so the name exists as soon as create(2) returns,
 	// which is what a caller that stats it straight afterwards expects.
 	// The empty record is replaced on the first real flush.
@@ -195,7 +208,8 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	if n.cfg.ReadOnly {
 		return nil, syscall.EROFS
 	}
-	id, err := n.cfg.Client.Mkdir(ctx, n.ino, name)
+	uid, gid := callerOwner(ctx)
+	id, err := n.cfg.Client.Mkdir(ctx, n.ino, name, mode, uid, gid)
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -316,7 +330,8 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	if n.cfg.ReadOnly {
 		return nil, syscall.EROFS
 	}
-	id, err := n.cfg.Client.Symlink(ctx, n.ino, name, target)
+	uid, gid := callerOwner(ctx)
+	id, err := n.cfg.Client.Symlink(ctx, n.ino, name, target, uid, gid)
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -346,10 +361,16 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 	if mode, ok := in.GetMode(); ok {
 		mut.Mode = &mode
 	}
+	if uid, ok := in.GetUID(); ok {
+		mut.Uid = &uid
+	}
+	if gid, ok := in.GetGID(); ok {
+		mut.Gid = &gid
+	}
 	if mtime, ok := in.GetMTime(); ok {
 		mut.MTime = &mtime
 	}
-	if mut.Mode != nil || mut.MTime != nil {
+	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil {
 		rec, err := n.cfg.Client.SetAttr(ctx, n.ino, mut)
 		if err != nil {
 			return errnoFor(err)
@@ -359,7 +380,7 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 
 	size, ok := in.GetSize()
 	if !ok {
-		if mut.Mode == nil && mut.MTime == nil {
+		if mut.Mode == nil && mut.Uid == nil && mut.Gid == nil && mut.MTime == nil {
 			rec, errno := n.current(ctx)
 			if errno != 0 {
 				return errno

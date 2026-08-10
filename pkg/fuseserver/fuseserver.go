@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"syscall"
 
@@ -41,6 +42,19 @@ import (
 // coherenceHolder is the single local holder ID this in-process mount
 // registers as with a repo's coherence.Manager.
 const coherenceHolder = "local"
+
+// callerOwner is the uid/gid to stamp on an inode a syscall is creating:
+// the caller's own, which go-fuse carries on the request context
+// (DESIGN.md §20). A request with no caller information — go-fuse
+// synthesises some internally — falls back to the process's own identity
+// rather than to root, so a non-root mount does not produce files it
+// then cannot write.
+func callerOwner(ctx context.Context) repo.Owner {
+	if c, ok := fuse.FromContext(ctx); ok {
+		return repo.Owner{Uid: c.Uid, Gid: c.Gid}
+	}
+	return repo.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+}
 
 // Node is one FUSE inode, backed by an AtlasFS inode in a Repo. parent
 // and name are needed to commit an overwrite (writing to an existing
@@ -170,6 +184,7 @@ func (n *Node) markStale() {
 // actual access-control boundary).
 func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 	out.Size = rec.Size
+	out.Owner = fuse.Owner{Uid: rec.Uid, Gid: rec.Gid}
 	sec := uint64(0)
 	if !rec.MTime.IsZero() {
 		sec = uint64(rec.MTime.Unix())
@@ -417,6 +432,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	// The kernel has already applied the caller's umask to mode, so this
 	// is the mode the file should end up with.
 	h.SetMode(mode)
+	h.SetOwner(callerOwner(ctx))
 	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, mode: mode & 0o7777}
 	id, err := h.Commit(ctx)
 	if err != nil {
@@ -443,7 +459,7 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	id, err := n.repo.Mkdir(n.ino, name, mode)
+	id, err := n.repo.Mkdir(n.ino, name, mode, callerOwner(ctx))
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -515,7 +531,7 @@ func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 }
 
 func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	id, err := n.repo.Symlink(n.ino, name, target)
+	id, err := n.repo.Symlink(n.ino, name, target, callerOwner(ctx))
 	if err != nil {
 		return nil, errnoFor(err)
 	}
@@ -535,13 +551,10 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 // implementation), plus mode and timestamp changes, which persist in the
 // inode record.
 //
-// Ownership is the one thing still accepted and dropped: DESIGN.md §20's
-// uid/gid model is a later phase, and storing an owner ahead of it would
-// mean a second source of truth to reconcile when the real one lands.
-// Silently accepting rather than returning ENOSYS matches what most FUSE
-// filesystems do for attributes they cannot materially support, since an
-// error there breaks a surprising amount of ordinary software (cp,
-// rsync, tar) that always tries to restore ownership.
+// Ownership changes persist too (DESIGN.md §20). Enforcement of who may
+// make them is the kernel's: the mount carries `default_permissions`, so
+// the VFS checks the mode/uid/gid this filesystem reports before the
+// request ever arrives.
 func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	rec, errno := n.currentRec()
 	if errno != 0 {
@@ -615,19 +628,22 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		}
 	}
 
-	// Mode and times are pure metadata and persist here. Ownership does
-	// not: DESIGN.md §20's uid/gid model is a later phase, and chown is
-	// accepted-and-ignored rather than refused because cp, rsync and tar
-	// all try to restore ownership unconditionally and an error there
-	// breaks them outright.
+	// Mode, ownership and times are all pure metadata and persist here
+	// (DESIGN.md §20).
 	var mut metadb.AttrMutation
 	if mode, ok := in.GetMode(); ok {
 		mut.Mode = &mode
 	}
+	if uid, ok := in.GetUID(); ok {
+		mut.Uid = &uid
+	}
+	if gid, ok := in.GetGID(); ok {
+		mut.Gid = &gid
+	}
 	if mtime, ok := in.GetMTime(); ok {
 		mut.MTime = &mtime
 	}
-	if mut.Mode != nil || mut.MTime != nil {
+	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil {
 		if !n.repo.Class.Mutable() {
 			return syscall.EROFS
 		}
@@ -880,6 +896,14 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 	if !r.Class.Mutable() {
 		opts = append(opts, "ro")
 	}
+	// default_permissions hands POSIX access checking to the kernel,
+	// which applies the mode/uid/gid this filesystem reports. Without it
+	// FUSE performs no permission check at all beyond the mount owner's,
+	// so a world-unreadable file is readable by anyone who can see the
+	// mount — and every rule §20 cares about is unenforced. Re-deriving
+	// the access rules in userspace would be more code and more ways to
+	// be subtly wrong.
+	opts = append(opts, "default_permissions")
 	// Let the kernel cache attrs and dentries for exactly this class's
 	// D (repo.Class.KernelCacheTTL). Leaving these nil — go-fuse's
 	// default — means a zero timeout, so every getattr and every lookup

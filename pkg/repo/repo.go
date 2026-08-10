@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
@@ -296,7 +297,11 @@ func (r *Repo) PublishTree(ctx context.Context, srcDir string, destPath []string
 			if err != nil {
 				return err
 			}
-			rec := metadb.InodeRecord{IsDir: true, Mode: permOf(info.Mode(), 0o755), MTime: info.ModTime(), NLink: 2}
+			uid, gid := ownerOf(info)
+			rec := metadb.InodeRecord{
+				IsDir: true, Mode: permOf(info.Mode(), 0o755),
+				Uid: uid, Gid: gid, MTime: info.ModTime(), NLink: 2,
+			}
 			id, err := r.DB.CommitMkdir(parentInode, d.Name(), rec)
 			if errors.Is(err, metadb.ErrExists) {
 				if id, err = r.DB.Lookup(parentInode, d.Name()); err != nil {
@@ -352,8 +357,11 @@ func (r *Repo) publishSymlink(dir metadb.InodeID, name, srcPath string) error {
 	if err != nil {
 		return err
 	}
+	uid, gid := ownerOf(info)
 	rec := metadb.InodeRecord{
 		Mode:          0o777,
+		Uid:           uid,
+		Gid:           gid,
 		Size:          uint64(len(target)),
 		MTime:         info.ModTime(),
 		NLink:         1,
@@ -385,7 +393,8 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 	// The source's own permission bits, not a constant: publishing a
 	// tree of executables and mounting it has to give back executables,
 	// and a hardcoded 0o644 silently strips every exec bit in the tree.
-	rec := metadb.InodeRecord{Mode: permOf(info.Mode(), 0o644), MTime: info.ModTime(), NLink: 1}
+	uid, gid := ownerOf(info)
+	rec := metadb.InodeRecord{Mode: permOf(info.Mode(), 0o644), Uid: uid, Gid: gid, MTime: info.ModTime(), NLink: 1}
 	content.apply(&rec)
 	if _, err := r.DB.PublishFile(dir, name, rec); err != nil {
 		return 0, publishBindErr(name, err)
@@ -402,6 +411,18 @@ func permOf(m os.FileMode, def uint32) uint32 {
 		return def
 	}
 	return perm
+}
+
+// ownerOf reads a source file's uid/gid so a published tree keeps its
+// ownership (DESIGN.md §20). The syscall-level stat is behind an
+// interface assertion because os.FileInfo.Sys() is platform-specific;
+// on anything that does not supply it, the tree publishes as root-owned,
+// which is what it did before ownership existed at all.
+func ownerOf(info os.FileInfo) (uid, gid uint32) {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Uid, st.Gid
+	}
+	return 0, 0
 }
 
 // contentRef is the chunk/manifest-shaped part of an InodeRecord, the

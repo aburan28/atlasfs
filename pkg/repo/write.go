@@ -64,13 +64,28 @@ func (r *Repo) QuotaLimits() (bytesLimit, inodesLimit uint64, err error) {
 // WriteHandle buffers a new or replacement file's content. Nothing is
 // visible in the namespace until Commit.
 type WriteHandle struct {
-	repo *Repo
-	dir  metadb.InodeID
-	name string
-	mode uint32
-	buf  bytes.Buffer
-	done bool
+	repo  *Repo
+	dir   metadb.InodeID
+	name  string
+	mode  uint32
+	owner Owner
+	buf   bytes.Buffer
+	done  bool
 }
+
+// Owner is the uid/gid a new inode is created with (DESIGN.md §20).
+// The caller supplies it because only the mount knows who made the
+// syscall — pkg/repo has no notion of a current user.
+type Owner struct {
+	Uid uint32
+	Gid uint32
+}
+
+// SetOwner records the uid/gid a newly-created file gets. Like SetMode
+// it applies only when Commit binds a new name; an overwrite leaves the
+// existing inode's ownership alone, because writing to a file you do not
+// own must not quietly transfer it to you.
+func (h *WriteHandle) SetOwner(o Owner) { h.owner = o }
 
 // SetMode records the permission bits a create(2) asked for. It applies
 // only when Commit binds a *new* name: an overwrite keeps the existing
@@ -178,7 +193,7 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 	if mode == 0 {
 		mode = 0o644
 	}
-	rec := metadb.InodeRecord{Mode: mode, MTime: time.Now(), NLink: 1}
+	rec := metadb.InodeRecord{Mode: mode, Uid: h.owner.Uid, Gid: h.owner.Gid, MTime: time.Now(), NLink: 1}
 	content.apply(&rec)
 
 	id, err := r.DB.CommitFile(h.dir, h.name, rec)
@@ -224,7 +239,7 @@ func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 // Mkdir creates a new, empty directory named name under dir. Fails with
 // EEXIST-equivalent if name is already bound to anything — unlike
 // WriteHandle.Commit, mkdir(2) never silently overwrites.
-func (r *Repo) Mkdir(dir metadb.InodeID, name string, mode uint32) (metadb.InodeID, error) {
+func (r *Repo) Mkdir(dir metadb.InodeID, name string, mode uint32, owner Owner) (metadb.InodeID, error) {
 	if !r.Class.Mutable() {
 		return 0, ErrReadOnly
 	}
@@ -232,7 +247,9 @@ func (r *Repo) Mkdir(dir metadb.InodeID, name string, mode uint32) (metadb.Inode
 	if perm == 0 {
 		perm = 0o755
 	}
-	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{IsDir: true, Mode: perm, MTime: time.Now(), NLink: 2})
+	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{
+		IsDir: true, Mode: perm, Uid: owner.Uid, Gid: owner.Gid, MTime: time.Now(), NLink: 2,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, metadb.ErrExists):
@@ -326,11 +343,11 @@ func (r *Repo) Link(dir metadb.InodeID, name string, target metadb.InodeID) (met
 }
 
 // Symlink creates a symlink at (dir, name) pointing at target.
-func (r *Repo) Symlink(dir metadb.InodeID, name, target string) (metadb.InodeID, error) {
+func (r *Repo) Symlink(dir metadb.InodeID, name, target string, owner Owner) (metadb.InodeID, error) {
 	if !r.Class.Mutable() {
 		return 0, ErrReadOnly
 	}
-	id, err := r.DB.CreateSymlink(dir, name, target)
+	id, err := r.DB.CreateSymlink(dir, name, target, owner.Uid, owner.Gid)
 	if err != nil {
 		return 0, err
 	}

@@ -170,7 +170,7 @@ func TestRenameDirectoryOverEmptyDirectory(t *testing.T) {
 
 func TestCreateSymlinkRecord(t *testing.T) {
 	db := openTestDB(t)
-	id, err := db.CreateSymlink(RootInode, "link", "../target")
+	id, err := db.CreateSymlink(RootInode, "link", "../target", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestCreateSymlinkRecord(t *testing.T) {
 		t.Fatalf("symlink size = %d, want %d", rec.Size, len("../target"))
 	}
 	// symlink(2) never clobbers.
-	if _, err := db.CreateSymlink(RootInode, "link", "elsewhere"); !errors.Is(err, ErrExists) {
+	if _, err := db.CreateSymlink(RootInode, "link", "elsewhere", 0, 0); !errors.Is(err, ErrExists) {
 		t.Fatalf("got %v, want ErrExists", err)
 	}
 }

@@ -141,3 +141,38 @@ func TestCreateHonoursTheRequestedModeThroughAuthority(t *testing.T) {
 		}
 	}
 }
+
+// TestOwnershipThroughAuthority: the authority cannot derive who made a
+// syscall, so the mount forwards the caller's uid/gid on every creating
+// operation and on chown (DESIGN.md §20).
+func TestOwnershipThroughAuthority(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
+	mnt := c.mountAt(t, "writer", 0)
+
+	if err := os.WriteFile(filepath.Join(mnt, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(filepath.Join(mnt, "f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	if st.Uid != uint32(os.Getuid()) || st.Gid != uint32(os.Getgid()) {
+		t.Fatalf("new file owned by %d:%d, want %d:%d", st.Uid, st.Gid, os.Getuid(), os.Getgid())
+	}
+
+	if os.Getuid() != 0 {
+		t.Skip("changing a file's owner to an arbitrary uid needs root")
+	}
+	if err := os.Chown(filepath.Join(mnt, "f"), 4242, 4343); err != nil {
+		t.Fatalf("chown: %v", err)
+	}
+	fi, err = os.Lstat(filepath.Join(mnt, "f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st = fi.Sys().(*syscall.Stat_t)
+	if st.Uid != 4242 || st.Gid != 4343 {
+		t.Fatalf("after chown through the authority: %d:%d, want 4242:4343", st.Uid, st.Gid)
+	}
+}

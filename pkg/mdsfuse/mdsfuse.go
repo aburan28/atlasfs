@@ -106,6 +106,10 @@ func Mount(ctx context.Context, cfg Config, mountpoint string, onMounted func(*f
 	if cfg.ReadOnly {
 		opts = append(opts, "ro")
 	}
+	// default_permissions: the kernel enforces POSIX access checks
+	// against the mode/uid/gid the authority reports. Without it FUSE
+	// checks nothing, so §20's rules would be advisory.
+	opts = append(opts, "default_permissions")
 	ttl := cfg.KernelCacheTTL
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
 		EntryTimeout: &ttl,
@@ -173,6 +177,7 @@ func (n *Node) current(ctx context.Context) (metadb.InodeRecord, syscall.Errno) 
 
 func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 	out.Size = rec.Size
+	out.Owner = fuse.Owner{Uid: rec.Uid, Gid: rec.Gid}
 	sec := uint64(0)
 	if !rec.MTime.IsZero() {
 		sec = uint64(rec.MTime.Unix())

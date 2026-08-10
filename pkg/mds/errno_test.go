@@ -47,11 +47,11 @@ func TestErrnoSurvivesTheWire(t *testing.T) {
 	c := env.client("caller", nil)
 	ctx := context.Background()
 
-	dir, err := c.Mkdir(ctx, metadb.RootInode, "d")
+	dir, err := c.Mkdir(ctx, metadb.RootInode, "d", 0o755, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Mkdir(ctx, dir, "inside"); err != nil {
+	if _, err := c.Mkdir(ctx, dir, "inside", 0o755, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Commit(ctx, metadb.RootInode, "f", metadb.InodeRecord{Mode: 0o644, NLink: 1}); err != nil {
@@ -68,7 +68,7 @@ func TestErrnoSurvivesTheWire(t *testing.T) {
 		{"rename a directory over a file", func() error { return c.Rename(ctx, metadb.RootInode, "d", metadb.RootInode, "f") }, syscall.ENOTDIR},
 		{"rename a missing name", func() error { return c.Rename(ctx, metadb.RootInode, "gone", metadb.RootInode, "x") }, syscall.ENOENT},
 		{"symlink over an existing name", func() error {
-			_, err := c.Symlink(ctx, metadb.RootInode, "f", "target")
+			_, err := c.Symlink(ctx, metadb.RootInode, "f", "target", 0, 0)
 			return err
 		}, syscall.EEXIST},
 	}

@@ -215,6 +215,12 @@ type MkdirRequest struct {
 	Holder string         `json:"holder"`
 	Dir    metadb.InodeID `json:"dir"`
 	Name   string         `json:"name"`
+	// Mode and Uid/Gid come from the calling process: mkdir(2) carries a
+	// mode the kernel has already umasked, and the authority has no way
+	// to know who made the syscall (DESIGN.md §20).
+	Mode uint32 `json:"mode"`
+	Uid  uint32 `json:"uid"`
+	Gid  uint32 `json:"gid"`
 }
 
 type MkdirResponse struct {
@@ -275,6 +281,10 @@ type SymlinkRequest struct {
 	Dir    metadb.InodeID `json:"dir"`
 	Name   string         `json:"name"`
 	Target string         `json:"target"`
+	// Uid/Gid are the calling process's, forwarded by the mount: the
+	// authority has no way to know who made the syscall (DESIGN.md §20).
+	Uid uint32 `json:"uid"`
+	Gid uint32 `json:"gid"`
 }
 
 type SymlinkResponse struct {
@@ -304,6 +314,8 @@ type SetAttrRequest struct {
 	Holder string         `json:"holder"`
 	Inode  metadb.InodeID `json:"inode"`
 	Mode   *uint32        `json:"mode,omitempty"`
+	Uid    *uint32        `json:"uid,omitempty"`
+	Gid    *uint32        `json:"gid,omitempty"`
 	MTime  *time.Time     `json:"mtime,omitempty"`
 }
 

@@ -360,7 +360,13 @@ func (s *Server) HasLocator(ctx context.Context, req *HasLocatorRequest) (*HasLo
 // directory version, which is what invalidates every holder's negative
 // cache entry for this name in one step (§10.4).
 func (s *Server) Mkdir(ctx context.Context, req *MkdirRequest) (*MkdirResponse, error) {
-	rec := metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}
+	perm := req.Mode & 0o7777
+	if perm == 0 {
+		perm = 0o755
+	}
+	rec := metadb.InodeRecord{
+		IsDir: true, Mode: perm, Uid: req.Uid, Gid: req.Gid, MTime: time.Now(), NLink: 2,
+	}
 	id, err := s.db.CommitMkdir(req.Dir, req.Name, rec)
 	if err != nil {
 		return nil, toStatus(err)
@@ -438,7 +444,9 @@ func (s *Server) SetAttr(ctx context.Context, req *SetAttrRequest) (*SetAttrResp
 			return nil, status.FromContextError(err).Err()
 		}
 	}
-	rec, err := s.db.SetAttr(req.Inode, metadb.AttrMutation{Mode: req.Mode, MTime: req.MTime})
+	rec, err := s.db.SetAttr(req.Inode, metadb.AttrMutation{
+		Mode: req.Mode, Uid: req.Uid, Gid: req.Gid, MTime: req.MTime,
+	})
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -482,7 +490,7 @@ func (s *Server) Link(ctx context.Context, req *LinkRequest) (*LinkResponse, err
 }
 
 func (s *Server) Symlink(ctx context.Context, req *SymlinkRequest) (*SymlinkResponse, error) {
-	id, err := s.db.CreateSymlink(req.Dir, req.Name, req.Target)
+	id, err := s.db.CreateSymlink(req.Dir, req.Name, req.Target, req.Uid, req.Gid)
 	if err != nil {
 		return nil, toStatus(err)
 	}

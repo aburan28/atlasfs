@@ -456,9 +456,9 @@ func (c *Client) HasLocator(ctx context.Context, id chunk.ID) (bool, error) {
 	return resp.Found, nil
 }
 
-func (c *Client) Mkdir(ctx context.Context, dir metadb.InodeID, name string) (metadb.InodeID, error) {
+func (c *Client) Mkdir(ctx context.Context, dir metadb.InodeID, name string, mode, uid, gid uint32) (metadb.InodeID, error) {
 	var resp MkdirResponse
-	err := c.cc.Invoke(ctx, MethodMkdir, &MkdirRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	err := c.cc.Invoke(ctx, MethodMkdir, &MkdirRequest{Holder: c.holder, Dir: dir, Name: name, Mode: mode, Uid: uid, Gid: gid}, &resp)
 	if err == nil {
 		c.invalidateOwnMutation(dir)
 	}
@@ -493,7 +493,10 @@ func (c *Client) Rename(ctx context.Context, oldDir metadb.InodeID, oldName stri
 func (c *Client) SetAttr(ctx context.Context, id metadb.InodeID, mut metadb.AttrMutation) (metadb.InodeRecord, error) {
 	var resp SetAttrResponse
 	err := c.cc.Invoke(ctx, MethodSetAttr,
-		&SetAttrRequest{Holder: c.holder, Inode: id, Mode: mut.Mode, MTime: mut.MTime}, &resp)
+		&SetAttrRequest{
+			Holder: c.holder, Inode: id,
+			Mode: mut.Mode, Uid: mut.Uid, Gid: mut.Gid, MTime: mut.MTime,
+		}, &resp)
 	if err == nil {
 		// The mutator is excluded from its own recall, so nothing else
 		// will drop this holder's now-stale cached record.
@@ -520,9 +523,10 @@ func (c *Client) Link(ctx context.Context, dir metadb.InodeID, name string, targ
 	return resp.Record, err
 }
 
-func (c *Client) Symlink(ctx context.Context, dir metadb.InodeID, name, target string) (metadb.InodeID, error) {
+func (c *Client) Symlink(ctx context.Context, dir metadb.InodeID, name, target string, uid, gid uint32) (metadb.InodeID, error) {
 	var resp SymlinkResponse
-	err := c.cc.Invoke(ctx, MethodSymlink, &SymlinkRequest{Holder: c.holder, Dir: dir, Name: name, Target: target}, &resp)
+	err := c.cc.Invoke(ctx, MethodSymlink,
+		&SymlinkRequest{Holder: c.holder, Dir: dir, Name: name, Target: target, Uid: uid, Gid: gid}, &resp)
 	if err == nil {
 		c.invalidateOwnMutation(dir)
 	}

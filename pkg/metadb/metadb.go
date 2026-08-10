@@ -77,8 +77,15 @@ var ErrQuotaExceeded = errors.New("metadb: quota exceeded")
 // inline single chunk (§5.3: "small files ... inline the chunk ID
 // directly in the inode and skip the manifest object entirely").
 type InodeRecord struct {
-	IsDir       bool
-	Mode        uint32
+	IsDir bool
+	Mode  uint32
+	// Uid and Gid are DESIGN.md §20's ownership, stored per inode.
+	// They are the caller's at create time and change only through
+	// chown; a zero pair means "unset" for records written before
+	// ownership was tracked, and the mounts present that as root-owned,
+	// which is what an unowned inode already looked like.
+	Uid         uint32
+	Gid         uint32
 	Size        uint64
 	MTime       time.Time
 	NLink       uint32
@@ -540,9 +547,11 @@ func parentOfTx(tx *bbolt.Tx, child InodeID) (InodeID, error) {
 // is stored verbatim in the inode record rather than chunked — its
 // "content" is a short string, the same way a real filesystem treats a
 // fast symlink (see InodeRecord.SymlinkTarget).
-func (db *DB) CreateSymlink(dir InodeID, name, target string) (InodeID, error) {
+func (db *DB) CreateSymlink(dir InodeID, name, target string, uid, gid uint32) (InodeID, error) {
 	rec := InodeRecord{
 		Mode:          0o777,
+		Uid:           uid,
+		Gid:           gid,
 		Size:          uint64(len(target)),
 		MTime:         time.Now(),
 		NLink:         1,
@@ -1126,6 +1135,9 @@ func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID,
 			if existingRec.Mode != 0 {
 				rec.Mode = existingRec.Mode
 			}
+			// Ownership likewise: writing to a file you do not own must
+			// not quietly transfer it to you.
+			rec.Uid, rec.Gid = existingRec.Uid, existingRec.Gid
 		case isNew:
 			newID, err := allocInodeTx(tx)
 			if err != nil {

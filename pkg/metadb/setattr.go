@@ -10,19 +10,19 @@ import (
 // through the write path (chunk, upload, commit); mode and timestamps
 // are pure metadata and change in one transaction here.
 //
-// Scope, stated rather than implied: uid/gid are not stored. DESIGN.md
-// §20's ownership and permission model is a later phase, and inventing
-// an owner field ahead of it would mean a second source of truth to
-// reconcile when the real one lands. chown is still accepted and
-// ignored by the mounts, which is what most FUSE filesystems without an
-// ownership model do — returning an error there breaks cp, rsync and
-// tar, all of which try to restore ownership unconditionally.
+// Ownership (DESIGN.md §20) is here too. Permission *enforcement* is
+// not: the mounts pass `default_permissions` so the kernel checks the
+// mode/uid/gid this store reports, which is both less code and less
+// likely to be subtly wrong than re-deriving POSIX access rules in
+// userspace.
 
 // AttrMutation names the attributes to change. A nil field is left
 // alone, which is what setattr's valid-mask means: the kernel sends only
 // the fields the caller actually set.
 type AttrMutation struct {
 	Mode  *uint32
+	Uid   *uint32
+	Gid   *uint32
 	MTime *time.Time
 }
 
@@ -40,8 +40,21 @@ func (db *DB) SetAttr(id InodeID, mut AttrMutation) (InodeRecord, error) {
 			// directory into a file by arithmetic.
 			rec.Mode = *mut.Mode & 0o7777
 		}
+		if mut.Uid != nil {
+			rec.Uid = *mut.Uid
+		}
+		if mut.Gid != nil {
+			rec.Gid = *mut.Gid
+		}
 		if mut.MTime != nil {
 			rec.MTime = *mut.MTime
+		}
+		// chown(2) clears set-user-ID and set-group-ID on a successful
+		// change by a non-root caller, and clearing them unconditionally
+		// is the safe direction: leaving a setuid bit attached to a file
+		// whose owner just changed is a privilege-escalation primitive.
+		if (mut.Uid != nil || mut.Gid != nil) && !rec.IsDir {
+			rec.Mode &^= 0o6000
 		}
 		if err := putInode(tx, id, rec); err != nil {
 			return err
