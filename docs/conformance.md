@@ -3,12 +3,14 @@
 DESIGN.md §27 makes POSIX conformance a **gating** criterion rather than an
 aspiration, and names three suites: pjdfstest, `fsx`, and xfstests. Until now
 none of them had been run — the README said so, which is better than silence
-but is not the same as evidence.
+but is not the same as evidence. This records runs of the first two.
 
-This document records an actual run: how it was set up, what it scored, and
+This document records those runs: how they were set up, what they scored, and
 what each remaining failure is. §27 asks for "100% pass within `posix`
 subtrees, documented enumerated exceptions only, each with a rationale." The
-enumeration below is that list. It is not yet 100%.
+enumeration below is that list — one entry, plus pjdfstest's own known Linux
+deviations. It is not 100%, and the gap is a feature this build has never
+claimed to have.
 
 ## What was run
 
@@ -51,14 +53,14 @@ misleading results before they were understood:
 | + `posix` class via the authority | 8649 / 8792 | 98.4% |
 | + atime/ctime and mode 0 | 8731 / 8798 | 99.24% |
 | + NAME_MAX and directory timestamps | 8788 / 8798 | 99.89% |
-| **+ subsecond times, directory nlink, truncate bound** | **8794 / 8798** | **99.95%** |
+| + subsecond times, directory nlink, truncate bound | 8794 / 8798 | 99.95% |
+| **+ in-flight size while a write is open** (found by `fsx`) | **8796 / 8798** | **99.98%** |
 
 The assertion count differs between rows because pjdfstest runs more
 assertions as more of them get far enough to matter.
 
-The four remaining failures are the two exceptions enumerated below —
-`unlink/14` (3 assertions) and `open/07` (1). Nothing else in the suite
-fails.
+The two remaining failures are both in `unlink/14`, the single exception
+enumerated below. Nothing else in the suite fails.
 
 The jump from 58% to 98% is almost entirely `mknod`. It is worth understanding
 why one missing call cost that much: a large number of the chmod, chown,
@@ -113,18 +115,7 @@ These remain. Each is a real limitation with a reason, not an unexplained
 skip — §27's standard is that "a skip list nobody has justified is
 indistinguishable from a failure list."
 
-### 1. Buffered writes do not update `size` until flush
-
-`open/07` expects `fstat` on a write fd to report the new size immediately
-after a `write`. This build buffers a file's content and commits it as a unit
-on flush (§16.1), so the inode's size moves at flush, not at write.
-
-This is architectural, not an oversight: the write path chunks and
-content-addresses on commit, and there is no partial-file state to publish a
-size from. §16.3's in-place random-access writes are what would change it,
-and they are `posix`-class work this build does not do.
-
-### 2. Open-but-unlinked files are not kept alive (`unlink/14`, 3 assertions)
+### 1. Open-but-unlinked files are not kept alive (`unlink/14`, 2 assertions)
 
 POSIX requires an unlinked file to stay readable through an already-open
 descriptor until the last one closes. This build graves an inode as soon as
@@ -134,19 +125,52 @@ leased-open-handle registry is what would close it. It needs open-handle
 tracking across process boundaries, which is authority work rather than a
 mount-local fix.
 
-### 3. pjdfstest's own Linux deviations
+### 2. pjdfstest's own Linux deviations
 
 Several `chown` cases are marked `# TODO Linux doesn't clear the SGID/SUID
 bits for directories, despite the description noted` in pjdfstest itself.
 These fail on ext4 too. They are counted as expected failures by the harness,
 not by us.
 
+## fsx
+
+§27 also names `fsx`, and predicted correctly: it is the suite that finds
+things pjdfstest cannot, because it hammers overlapping partial writes and
+truncates against a shadow copy and compares byte for byte.
+
+Built from xfstests' `ltp/fsx.c` (it needs a small stand-in for the
+`config.h` that xfstests' configure generates; the reproduction steps below
+include it).
+
+It failed on its **third operation** the first time it ran: a write past EOF
+left `stat` reporting the pre-write size, because content commits on flush
+(§16.1) and nothing consulted the open write handle for the in-flight
+length. That is the same defect pjdfstest's `open/07` reported through a much
+smaller hole. With it fixed:
+
+| Run | Operations | mmap | Result |
+|---|---|---|---|
+| authority-backed `posix` mount | 50,000 | yes | all A-OK |
+| authority-backed, 3 seeds concurrently | 3 × 30,000 | yes | all A-OK |
+| in-process `relaxed` mount | 30,000 | yes | all A-OK |
+
+That is 170,000 operations with mmap reads and writes enabled, against both
+mount implementations, with three of the runs concurrent against one mount.
+
+`fsx` also reports what the filesystem does not support, which is a useful
+inventory in itself: `FALLOC_FL_KEEP_SIZE`, `PUNCH_HOLE`, `ZERO_RANGE`,
+`COLLAPSE_RANGE`, `INSERT_RANGE`, `UNSHARE_RANGE`, dontcache I/O, and
+`O_DIRECT` (which atomic writes need). `fallocate` in general is
+unimplemented; a content-addressed store has no preallocation to do, but
+`PUNCH_HOLE` is a real gap for a sparse-file workload.
+
+**This is not §27's bar.** §27 asks for a 24-hour soak; these runs take
+minutes. What they establish is that the write path survives sustained
+random overlapping I/O with mmap, not that it survives a day of it.
+
 ## What has not been run
 
-- **`fsx`** (§27's 24-hour soak with mmap enabled) — not run. `fsx-linux` is
-  not packaged here. It is also the suite most likely to find real problems in
-  this build, because it hammers overlapping partial writes, which is exactly
-  the area §16.1's buffer-then-commit model handles most coarsely.
+- **`fsx` for 24 hours** — see above. The runs here are minutes, not a day.
 - **xfstests** — not run. It needs a scratch device and a much larger
   harness, and the `generic/` subset applicable to a network filesystem would
   need the N/A justifications §27 asks for.
@@ -156,6 +180,23 @@ not by us.
   history checker under partition.
 
 ## Reproducing
+
+### fsx
+
+```sh
+# fsx.c from xfstests, plus the two headers it includes
+curl -O https://raw.githubusercontent.com/kdave/xfstests/master/ltp/fsx.c
+curl -O https://raw.githubusercontent.com/kdave/xfstests/master/src/global.h
+curl -O https://raw.githubusercontent.com/kdave/xfstests/master/src/statx.h
+# global.h includes <config.h>, generated by xfstests' configure; a file
+# defining HAVE_<HEADER>_H for the usual Linux headers plus HAVE_ERR_H,
+# HAVE_LINUX_FALLOC_H, HAVE_COPY_FILE_RANGE and STDC_HEADERS is enough.
+gcc -O2 -D_GNU_SOURCE -I. -o fsx fsx.c   # add #include <getopt.h>
+
+cd /mnt/atlas && ./fsx -N 50000 -S 42 testfile
+```
+
+### pjdfstest
 
 ```sh
 git clone --depth 1 https://github.com/pjd/pjdfstest
