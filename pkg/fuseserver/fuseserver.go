@@ -107,6 +107,7 @@ var (
 	_ fs.NodeSymlinker  = (*Node)(nil)
 	_ fs.NodeLinker     = (*Node)(nil)
 	_ fs.NodeStatfser   = (*Node)(nil)
+	_ fs.NodeMknoder    = (*Node)(nil)
 )
 
 // binding reads the dentry this node is currently bound to. Rename
@@ -185,6 +186,7 @@ func (n *Node) markStale() {
 func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 	out.Size = rec.Size
 	out.Owner = fuse.Owner{Uid: rec.Uid, Gid: rec.Gid}
+	out.Rdev = rec.Rdev
 	sec := uint64(0)
 	if !rec.MTime.IsZero() {
 		sec = uint64(rec.MTime.Unix())
@@ -198,6 +200,12 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 		out.Nlink = 2
 	case rec.IsSymlink:
 		out.Mode = syscall.S_IFLNK | 0o777
+		out.Nlink = 1
+	case rec.Type != 0:
+		// A special file: the VFS handles the FIFO or socket itself once
+		// getattr tells it what the inode is. All this layer owes it is
+		// the type, the permissions and the device number.
+		out.Mode = rec.Type | permBits(rec.Mode, 0o644, mutable)
 		out.Nlink = 1
 	default:
 		out.Mode = syscall.S_IFREG | permBits(rec.Mode, 0o644, mutable)
@@ -243,6 +251,8 @@ func direntMode(rec metadb.InodeRecord) uint32 {
 		return syscall.S_IFDIR
 	case rec.IsSymlink:
 		return syscall.S_IFLNK
+	case rec.Type != 0:
+		return rec.Type
 	default:
 		return syscall.S_IFREG
 	}
@@ -528,6 +538,31 @@ func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 	tn.setCached(rec)
 	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
 	return tn.EmbeddedInode(), 0
+}
+
+// Mknod creates a FIFO, socket or device node. Regular files arrive
+// through Create, not here, so S_IFREG is refused: a caller using mknod
+// for a regular file is doing something this path would silently get
+// wrong (no content pointer, no write handle).
+func (n *Node) Mknod(ctx context.Context, name string, mode, rdev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	typ := mode & syscall.S_IFMT
+	switch typ {
+	case syscall.S_IFIFO, syscall.S_IFSOCK, syscall.S_IFCHR, syscall.S_IFBLK:
+	default:
+		return nil, syscall.EINVAL
+	}
+	id, err := n.repo.Mknod(n.ino, name, typ, rdev, mode&0o7777, callerOwner(ctx))
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	rec, err := n.repo.DB.GetInode(id)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	child := &Node{repo: n.repo, ino: id, parent: n.ino, name: name}
+	child.setCached(rec)
+	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)
+	return n.NewInode(ctx, child, fs.StableAttr{Mode: typ, Ino: uint64(id)}), 0
 }
 
 func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

@@ -131,3 +131,60 @@ func TestPublishPreservesOwnership(t *testing.T) {
 		t.Fatalf("published file owned by %d:%d, want 4242:4343", st.Uid, st.Gid)
 	}
 }
+
+// TestMknodFifo: mkfifo(3) is mknod(2), and the VFS handles the pipe
+// itself once the filesystem reports the inode's type. Without it the
+// call fails with EOPNOTSUPP — which pjdfstest turns into a cascade,
+// since a large number of its chmod/chown/rename cases use a FIFO as
+// their subject and then fail again with ENOENT.
+func TestMknodFifo(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "fifo")
+
+	if err := syscall.Mkfifo(path, 0o644); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("created node has mode %v, want a named pipe", fi.Mode())
+	}
+	if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("fifo perms %v, want 0644", fi.Mode().Perm())
+	}
+
+	// It survives a readdir as a fifo too, not just a direct lstat.
+	entries, err := os.ReadDir(mnt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Name() == "fifo" {
+			found = true
+			if e.Type()&os.ModeNamedPipe == 0 {
+				t.Fatalf("readdir reports %v for the fifo", e.Type())
+			}
+		}
+	}
+	if !found {
+		t.Fatal("fifo missing from readdir")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMknodRegularFileIsRefused: a regular file must go through Create,
+// which gives it a content pointer and a write handle. Accepting it here
+// would produce an inode this filesystem cannot write to.
+func TestMknodRegularFileIsRefused(t *testing.T) {
+	_, mnt := mountWritable(t)
+	err := syscall.Mknod(filepath.Join(mnt, "reg"), syscall.S_IFREG|0o644, 0)
+	if err == nil {
+		t.Fatal("expected mknod of a regular file to be refused")
+	}
+}

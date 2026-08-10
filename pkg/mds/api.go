@@ -257,6 +257,7 @@ const (
 	MethodLink       = "/" + ServiceName + "/Link"
 	MethodStatfs     = "/" + ServiceName + "/Statfs"
 	MethodSetAttr    = "/" + ServiceName + "/SetAttr"
+	MethodMknod      = "/" + ServiceName + "/Mknod"
 )
 
 // RenameRequest moves a binding. Both directories are named because a
@@ -288,6 +289,23 @@ type SymlinkRequest struct {
 }
 
 type SymlinkResponse struct {
+	Inode metadb.InodeID `json:"inode"`
+}
+
+// MknodRequest creates a special file — FIFO, socket or device node.
+// Type is the S_IFMT bits; Rdev is meaningful only for S_IFCHR/S_IFBLK.
+type MknodRequest struct {
+	Holder string         `json:"holder"`
+	Dir    metadb.InodeID `json:"dir"`
+	Name   string         `json:"name"`
+	Type   uint32         `json:"type"`
+	Rdev   uint32         `json:"rdev"`
+	Mode   uint32         `json:"mode"`
+	Uid    uint32         `json:"uid"`
+	Gid    uint32         `json:"gid"`
+}
+
+type MknodResponse struct {
 	Inode metadb.InodeID `json:"inode"`
 }
 

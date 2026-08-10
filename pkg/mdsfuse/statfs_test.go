@@ -176,3 +176,25 @@ func TestOwnershipThroughAuthority(t *testing.T) {
 		t.Fatalf("after chown through the authority: %d:%d, want 4242:4343", st.Uid, st.Gid)
 	}
 }
+
+// TestMknodFifoThroughAuthority: a special file has no content, so it is
+// a pure metadata operation — nothing is uploaded, and the authority
+// records only the type.
+func TestMknodFifoThroughAuthority(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
+	mnt := c.mountAt(t, "writer", 0)
+
+	if err := syscall.Mkfifo(filepath.Join(mnt, "fifo"), 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	fi, err := os.Lstat(filepath.Join(mnt, "fifo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("mode %v, want a named pipe", fi.Mode())
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("perms %v, want 0600", fi.Mode().Perm())
+	}
+}

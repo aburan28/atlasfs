@@ -512,6 +512,19 @@ func (c *Client) Statfs(ctx context.Context) (StatfsResponse, error) {
 	return resp, err
 }
 
+// Mknod creates a special file at (dir, name).
+func (c *Client) Mknod(ctx context.Context, dir metadb.InodeID, name string, typ, rdev, mode, uid, gid uint32) (metadb.InodeID, error) {
+	var resp MknodResponse
+	err := c.cc.Invoke(ctx, MethodMknod, &MknodRequest{
+		Holder: c.holder, Dir: dir, Name: name,
+		Type: typ, Rdev: rdev, Mode: mode, Uid: uid, Gid: gid,
+	}, &resp)
+	if err == nil {
+		c.invalidateOwnMutation(dir)
+	}
+	return resp.Inode, err
+}
+
 // Link binds another name to target and returns its updated record.
 func (c *Client) Link(ctx context.Context, dir metadb.InodeID, name string, target metadb.InodeID) (metadb.InodeRecord, error) {
 	var resp LinkResponse

@@ -42,6 +42,7 @@ var (
 	_ fs.NodeSymlinker = (*Node)(nil)
 	_ fs.NodeLinker    = (*Node)(nil)
 	_ fs.NodeStatfser  = (*Node)(nil)
+	_ fs.NodeMknoder   = (*Node)(nil)
 )
 
 // errnoFor maps an authority failure back to the errno a filesystem
@@ -305,6 +306,33 @@ func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 // allocation unit: content-addressed chunks live in packed containers
 // (§5.4), so there is no on-disk block to match.
 const statfsBlockSize = 4096
+
+// Mknod creates a FIFO, socket or device node through the authority.
+// S_IFREG is refused: a regular file arrives through Create, which has a
+// content pointer and a write handle this path would not give it.
+func (n *Node) Mknod(ctx context.Context, name string, mode, rdev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.cfg.ReadOnly {
+		return nil, syscall.EROFS
+	}
+	typ := mode & syscall.S_IFMT
+	switch typ {
+	case syscall.S_IFIFO, syscall.S_IFSOCK, syscall.S_IFCHR, syscall.S_IFBLK:
+	default:
+		return nil, syscall.EINVAL
+	}
+	uid, gid := callerOwner(ctx)
+	id, err := n.cfg.Client.Mknod(ctx, n.ino, name, typ, rdev, mode&0o7777, uid, gid)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	rec, err := n.cfg.Client.GetInode(ctx, id)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	child := &Node{cfg: n.cfg, ino: id, rec: rec, parent: n.ino, name: name}
+	fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
+	return n.NewInode(ctx, child, fs.StableAttr{Mode: typ, Ino: uint64(id)}), 0
+}
 
 // Link binds name in this directory to an already-existing inode. It
 // returns the existing node rather than a fresh one: two names for one

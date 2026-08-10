@@ -34,6 +34,7 @@ type MetadataServer interface {
 	Link(context.Context, *LinkRequest) (*LinkResponse, error)
 	Statfs(context.Context, *StatfsRequest) (*StatfsResponse, error)
 	SetAttr(context.Context, *SetAttrRequest) (*SetAttrResponse, error)
+	Mknod(context.Context, *MknodRequest) (*MknodResponse, error)
 	Subscribe(*SubscribeRequest, grpc.ServerStream) error
 }
 
@@ -86,6 +87,7 @@ var serviceDesc = grpc.ServiceDesc{
 		{MethodName: "Link", Handler: unaryHandler(MetadataServer.Link, MethodLink)},
 		{MethodName: "Statfs", Handler: unaryHandler(MetadataServer.Statfs, MethodStatfs)},
 		{MethodName: "SetAttr", Handler: unaryHandler(MetadataServer.SetAttr, MethodSetAttr)},
+		{MethodName: "Mknod", Handler: unaryHandler(MetadataServer.Mknod, MethodMknod)},
 	},
 	Streams: []grpc.StreamDesc{
 		{StreamName: "Subscribe", Handler: subscribeHandler, ServerStreams: true},

@@ -342,6 +342,24 @@ func (r *Repo) Link(dir metadb.InodeID, name string, target metadb.InodeID) (met
 	return rec, nil
 }
 
+// Mknod creates a special file — FIFO, socket, or device node — at
+// (dir, name). typ is the S_IFMT bits and rdev the device number, which
+// only S_IFCHR/S_IFBLK use.
+func (r *Repo) Mknod(dir metadb.InodeID, name string, typ, rdev, mode uint32, owner Owner) (metadb.InodeID, error) {
+	if !r.Class.Mutable() {
+		return 0, ErrReadOnly
+	}
+	id, err := r.DB.CreateSpecial(dir, name, typ, rdev, mode, owner.Uid, owner.Gid)
+	if err != nil {
+		return 0, err
+	}
+	if r.Coherence != nil {
+		r.Coherence.BumpDir(DirCoherenceKey(dir))
+		r.Coherence.Bump(DirCoherenceKey(dir))
+	}
+	return id, nil
+}
+
 // Symlink creates a symlink at (dir, name) pointing at target.
 func (r *Repo) Symlink(dir metadb.InodeID, name, target string, owner Owner) (metadb.InodeID, error) {
 	if !r.Class.Mutable() {

@@ -194,11 +194,16 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 		sec = uint64(rec.MTime.Unix())
 	}
 	out.Mtime, out.Atime, out.Ctime = sec, sec, sec
+	out.Rdev = rec.Rdev
 	switch {
 	case rec.IsDir:
 		out.Mode, out.Nlink = syscall.S_IFDIR|permBits(rec.Mode, 0o755, readOnly), 2
 	case rec.IsSymlink:
 		out.Mode, out.Nlink = syscall.S_IFLNK|0o777, 1
+	case rec.Type != 0:
+		// A special file: the VFS handles the FIFO or socket itself, and
+		// all this layer owes it is the type, permissions and rdev.
+		out.Mode, out.Nlink = rec.Type|permBits(rec.Mode, 0o644, readOnly), 1
 	default:
 		// The stored link count, not a constant: a hard-linked file
 		// reporting 1 would tell a caller it is safe to delete the last
@@ -237,6 +242,8 @@ func direntMode(rec metadb.InodeRecord) uint32 {
 		return syscall.S_IFDIR
 	case rec.IsSymlink:
 		return syscall.S_IFLNK
+	case rec.Type != 0:
+		return rec.Type
 	default:
 		return syscall.S_IFREG
 	}

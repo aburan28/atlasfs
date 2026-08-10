@@ -95,6 +95,16 @@ type InodeRecord struct {
 	HasInline   bool
 	InlineChunk chunk.ID
 
+	// Type holds the S_IFMT bits for a special file — FIFO, socket, or
+	// device node — created by mknod(2). Zero means an ordinary file,
+	// which is what every record written before special files existed
+	// reads back as. Directories and symlinks keep their own flags
+	// rather than moving here, so nothing about them changes.
+	//
+	// Rdev is the device number, meaningful only for S_IFCHR/S_IFBLK.
+	Type uint32
+	Rdev uint32
+
 	// IsSymlink and SymlinkTarget hold a symlink's target path verbatim.
 	// A symlink is never chunked or content-addressed — its "content"
 	// is the target string, small and stored directly in the inode
@@ -551,6 +561,24 @@ func parentOfTx(tx *bbolt.Tx, child InodeID) (InodeID, error) {
 		}
 	}
 	return 0, ErrNotFound
+}
+
+// CreateSpecial binds a new special file — FIFO, socket, or device node
+// — at (dir, name). It has no content: a FIFO's data lives in the
+// kernel's pipe buffer and a socket's in the network stack, so there is
+// nothing to chunk. What the filesystem stores is the type, so lookup
+// and getattr report it and the VFS handles the rest itself.
+func (db *DB) CreateSpecial(dir InodeID, name string, typ uint32, rdev uint32, mode, uid, gid uint32) (InodeID, error) {
+	rec := InodeRecord{
+		Mode:  mode & 0o7777,
+		Type:  typ,
+		Rdev:  rdev,
+		Uid:   uid,
+		Gid:   gid,
+		MTime: time.Now(),
+		NLink: 1,
+	}
+	return db.PublishFile(dir, name, rec)
 }
 
 // CreateSymlink binds a new symlink at (dir, name). A symlink's target

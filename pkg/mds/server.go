@@ -475,6 +475,17 @@ func (s *Server) Statfs(ctx context.Context, req *StatfsRequest) (*StatfsRespons
 	}, nil
 }
 
+// Mknod creates a special file. It has no content, so unlike Commit
+// there is nothing for the client to upload first.
+func (s *Server) Mknod(ctx context.Context, req *MknodRequest) (*MknodResponse, error) {
+	id, err := s.db.CreateSpecial(req.Dir, req.Name, req.Type, req.Rdev, req.Mode, req.Uid, req.Gid)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	s.bumpDir(req.Dir)
+	return &MknodResponse{Inode: id}, nil
+}
+
 // Link binds another name to an existing inode. Both lease domains move
 // (§10.5): the directory gained a name, and the inode's nlink changed.
 func (s *Server) Link(ctx context.Context, req *LinkRequest) (*LinkResponse, error) {
