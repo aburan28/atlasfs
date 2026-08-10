@@ -428,6 +428,26 @@ func (s *Server) Rename(ctx context.Context, req *RenameRequest) (*RenameRespons
 	return &RenameResponse{}, nil
 }
 
+// SetAttr changes an inode's mode and/or mtime. It is a `posix`-class
+// recall point like any other inode mutation: a holder caching the old
+// attrs has to give that copy up before the change is visible, or it
+// would keep answering getattr with the pre-chmod mode.
+func (s *Server) SetAttr(ctx context.Context, req *SetAttrRequest) (*SetAttrResponse, error) {
+	if s.posix && s.coh != nil {
+		if _, err := s.coh.Recall(ctx, inodeObj(req.Inode), req.Holder, s.drecall); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+	}
+	rec, err := s.db.SetAttr(req.Inode, metadb.AttrMutation{Mode: req.Mode, MTime: req.MTime})
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	if s.coh != nil {
+		s.coh.Bump(inodeObj(req.Inode))
+	}
+	return &SetAttrResponse{Record: rec}, nil
+}
+
 // Statfs reports the subtree's quota and usage. It is not cached under a
 // lease: usage changes on every write from every holder, so a leased copy
 // would be stale far more often than not, and df is rare enough that the

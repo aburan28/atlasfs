@@ -295,7 +295,7 @@ func (r *Repo) PublishTree(ctx context.Context, srcDir string, destPath []string
 			if err != nil {
 				return err
 			}
-			rec := metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: info.ModTime(), NLink: 2}
+			rec := metadb.InodeRecord{IsDir: true, Mode: permOf(info.Mode(), 0o755), MTime: info.ModTime(), NLink: 2}
 			id, err := r.DB.CommitMkdir(parentInode, d.Name(), rec)
 			if errors.Is(err, metadb.ErrExists) {
 				if id, err = r.DB.Lookup(parentInode, d.Name()); err != nil {
@@ -381,12 +381,26 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 	if err != nil {
 		return 0, err
 	}
-	rec := metadb.InodeRecord{Mode: 0o644, MTime: info.ModTime(), NLink: 1}
+	// The source's own permission bits, not a constant: publishing a
+	// tree of executables and mounting it has to give back executables,
+	// and a hardcoded 0o644 silently strips every exec bit in the tree.
+	rec := metadb.InodeRecord{Mode: permOf(info.Mode(), 0o644), MTime: info.ModTime(), NLink: 1}
 	content.apply(&rec)
 	if _, err := r.DB.PublishFile(dir, name, rec); err != nil {
 		return 0, publishBindErr(name, err)
 	}
 	return size, nil
+}
+
+// permOf extracts the permission bits from a source file's mode,
+// falling back to def for the degenerate all-zero case (a source with no
+// permission bits at all would otherwise publish as unreadable).
+func permOf(m os.FileMode, def uint32) uint32 {
+	perm := uint32(m.Perm())
+	if perm == 0 {
+		return def
+	}
+	return perm
 }
 
 // contentRef is the chunk/manifest-shaped part of an InodeRecord, the

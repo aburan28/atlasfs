@@ -336,16 +336,34 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 	if n.cfg.ReadOnly {
 		return syscall.EROFS
 	}
-	size, ok := in.GetSize()
-	if !ok {
-		// Nothing this mount tracks (mode/uid/gid/times are not stored
-		// per-inode here beyond mtime), so report current attrs and move
-		// on rather than failing a chmod a caller may not even care about.
-		rec, errno := n.current(ctx)
-		if errno != 0 {
-			return errno
+	// Mode and mtime are pure metadata and go straight to the authority.
+	// Ownership does not: DESIGN.md §20's uid/gid model is a later phase,
+	// and chown is accepted-and-ignored rather than refused because cp,
+	// rsync and tar all restore ownership unconditionally.
+	var mut metadb.AttrMutation
+	if mode, ok := in.GetMode(); ok {
+		mut.Mode = &mode
+	}
+	if mtime, ok := in.GetMTime(); ok {
+		mut.MTime = &mtime
+	}
+	if mut.Mode != nil || mut.MTime != nil {
+		rec, err := n.cfg.Client.SetAttr(ctx, n.ino, mut)
+		if err != nil {
+			return errnoFor(err)
 		}
 		fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
+	}
+
+	size, ok := in.GetSize()
+	if !ok {
+		if mut.Mode == nil && mut.MTime == nil {
+			rec, errno := n.current(ctx)
+			if errno != 0 {
+				return errno
+			}
+			fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
+		}
 		return 0
 	}
 

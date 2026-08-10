@@ -33,6 +33,7 @@ type MetadataServer interface {
 	Symlink(context.Context, *SymlinkRequest) (*SymlinkResponse, error)
 	Link(context.Context, *LinkRequest) (*LinkResponse, error)
 	Statfs(context.Context, *StatfsRequest) (*StatfsResponse, error)
+	SetAttr(context.Context, *SetAttrRequest) (*SetAttrResponse, error)
 	Subscribe(*SubscribeRequest, grpc.ServerStream) error
 }
 
@@ -84,6 +85,7 @@ var serviceDesc = grpc.ServiceDesc{
 		{MethodName: "Symlink", Handler: unaryHandler(MetadataServer.Symlink, MethodSymlink)},
 		{MethodName: "Link", Handler: unaryHandler(MetadataServer.Link, MethodLink)},
 		{MethodName: "Statfs", Handler: unaryHandler(MetadataServer.Statfs, MethodStatfs)},
+		{MethodName: "SetAttr", Handler: unaryHandler(MetadataServer.SetAttr, MethodSetAttr)},
 	},
 	Streams: []grpc.StreamDesc{
 		{StreamName: "Subscribe", Handler: subscribeHandler, ServerStreams: true},

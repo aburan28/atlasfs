@@ -1112,14 +1112,19 @@ func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID,
 			}
 			id = existing
 			oldSize = existingRec.Size
-			// The caller supplies content and mtime, not link count.
-			// Taking rec's NLink verbatim would reset a hard-linked
-			// file's count to 1 on every overwrite, after which removing
-			// one of its names would grave an inode the other name still
-			// resolves to — and GC would then reclaim chunks a live file
-			// reads.
+			// The caller supplies content and mtime — not link count, not
+			// permissions. Taking rec's NLink verbatim would reset a
+			// hard-linked file's count to 1 on every overwrite, after
+			// which removing one of its names would grave an inode the
+			// other name still resolves to and GC would reclaim chunks a
+			// live file reads. Taking its Mode verbatim would strip the
+			// exec bit off any script the caller merely rewrote, which
+			// is what write-then-run workflows notice immediately.
 			if existingRec.NLink > 1 {
 				rec.NLink = existingRec.NLink
+			}
+			if existingRec.Mode != 0 {
+				rec.Mode = existingRec.Mode
 			}
 		case isNew:
 			newID, err := allocInodeTx(tx)

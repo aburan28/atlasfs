@@ -180,16 +180,10 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 	out.Mtime, out.Atime, out.Ctime = sec, sec, sec
 	switch {
 	case rec.IsDir:
-		out.Mode, out.Nlink = syscall.S_IFDIR|0o555, 2
+		out.Mode, out.Nlink = syscall.S_IFDIR|permBits(rec.Mode, 0o755, readOnly), 2
 	case rec.IsSymlink:
 		out.Mode, out.Nlink = syscall.S_IFLNK|0o777, 1
 	default:
-		mode := uint32(0o644)
-		if readOnly {
-			// Advertising write bits on a read-only mount would only
-			// invite an EROFS later.
-			mode = 0o444
-		}
 		// The stored link count, not a constant: a hard-linked file
 		// reporting 1 would tell a caller it is safe to delete the last
 		// name when it is not.
@@ -197,8 +191,28 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 		if nlink == 0 {
 			nlink = 1
 		}
-		out.Mode, out.Nlink = syscall.S_IFREG|mode, nlink
+		out.Mode, out.Nlink = syscall.S_IFREG|permBits(rec.Mode, 0o644, readOnly), nlink
 	}
+}
+
+// permBits reports the permission bits to advertise: the record's own,
+// which preserves an executable published from a source tree or set by a
+// later chmod. def covers a record written before modes were stored.
+//
+// A read-only mount clears the write bits — presentation, not
+// enforcement, since every mutation already returns EROFS, but
+// advertising a writable file that will refuse the write only produces a
+// confusing error later. The exec bit stays: publishing a tree of
+// binaries read-only and running them is the point.
+func permBits(mode uint32, def uint32, readOnly bool) uint32 {
+	perm := mode & 0o7777
+	if perm == 0 {
+		perm = def
+	}
+	if readOnly {
+		perm &^= 0o222
+	}
+	return perm
 }
 
 func direntMode(rec metadb.InodeRecord) uint32 {

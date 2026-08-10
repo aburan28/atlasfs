@@ -321,3 +321,20 @@ func (r *Repo) Symlink(dir metadb.InodeID, name, target string) (metadb.InodeID,
 	}
 	return id, nil
 }
+
+// SetAttr changes an inode's mode and/or mtime (metadb.AttrMutation
+// names which). It bumps the inode's own lease and not the directory's:
+// §10.5 puts attributes in the inode's domain, and no name changed.
+func (r *Repo) SetAttr(id metadb.InodeID, mut metadb.AttrMutation) (metadb.InodeRecord, error) {
+	if !r.Class.Mutable() {
+		return metadb.InodeRecord{}, ErrReadOnly
+	}
+	rec, err := r.DB.SetAttr(id, mut)
+	if err != nil {
+		return metadb.InodeRecord{}, err
+	}
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
+	}
+	return rec, nil
+}

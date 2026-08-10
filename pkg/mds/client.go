@@ -488,6 +488,20 @@ func (c *Client) Rename(ctx context.Context, oldDir metadb.InodeID, oldName stri
 	return err
 }
 
+// SetAttr changes an inode's mode and/or mtime and returns the updated
+// record.
+func (c *Client) SetAttr(ctx context.Context, id metadb.InodeID, mut metadb.AttrMutation) (metadb.InodeRecord, error) {
+	var resp SetAttrResponse
+	err := c.cc.Invoke(ctx, MethodSetAttr,
+		&SetAttrRequest{Holder: c.holder, Inode: id, Mode: mut.Mode, MTime: mut.MTime}, &resp)
+	if err == nil {
+		// The mutator is excluded from its own recall, so nothing else
+		// will drop this holder's now-stale cached record.
+		c.invalidate(inodeObj(id))
+	}
+	return resp.Record, err
+}
+
 // Statfs asks the authority for the subtree's quota and usage.
 func (c *Client) Statfs(ctx context.Context) (StatfsResponse, error) {
 	var resp StatfsResponse

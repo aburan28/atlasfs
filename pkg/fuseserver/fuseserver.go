@@ -179,17 +179,13 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 	out.Ctime = sec
 	switch {
 	case rec.IsDir:
-		out.Mode = syscall.S_IFDIR | 0o755
+		out.Mode = syscall.S_IFDIR | permBits(rec.Mode, 0o755, mutable)
 		out.Nlink = 2
 	case rec.IsSymlink:
 		out.Mode = syscall.S_IFLNK | 0o777
 		out.Nlink = 1
 	default:
-		mode := uint32(0o444)
-		if mutable {
-			mode = 0o644
-		}
-		out.Mode = syscall.S_IFREG | mode
+		out.Mode = syscall.S_IFREG | permBits(rec.Mode, 0o644, mutable)
 		// The stored count, not a constant: `ls -l` and `find -links`
 		// read it, and a hard-linked file reporting 1 would tell a
 		// caller it is safe to delete the last name when it is not.
@@ -198,6 +194,28 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 			out.Nlink = 1
 		}
 	}
+}
+
+// permBits reports the permission bits to advertise: the record's own,
+// which is what preserves an executable published from a source tree or
+// set by a later chmod. def covers a record written before modes were
+// stored.
+//
+// On an immutable mount the write bits are cleared. That is presentation
+// rather than enforcement — the mount carries the `ro` option and Open
+// returns EROFS regardless — but advertising a writable file on a
+// filesystem that will refuse the write only invites a confusing error
+// later. The exec bit is deliberately *not* cleared: publishing a tree of
+// binaries read-only and then running them is the point.
+func permBits(mode uint32, def uint32, mutable bool) uint32 {
+	perm := mode & 0o7777
+	if perm == 0 {
+		perm = def
+	}
+	if !mutable {
+		perm &^= 0o222
+	}
+	return perm
 }
 
 // direntMode is the raw type bits (S_IFDIR/S_IFLNK/S_IFREG) go-fuse
@@ -510,14 +528,16 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 // Setattr handles truncate (via truncate(2)/ftruncate(2), and the
 // O_TRUNC-on-an-existing-file case that a plain open(2) also routes
 // through this — not through Node.Open's flags — on Linux's FUSE
-// implementation). Every other attribute change (mode, times, owner) is
-// accepted but not persisted: this build's InodeRecord doesn't track a
-// separate mode from the class-derived default (fillAttrOut), and there
-// is no uid/gid model yet (DESIGN.md §20 is a later phase) — silently
-// accepting rather than returning ENOSYS matches what most FUSE
-// filesystems do for attributes they don't materially support, since
-// returning an error here breaks a surprising amount of ordinary
-// software (cp, rsync, tar) that always tries to restore them.
+// implementation), plus mode and timestamp changes, which persist in the
+// inode record.
+//
+// Ownership is the one thing still accepted and dropped: DESIGN.md §20's
+// uid/gid model is a later phase, and storing an owner ahead of it would
+// mean a second source of truth to reconcile when the real one lands.
+// Silently accepting rather than returning ENOSYS matches what most FUSE
+// filesystems do for attributes they cannot materially support, since an
+// error there breaks a surprising amount of ordinary software (cp,
+// rsync, tar) that always tries to restore ownership.
 func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	rec, errno := n.currentRec()
 	if errno != 0 {
@@ -589,6 +609,30 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 			n.setCached(newRec)
 			rec = newRec
 		}
+	}
+
+	// Mode and times are pure metadata and persist here. Ownership does
+	// not: DESIGN.md §20's uid/gid model is a later phase, and chown is
+	// accepted-and-ignored rather than refused because cp, rsync and tar
+	// all try to restore ownership unconditionally and an error there
+	// breaks them outright.
+	var mut metadb.AttrMutation
+	if mode, ok := in.GetMode(); ok {
+		mut.Mode = &mode
+	}
+	if mtime, ok := in.GetMTime(); ok {
+		mut.MTime = &mtime
+	}
+	if mut.Mode != nil || mut.MTime != nil {
+		if !n.repo.Class.Mutable() {
+			return syscall.EROFS
+		}
+		updated, err := n.repo.SetAttr(n.ino, mut)
+		if err != nil {
+			return errnoFor(err)
+		}
+		n.setCached(updated)
+		rec = updated
 	}
 
 	fillAttrOut(rec, n.repo.Class.Mutable(), &out.Attr)

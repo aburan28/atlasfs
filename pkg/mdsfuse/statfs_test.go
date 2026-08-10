@@ -72,3 +72,43 @@ func TestFsyncThroughAuthority(t *testing.T) {
 		return err == nil && string(got) == "committed by fsync"
 	})
 }
+
+// TestChmodThroughAuthority: a mode change is metadata, so it goes to the
+// authority and shows up on every other holder — the same invalidation
+// path a write takes.
+func TestChmodThroughAuthority(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
+	writer := c.mountAt(t, "writer", 0)
+	reader := c.mountAt(t, "reader", 0)
+
+	path := filepath.Join(writer, "script")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The reader caches the pre-chmod mode under its lease.
+	if fi, err := os.Stat(filepath.Join(reader, "script")); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("initial mode = %v, want 0644", fi.Mode().Perm())
+	}
+
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("writer sees mode %v err=%v, want 0755", fi.Mode().Perm(), err)
+	}
+
+	awaitOrFail(t, "the other mount never saw the chmod", func() bool {
+		fi, err := os.Stat(filepath.Join(reader, "script"))
+		return err == nil && fi.Mode().Perm() == 0o755
+	})
+
+	// And it survives a rewrite: a commit carries content, not permissions.
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho hi again\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("overwrite reset the mode to %v err=%v", fi.Mode().Perm(), err)
+	}
+}

@@ -250,6 +250,7 @@ const (
 	MethodSymlink    = "/" + ServiceName + "/Symlink"
 	MethodLink       = "/" + ServiceName + "/Link"
 	MethodStatfs     = "/" + ServiceName + "/Statfs"
+	MethodSetAttr    = "/" + ServiceName + "/SetAttr"
 )
 
 // RenameRequest moves a binding. Both directories are named because a
@@ -292,6 +293,21 @@ type LinkRequest struct {
 }
 
 type LinkResponse struct {
+	Record metadb.InodeRecord `json:"record"`
+}
+
+// SetAttrRequest changes an inode's mode and/or mtime. Both fields are
+// pointers for the same reason setattr(2) carries a valid-mask: the
+// kernel sends only the attributes the caller actually set, and a zero
+// value is a legitimate mode.
+type SetAttrRequest struct {
+	Holder string         `json:"holder"`
+	Inode  metadb.InodeID `json:"inode"`
+	Mode   *uint32        `json:"mode,omitempty"`
+	MTime  *time.Time     `json:"mtime,omitempty"`
+}
+
+type SetAttrResponse struct {
 	Record metadb.InodeRecord `json:"record"`
 }
 
