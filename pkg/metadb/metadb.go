@@ -86,6 +86,30 @@ func checkName(name string) error {
 	return nil
 }
 
+// adjustDirLinksTx moves a directory's own link count when a
+// subdirectory is added to or removed from it.
+//
+// A directory's nlink is 2 plus its subdirectory count: "." plus its
+// parent's entry, plus one ".." from each child directory. Reporting a
+// constant 2 is not cosmetic — `find` uses nlink-2 to decide a directory
+// has no subdirectories left to visit, so a wrong count makes it skip
+// real subtrees.
+func adjustDirLinksTx(tx *bbolt.Tx, dir InodeID, delta int32) error {
+	rec, err := getInodeTx(tx, dir)
+	if err != nil {
+		return err
+	}
+	if !rec.IsDir {
+		return nil
+	}
+	n := int32(rec.NLink) + delta
+	if n < 2 {
+		n = 2
+	}
+	rec.NLink = uint32(n)
+	return putInode(tx, dir, rec)
+}
+
 // touchDirTx moves a directory's mtime and ctime, which POSIX requires
 // whenever an entry is added to it or removed from it. Without this a
 // build tool watching a directory's mtime never notices a file appearing
@@ -424,6 +448,12 @@ func (db *DB) RemoveEntry(dir InodeID, name string, deletedAt time.Time) error {
 		if err := touchDirTx(tx, dir, deletedAt); err != nil {
 			return err
 		}
+		if rec.IsDir {
+			// Its ".." went with it.
+			if err := adjustDirLinksTx(tx, dir, -1); err != nil {
+				return err
+			}
+		}
 		return dropLinkTx(tx, id, rec, deletedAt)
 	})
 }
@@ -582,6 +612,15 @@ func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName str
 		}
 		if err := touchDirTx(tx, oldDir, deletedAt); err != nil {
 			return err
+		}
+		if srcRec.IsDir && oldDir != newDir {
+			// The moved directory's ".." now points at newDir.
+			if err := adjustDirLinksTx(tx, oldDir, -1); err != nil {
+				return err
+			}
+			if err := adjustDirLinksTx(tx, newDir, +1); err != nil {
+				return err
+			}
 		}
 		return setDentryTx(tx, newDir, newName, srcID)
 	})
@@ -1313,6 +1352,10 @@ func (db *DB) CommitMkdir(dir InodeID, name string, rec InodeRecord) (InodeID, e
 			return err
 		}
 		if err := setDentryTx(tx, dir, name, newID); err != nil {
+			return err
+		}
+		// The new directory's ".." is a link to its parent.
+		if err := adjustDirLinksTx(tx, dir, +1); err != nil {
 			return err
 		}
 		id = newID

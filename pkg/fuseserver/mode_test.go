@@ -338,3 +338,83 @@ func TestDirectoryTimestampsMoveOnEntryChange(t *testing.T) {
 		t.Fatalf("dir mtime did not move when a file was removed from it: %d", got)
 	}
 }
+
+// TestTruncateBeyondMaxIsRefused. The write path buffers a whole file in
+// memory, so it sizes a buffer from whatever truncate asks for: without a
+// bound, an unprivileged `truncate(f, 1<<62)` takes the mount down with
+// an OOM rather than returning an error. This is a denial-of-service
+// guard first and a POSIX detail second.
+func TestTruncateBeyondMaxIsRefused(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "big")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := os.Truncate(path, repo.MaxFileSize+1)
+	var errno syscall.Errno
+	if !errors.As(err, &errno) || errno != syscall.EFBIG {
+		t.Fatalf("got %v, want EFBIG", err)
+	}
+	// The file is untouched, and the mount is still alive.
+	if fi, err := os.Stat(path); err != nil || fi.Size() != 1 {
+		t.Fatalf("file changed after the refused truncate: size=%v err=%v", fi, err)
+	}
+}
+
+// TestDirectoryLinkCountsSubdirectories: a directory's nlink is 2 plus
+// its subdirectory count, one ".." per child. `find` uses nlink-2 to
+// decide a directory has no subdirectories left to visit, so a constant
+// 2 makes it skip real subtrees.
+func TestDirectoryLinkCountsSubdirectories(t *testing.T) {
+	_, mnt := mountWritable(t)
+	d := filepath.Join(mnt, "d")
+	if err := os.Mkdir(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if n := statOf(t, d).Nlink; n != 2 {
+		t.Fatalf("empty directory has nlink %d, want 2", n)
+	}
+	for _, sub := range []string{"a", "b"} {
+		if err := os.Mkdir(filepath.Join(d, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := statOf(t, d).Nlink; n != 4 {
+		t.Fatalf("directory with two subdirectories has nlink %d, want 4", n)
+	}
+	// A plain file is not a ".." link.
+	if err := os.WriteFile(filepath.Join(d, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n := statOf(t, d).Nlink; n != 4 {
+		t.Fatalf("a regular file changed the directory's nlink to %d", n)
+	}
+	if err := os.Remove(filepath.Join(d, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if n := statOf(t, d).Nlink; n != 3 {
+		t.Fatalf("nlink %d after removing one subdirectory, want 3", n)
+	}
+}
+
+// TestSubsecondTimestamps: utimensat sets nanoseconds and stat reports
+// them; dropping them makes every timestamp look rounded to the second.
+func TestSubsecondTimestamps(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "ns")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(1_500_000_000, 100_000_000)
+	mt := time.Unix(1_500_000_000, 200_000_000)
+	if err := os.Chtimes(path, at, mt); err != nil {
+		t.Fatal(err)
+	}
+	st := statOf(t, path)
+	if st.Atim.Nsec != 100_000_000 {
+		t.Errorf("atime nsec = %d, want 100000000", st.Atim.Nsec)
+	}
+	if st.Mtim.Nsec != 200_000_000 {
+		t.Errorf("mtime nsec = %d, want 200000000", st.Mtim.Nsec)
+	}
+}

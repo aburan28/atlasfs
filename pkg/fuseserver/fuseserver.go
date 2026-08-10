@@ -192,13 +192,13 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 	if !rec.MTime.IsZero() {
 		sec = uint64(rec.MTime.Unix())
 	}
-	out.Mtime = sec
-	out.Atime = unixOrZero(rec.Atime())
-	out.Ctime = unixOrZero(rec.Ctime())
+	out.Mtime, out.Mtimensec = sec, nsecOf(rec.MTime)
+	out.Atime, out.Atimensec = unixOrZero(rec.Atime()), nsecOf(rec.Atime())
+	out.Ctime, out.Ctimensec = unixOrZero(rec.Ctime()), nsecOf(rec.Ctime())
 	switch {
 	case rec.IsDir:
 		out.Mode = syscall.S_IFDIR | permBits(rec.Mode, mutable)
-		out.Nlink = 2
+		out.Nlink = nlinkOf(rec)
 	case rec.IsSymlink:
 		out.Mode = syscall.S_IFLNK | 0o777
 		out.Nlink = 1
@@ -214,6 +214,17 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 		out.Mode = syscall.S_IFREG | permBits(rec.Mode, mutable)
 		out.Nlink = nlinkOf(rec)
 	}
+}
+
+// nsecOf is the sub-second part of a timestamp. utimensat sets
+// nanoseconds and stat reports them, so dropping them makes every
+// timestamp look rounded to the second — which is what a filesystem that
+// stores only seconds looks like, and this one does not.
+func nsecOf(t time.Time) uint32 {
+	if t.IsZero() {
+		return 0
+	}
+	return uint32(t.Nanosecond())
 }
 
 // unixOrZero converts a timestamp for fuse.Attr, mapping the zero time
@@ -232,6 +243,9 @@ func unixOrZero(t time.Time) uint64 {
 // link.
 func nlinkOf(rec metadb.InodeRecord) uint32 {
 	if rec.NLink == 0 {
+		if rec.IsDir {
+			return 2 // "." plus the parent's entry
+		}
 		return 1
 	}
 	return uint32(rec.NLink)
@@ -623,6 +637,12 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		if !n.repo.Class.Mutable() {
 			return syscall.EROFS
 		}
+		if sz > repo.MaxFileSize {
+			// Bounded before anything allocates: the resize below sizes a
+			// buffer from sz, so an absurd truncate would OOM the mount
+			// rather than fail.
+			return syscall.EFBIG
+		}
 		if rec.IsDir {
 			return syscall.EISDIR
 		}
@@ -749,6 +769,8 @@ func errnoFor(err error) syscall.Errno {
 		return syscall.EINVAL
 	case errors.Is(err, metadb.ErrNameTooLong):
 		return syscall.ENAMETOOLONG
+	case errors.Is(err, repo.ErrFileTooBig):
+		return syscall.EFBIG
 	case errors.Is(err, repo.ErrQuotaExceeded), errors.Is(err, metadb.ErrQuotaExceeded):
 		return syscall.EDQUOT
 	default:

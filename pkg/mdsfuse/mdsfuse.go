@@ -200,12 +200,13 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 	if !rec.MTime.IsZero() {
 		sec = uint64(rec.MTime.Unix())
 	}
-	out.Mtime = sec
-	out.Atime, out.Ctime = unixOrZero(rec.Atime()), unixOrZero(rec.Ctime())
+	out.Mtime, out.Mtimensec = sec, nsecOf(rec.MTime)
+	out.Atime, out.Atimensec = unixOrZero(rec.Atime()), nsecOf(rec.Atime())
+	out.Ctime, out.Ctimensec = unixOrZero(rec.Ctime()), nsecOf(rec.Ctime())
 	out.Rdev = rec.Rdev
 	switch {
 	case rec.IsDir:
-		out.Mode, out.Nlink = syscall.S_IFDIR|permBits(rec.Mode, readOnly), 2
+		out.Mode, out.Nlink = syscall.S_IFDIR|permBits(rec.Mode, readOnly), nlinkOf(rec)
 	case rec.IsSymlink:
 		out.Mode, out.Nlink = syscall.S_IFLNK|0o777, 1
 	case rec.Type != 0:
@@ -216,6 +217,17 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 	default:
 		out.Mode, out.Nlink = syscall.S_IFREG|permBits(rec.Mode, readOnly), nlinkOf(rec)
 	}
+}
+
+// nsecOf is the sub-second part of a timestamp. utimensat sets
+// nanoseconds and stat reports them, so dropping them makes every
+// timestamp look rounded to the second — which is what a filesystem that
+// stores only seconds looks like, and this one does not.
+func nsecOf(t time.Time) uint32 {
+	if t.IsZero() {
+		return 0
+	}
+	return uint32(t.Nanosecond())
 }
 
 // unixOrZero converts a timestamp for fuse.Attr, mapping the zero time
@@ -233,6 +245,9 @@ func unixOrZero(t time.Time) uint64 {
 // back as 0 and means one link.
 func nlinkOf(rec metadb.InodeRecord) uint32 {
 	if rec.NLink == 0 {
+		if rec.IsDir {
+			return 2 // "." plus the parent's entry
+		}
 		return 1
 	}
 	return uint32(rec.NLink)

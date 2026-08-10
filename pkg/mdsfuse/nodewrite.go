@@ -428,6 +428,12 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		fillAttrMode(rec, n.cfg.ReadOnly, &out.Attr)
 	}
 
+	if size, ok := in.GetSize(); ok && size > repo.MaxFileSize {
+		// Bounded before anything allocates: the resize below sizes a
+		// buffer from it, so an absurd truncate would OOM the mount.
+		return syscall.EFBIG
+	}
+
 	size, ok := in.GetSize()
 	if !ok {
 		if mut.Mode == nil && mut.Uid == nil && mut.Gid == nil && mut.MTime == nil && mut.ATime == nil {

@@ -58,6 +58,22 @@ func (r *Repo) bumpDirEntries(dir metadb.InodeID) {
 }
 func DirCoherenceKey(id metadb.InodeID) string { return fmt.Sprintf("dir:%d", id) }
 
+// MaxFileSize is the largest size this build accepts for a file, and
+// truncate(2) beyond it fails with EFBIG.
+//
+// The number is not a storage limit — a manifest can address far more —
+// it is a guard on the write path, which buffers a whole file in memory
+// before committing it (§16.1). Without a bound, `truncate(f, 1<<62)`
+// asks that path to allocate an exabyte and takes the mount down with
+// it: an unprivileged local denial of service, not a missing feature.
+// A file anywhere near this size is impractical here for the same
+// buffering reason; the limit exists to make the failure an errno
+// instead of an OOM kill.
+const MaxFileSize = 1 << 40 // 1 TiB
+
+// ErrFileTooBig is returned for a size beyond MaxFileSize.
+var ErrFileTooBig = errors.New("repo: file size exceeds the maximum")
+
 // SetQuota sets this repo's byte and inode limits (DESIGN.md §18.3). A
 // zero value means unlimited for that dimension. This build has exactly
 // one subtree per repo (see pkg/metadb's package doc), so there is one
