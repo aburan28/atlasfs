@@ -2,7 +2,6 @@ package fuseserver
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -43,7 +42,7 @@ func TestStatfsReportsTheQuota(t *testing.T) {
 	}
 
 	// And df itself parses it, which is the actual user-facing check.
-	out, err := exec.Command("df", "-k", mnt).CombinedOutput()
+	out, err := execCommand("df", "-k", mnt).CombinedOutput()
 	if err != nil {
 		t.Fatalf("df: %v: %s", err, out)
 	}

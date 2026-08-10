@@ -53,7 +53,25 @@ func TestPublishPreservesTheExecutableBit(t *testing.T) {
 		t.Fatalf("immutable mount advertises write bits: mode %v", fi.Mode())
 	}
 
-	out, err := exec.Command(filepath.Join(mnt, "run.sh")).CombinedOutput()
+	// Bounded, and deliberately so. Executing a binary from a FUSE mount
+	// whose server lives in *this same process* is a known deadlock
+	// hazard: the kernel faults the executable's pages in through FUSE
+	// while the exec'ing thread is inside execve, and the server has to
+	// answer from a thread that is not blocked behind it. go-fuse's
+	// worker pool normally makes that fine — it does here — but CI has
+	// wedged on this exact line, and an unbounded exec takes the whole
+	// suite down with it for the full test timeout.
+	//
+	// The hazard is specific to the test's shape, not to the filesystem:
+	// a CSI mount or `atlas mount` serves a *different* process than the
+	// one running the binaries. A timeout turns the risk into a named
+	// failure instead of a six-minute hang.
+	execCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(execCtx, filepath.Join(mnt, "run.sh")).CombinedOutput()
+	if execCtx.Err() != nil {
+		t.Fatalf("executing a script from a mount served by this process did not complete in 30s: %v", execCtx.Err())
+	}
 	if err != nil {
 		t.Fatalf("running the published script: %v: %s", err, out)
 	}

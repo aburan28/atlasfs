@@ -1,11 +1,13 @@
 package fuseserver
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestTarRoundTripThroughTheMount is the closest thing this build has to
@@ -42,16 +44,16 @@ func TestTarRoundTripThroughTheMount(t *testing.T) {
 	}
 
 	archive := filepath.Join(t.TempDir(), "tree.tar")
-	if out, err := exec.Command("tar", "-cf", archive, "-C", src, ".").CombinedOutput(); err != nil {
+	if out, err := execCommand("tar", "-cf", archive, "-C", src, ".").CombinedOutput(); err != nil {
 		t.Fatalf("tar -c from a plain directory: %v: %s", err, out)
 	}
 	// -p so tar restores modes rather than applying the umask; the exec
 	// bit surviving extraction is half of what this test is checking.
-	if out, err := exec.Command("tar", "-xpf", archive, "-C", mnt).CombinedOutput(); err != nil {
+	if out, err := execCommand("tar", "-xpf", archive, "-C", mnt).CombinedOutput(); err != nil {
 		t.Fatalf("tar -x into the mount: %v: %s", err, out)
 	}
 
-	if out, err := exec.Command("diff", "-r", src, mnt).CombinedOutput(); err != nil {
+	if out, err := execCommand("diff", "-r", src, mnt).CombinedOutput(); err != nil {
 		t.Fatalf("extracted tree differs from the source:\n%s", out)
 	}
 
@@ -90,10 +92,10 @@ func TestTarRoundTripThroughTheMount(t *testing.T) {
 	// Re-archiving from the mount and comparing listings closes the loop:
 	// everything tar wrote in, it can read back out.
 	back := filepath.Join(t.TempDir(), "back.tar")
-	if out, err := exec.Command("tar", "-cf", back, "-C", mnt, ".").CombinedOutput(); err != nil {
+	if out, err := execCommand("tar", "-cf", back, "-C", mnt, ".").CombinedOutput(); err != nil {
 		t.Fatalf("tar -c from the mount: %v: %s", err, out)
 	}
-	listing, err := exec.Command("tar", "-tf", back).Output()
+	listing, err := execCommand("tar", "-tf", back).Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,4 +104,20 @@ func TestTarRoundTripThroughTheMount(t *testing.T) {
 			t.Fatalf("%q missing from an archive made from the mount:\n%s", want, listing)
 		}
 	}
+}
+
+// execCommand runs an external tool against the mount under a timeout.
+//
+// Every one of these drives the mount from a separate process, which is
+// the realistic shape — but they run against a FUSE server living in
+// this test binary, and a wedged request there blocks the tool forever.
+// CI has lost a whole run to that. A bounded command fails by name in
+// seconds instead.
+func execCommand(name string, args ...string) *exec.Cmd {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	cmd := exec.CommandContext(ctx, name, args...)
+	// The cancel leaks deliberately until the process exits: Cmd holds
+	// the context for its own lifetime, and a test process is short.
+	_ = cancel
+	return cmd
 }

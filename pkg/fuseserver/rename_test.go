@@ -3,7 +3,6 @@ package fuseserver
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -34,7 +33,7 @@ func TestMountRenameAndSymlinkViaShell(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mnt, "a.txt"), []byte("payload"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("mv", filepath.Join(mnt, "a.txt"), filepath.Join(mnt, "b.txt")).CombinedOutput(); err != nil {
+	if out, err := execCommand("mv", filepath.Join(mnt, "a.txt"), filepath.Join(mnt, "b.txt")).CombinedOutput(); err != nil {
 		t.Fatalf("mv through the mount: %v: %s", err, out)
 	}
 	got, err := os.ReadFile(filepath.Join(mnt, "b.txt"))
@@ -51,7 +50,7 @@ func TestMountRenameAndSymlinkViaShell(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(mnt, "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("mv", filepath.Join(mnt, "b.txt"), filepath.Join(mnt, "sub")).CombinedOutput(); err != nil {
+	if out, err := execCommand("mv", filepath.Join(mnt, "b.txt"), filepath.Join(mnt, "sub")).CombinedOutput(); err != nil {
 		t.Fatalf("mv into a subdirectory: %v: %s", err, out)
 	}
 	got, err = os.ReadFile(filepath.Join(mnt, "sub", "b.txt"))
@@ -59,7 +58,7 @@ func TestMountRenameAndSymlinkViaShell(t *testing.T) {
 		t.Fatalf("after cross-directory mv got %q err=%v", got, err)
 	}
 
-	if out, err := exec.Command("ln", "-s", "sub/b.txt", filepath.Join(mnt, "link")).CombinedOutput(); err != nil {
+	if out, err := execCommand("ln", "-s", "sub/b.txt", filepath.Join(mnt, "link")).CombinedOutput(); err != nil {
 		t.Fatalf("ln -s through the mount: %v: %s", err, out)
 	}
 	target, err := os.Readlink(filepath.Join(mnt, "link"))
@@ -249,7 +248,7 @@ func TestMountHardLink(t *testing.T) {
 	if err := os.WriteFile(orig, []byte("shared bytes"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("ln", orig, link).CombinedOutput(); err != nil {
+	if out, err := execCommand("ln", orig, link).CombinedOutput(); err != nil {
 		t.Fatalf("ln through the mount: %v: %s", err, out)
 	}
 
