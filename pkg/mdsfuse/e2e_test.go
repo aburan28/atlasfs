@@ -375,3 +375,66 @@ rmdir sub
 		t.Fatalf("after overwrite f.txt is %q, want \"second\\n\"", final)
 	}
 }
+
+// TestMutatingHolderSeesItsOwnChangesImmediately is a regression test for
+// a bug the client-side dentry cache introduced and CI caught: after this
+// holder's own rmdir, a stat still resolved the name.
+//
+// The cause is structural, not incidental. A holder is deliberately
+// excluded from its own recall (§10.6: the mutator does not recall
+// itself), and the invalidation push is asynchronous anyway — so a
+// client that only dropped cache entries on push would keep answering
+// from a view its own mutation had just invalidated. Read-your-own-writes
+// has to be maintained locally by the mutator.
+//
+// Each assertion here is immediately after the mutation, with no polling,
+// because "eventually correct" is exactly what must not be true for the
+// holder that made the change.
+func TestMutatingHolderSeesItsOwnChangesImmediately(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: time.Minute})
+	mnt := c.mountAt(t, "solo", 0)
+
+	// create -> immediately visible
+	p := filepath.Join(mnt, "own.txt")
+	if err := os.WriteFile(p, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(p); err != nil || st.Size() != 2 {
+		t.Fatalf("own create not immediately visible: %v size=%v", err, st)
+	}
+
+	// overwrite -> new size immediately, not the cached one
+	if err := os.WriteFile(p, []byte("much longer content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != int64(len("much longer content")) {
+		t.Fatalf("own overwrite not immediately visible: size %d", st.Size())
+	}
+
+	// unlink -> immediately gone
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("own unlink not immediately visible: %v", err)
+	}
+
+	// mkdir -> immediately present; rmdir -> immediately gone
+	d := filepath.Join(mnt, "ownd")
+	if err := os.Mkdir(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(d); err != nil || !st.IsDir() {
+		t.Fatalf("own mkdir not immediately visible: %v", err)
+	}
+	if err := os.Remove(d); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(d); !os.IsNotExist(err) {
+		t.Fatalf("own rmdir not immediately visible: %v", err)
+	}
+}

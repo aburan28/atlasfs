@@ -57,6 +57,12 @@ type Params struct {
 	DragonflyProxy string
 	DragonflyTag   string
 
+	// MDSAddr, when set, means this volume's metadata lives behind a
+	// remote authority (cmd/atlas-mds) rather than in repoDir. The repo
+	// directory then supplies only the object backend, since DESIGN.md
+	// §11 keeps chunk bytes out of the authority's path.
+	MDSAddr string
+
 	Region string // AtlasFS locator region (DESIGN.md §7.5), not the cloud provider's region
 
 	// Class is only a hint used when repoDir holds no repo yet — see
@@ -247,6 +253,8 @@ const (
 	KeyDragonflyProxy = "dragonflyProxy"
 	KeyDragonflyTag   = "dragonflyTag"
 
+	KeyMDSAddr = "mdsAddr"
+
 	KeyRegion = "region"
 	KeyClass  = "class"
 )
@@ -275,6 +283,8 @@ func ParamsFromMap(m map[string]string) (repoDir string, p Params, err error) {
 
 		DragonflyProxy: m[KeyDragonflyProxy],
 		DragonflyTag:   m[KeyDragonflyTag],
+
+		MDSAddr: m[KeyMDSAddr],
 
 		Region: m[KeyRegion],
 		Class:  m[KeyClass],

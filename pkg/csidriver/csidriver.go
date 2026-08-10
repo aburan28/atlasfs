@@ -31,11 +31,15 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/aburan28/atlasfs/pkg/fuseserver"
+	"github.com/aburan28/atlasfs/pkg/mds"
+	"github.com/aburan28/atlasfs/pkg/mdsfuse"
 	"github.com/aburan28/atlasfs/pkg/repo"
 	"github.com/aburan28/atlasfs/pkg/repoopen"
 )
@@ -80,9 +84,13 @@ type NodeServer struct {
 
 type activeMount struct {
 	volumeID string
-	repo     *repo.Repo
+	repo     *repo.Repo // nil for an authority-backed mount
 	server   *fuse.Server
 	done     chan struct{}
+
+	// closers run at unpublish: the gRPC connection and mds client for an
+	// authority-backed mount, which have no repo.Close to hang off.
+	closers []func()
 }
 
 func NewNodeServer(nodeID string) *NodeServer {
@@ -148,6 +156,14 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return nil, status.Errorf(codes.Internal, "create target_path: %v", err)
+	}
+
+	if params.MDSAddr != "" {
+		// Authority-backed volume: metadata over gRPC, bytes from object
+		// storage. The class checks below do not apply — the authority
+		// owns the class, and this node has no local metadata to consult
+		// for it.
+		return n.publishViaMDS(ctx, req, repoDir, params, target, readOnly)
 	}
 
 	r, err := repoopen.Open(ctx, repoDir, params)
@@ -231,8 +247,13 @@ func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 		return nil, status.Errorf(codes.Internal, "unmount: %v", err)
 	}
 	<-m.done
-	if err := m.repo.Close(); err != nil {
-		return nil, status.Errorf(codes.Internal, "close repo: %v", err)
+	for _, c := range m.closers {
+		c()
+	}
+	if m.repo != nil {
+		if err := m.repo.Close(); err != nil {
+			return nil, status.Errorf(codes.Internal, "close repo: %v", err)
+		}
 	}
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -251,4 +272,92 @@ func (n *NodeServer) NodeExpandVolume(context.Context, *csi.NodeExpandVolumeRequ
 
 func (n *NodeServer) NodeGetVolumeStats(context.Context, *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not advertised in NodeGetCapabilities")
+}
+
+// publishViaMDS mounts a volume whose metadata lives behind a remote
+// authority (VolumeContext mdsAddr). This is what lets a PV point at a
+// shared, coherent namespace instead of at one node's private metadata:
+// every pod mounting the volume becomes its own lease holder, so a write
+// from one is invalidated — or, under `posix`, recalled — on the others.
+//
+// The node still reads and writes chunk bytes straight to object storage
+// (DESIGN.md §11), so the authority's load does not scale with data
+// volume, only with metadata operations.
+func (n *NodeServer) publishViaMDS(
+	ctx context.Context,
+	req *csi.NodePublishVolumeRequest,
+	repoDir string,
+	params repoopen.Params,
+	target string,
+	readOnly bool,
+) (*csi.NodePublishVolumeResponse, error) {
+	cc, err := grpc.NewClient(params.MDSAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()), mds.DialOption())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "connect to metadata authority %s: %v", params.MDSAddr, err)
+	}
+
+	// Holder identity is per *volume mount*, not per node: two pods on one
+	// node mounting the same volume are two independent caches, and a
+	// shared identity would let one pod's recall ack speak for the other's.
+	holder := fmt.Sprintf("%s/%s", n.NodeID, req.GetVolumeId())
+	client := mds.NewClient(cc, holder, nil)
+	if err := client.Subscribe(ctx); err != nil {
+		cc.Close()
+		return nil, status.Errorf(codes.Internal, "subscribe to invalidations: %v", err)
+	}
+
+	backend, err := repoopen.OpenBackend(ctx, repoDir, params)
+	if err != nil {
+		client.Close()
+		cc.Close()
+		return nil, status.Errorf(codes.Internal, "open backend: %v", err)
+	}
+
+	mounted := make(chan *fuse.Server, 1)
+	mountErr := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		err := mdsfuse.Mount(context.Background(), mdsfuse.Config{
+			Client:   client,
+			Backend:  backend,
+			ReadOnly: readOnly,
+			Region:   params.Region,
+			// Zero: without asking the authority for the subtree's class,
+			// assume the strictest one. A `posix` volume must not have the
+			// kernel answering getattr from a cache that cannot be recalled.
+			KernelCacheTTL: 0,
+		}, target, func(s *fuse.Server) { mounted <- s })
+		if err != nil {
+			select {
+			case mountErr <- err:
+			default:
+			}
+		}
+		close(done)
+	}()
+
+	cleanup := []func(){client.Close, func() { cc.Close() }}
+	select {
+	case server := <-mounted:
+		n.mu.Lock()
+		n.mounts[target] = &activeMount{
+			volumeID: req.GetVolumeId(),
+			server:   server,
+			done:     done,
+			closers:  cleanup,
+		}
+		n.mu.Unlock()
+		return &csi.NodePublishVolumeResponse{}, nil
+	case err := <-mountErr:
+		for _, c := range cleanup {
+			c()
+		}
+		return nil, status.Errorf(codes.Internal, "mount via authority: %v", err)
+	case <-ctx.Done():
+		for _, c := range cleanup {
+			c()
+		}
+		return nil, status.Error(codes.DeadlineExceeded, "mount did not complete before context deadline")
+	}
 }

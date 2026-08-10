@@ -192,17 +192,33 @@ func (c *Client) Commit(ctx context.Context, dir metadb.InodeID, name string, re
 	var resp CommitResponse
 	err := c.cc.Invoke(ctx, MethodCommit, &CommitRequest{Holder: c.holder, Dir: dir, Name: name, Record: rec}, &resp)
 	if err == nil {
-		// The mutator's own cache must not keep the pre-write record: it
-		// was not recalled (a holder does not recall itself) and its lease
-		// is still nominally valid.
 		c.invalidate(inodeObj(resp.Inode))
+		c.invalidateOwnMutation(dir)
 	}
 	return resp, err
 }
 
 func (c *Client) Unlink(ctx context.Context, dir metadb.InodeID, name string) error {
 	var resp UnlinkResponse
-	return c.cc.Invoke(ctx, MethodUnlink, &UnlinkRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	err := c.cc.Invoke(ctx, MethodUnlink, &UnlinkRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	if err == nil {
+		c.invalidateOwnMutation(dir)
+	}
+	return err
+}
+
+// invalidateOwnMutation drops this holder's own cached view of a
+// directory it just changed.
+//
+// This is not redundant with the push. A holder is deliberately excluded
+// from its own recall (§10.6: the mutator does not recall itself), and
+// the invalidation push is asynchronous besides — so without this a
+// client would keep answering from a dentry cache its own rmdir just
+// invalidated, and read-your-own-writes would break on the one holder
+// most certain to notice. CI caught exactly that: a stat right after a
+// successful rmdir still resolved the name.
+func (c *Client) invalidateOwnMutation(dir metadb.InodeID) {
+	c.invalidate(dirObj(dir))
 }
 
 func (c *Client) store(obj string, rec metadb.InodeRecord, l Lease) {
@@ -373,10 +389,17 @@ func (c *Client) HasLocator(ctx context.Context, id chunk.ID) (bool, error) {
 func (c *Client) Mkdir(ctx context.Context, dir metadb.InodeID, name string) (metadb.InodeID, error) {
 	var resp MkdirResponse
 	err := c.cc.Invoke(ctx, MethodMkdir, &MkdirRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	if err == nil {
+		c.invalidateOwnMutation(dir)
+	}
 	return resp.Inode, err
 }
 
 func (c *Client) Rmdir(ctx context.Context, dir metadb.InodeID, name string) error {
 	var resp RmdirResponse
-	return c.cc.Invoke(ctx, MethodRmdir, &RmdirRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	err := c.cc.Invoke(ctx, MethodRmdir, &RmdirRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	if err == nil {
+		c.invalidateOwnMutation(dir)
+	}
+	return err
 }
