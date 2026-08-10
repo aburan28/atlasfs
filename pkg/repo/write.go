@@ -179,17 +179,19 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 	return id, nil
 }
 
-// Unlink removes name from dir. DESIGN.md §19.3's graveyard/nlink
-// bookkeeping (needed for POSIX's "open but unlinked" guarantee) is not
-// implemented — this build has no reference-counted GC at all yet (see
-// metadb.RemoveDentry's doc comment), so Unlink simply drops the
-// binding; the inode record and any chunks it alone referenced become
-// unreachable rather than reclaimed.
+// Unlink removes name from dir, moving the target inode into the
+// graveyard (DESIGN.md §19.3) rather than reclaiming it immediately —
+// pkg/repo.Sweep is what later collects its chunks, once past the grace
+// period. This build has no open-file-handle tracking across process
+// boundaries (single process only — see gc.go's doc comment), so unlike
+// real §19.3, an inode is gravable immediately on unlink rather than
+// only once its last open handle closes; that gap is stated, not
+// hidden.
 func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 	if !r.Class.Mutable() {
 		return ErrReadOnly
 	}
-	if err := r.DB.RemoveEntry(dir, name); err != nil {
+	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
 		return err
 	}
 	if r.Coherence != nil {
@@ -247,7 +249,7 @@ func (r *Repo) Rmdir(dir metadb.InodeID, name string) error {
 	if len(entries) > 0 {
 		return fmt.Errorf("%w: %q", ErrNotEmpty, name)
 	}
-	if err := r.DB.RemoveEntry(dir, name); err != nil {
+	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
 		return err
 	}
 	if r.Coherence != nil {

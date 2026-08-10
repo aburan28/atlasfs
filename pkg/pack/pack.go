@@ -92,6 +92,20 @@ func (p *Packer) Full() bool { return p.buf.Len() >= p.sealSize }
 // Empty reports whether there is nothing pending.
 func (p *Packer) Empty() bool { return p.buf.Len() == 0 }
 
+// PendingIDs returns the chunk IDs currently buffered but not yet sealed
+// into a container. A pending chunk has no locator yet (storeChunk only
+// calls PutLocator after Seal), so GC's mark phase (DESIGN.md §19.1)
+// has nothing to remove for one regardless — this exists so that fact
+// is an explicit, checked part of the invariant rather than an
+// incidental one.
+func (p *Packer) PendingIDs() []chunk.ID {
+	ids := make([]chunk.ID, len(p.pending))
+	for i, e := range p.pending {
+		ids[i] = e.id
+	}
+	return ids
+}
+
 // Seal writes the current buffer as one sealed container object and
 // returns the locators for every chunk packed into it. It is a no-op
 // (returns nil, nil) if nothing is pending.

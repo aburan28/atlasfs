@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
 	"github.com/aburan28/atlasfs/pkg/pack"
@@ -251,10 +252,10 @@ func TestRemoveEntryReleasesQuotaUsage(t *testing.T) {
 		t.Fatalf("usage before removal = bytes=%d inodes=%d, want 7,2", bytesUsed, inodesUsed)
 	}
 
-	if err := db.RemoveEntry(RootInode, "f.txt"); err != nil {
+	if err := db.RemoveEntry(RootInode, "f.txt", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RemoveEntry(RootInode, "d"); err != nil {
+	if err := db.RemoveEntry(RootInode, "d", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	bytesUsed, inodesUsed, err = db.GetQuotaUsage()
@@ -263,6 +264,122 @@ func TestRemoveEntryReleasesQuotaUsage(t *testing.T) {
 	}
 	if bytesUsed != 0 || inodesUsed != 0 {
 		t.Fatalf("usage after removing everything = bytes=%d inodes=%d, want 0,0", bytesUsed, inodesUsed)
+	}
+}
+
+// TestRemoveEntryGravesInsteadOfDeleting exercises the metadb half of
+// DESIGN.md §19.3: RemoveEntry must record a graveyard entry rather
+// than deleting the inode record, and DeleteInode/RemoveGraveyardEntry
+// (pkg/repo.Sweep's tools) must be able to finish the job later.
+func TestRemoveEntryGravesInsteadOfDeleting(t *testing.T) {
+	db := openTestDB(t)
+	id, err := db.CommitFile(RootInode, "f.txt", InodeRecord{Mode: 0o644, Size: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := db.ListGraveyard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected an empty graveyard before removal, got %d entries", len(entries))
+	}
+
+	deletedAt := time.Unix(1000, 0)
+	if err := db.RemoveEntry(RootInode, "f.txt", deletedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// The inode record survives the removal — RemoveEntry graves it
+	// rather than deleting it outright.
+	if _, err := db.GetInode(id); err != nil {
+		t.Fatalf("expected the inode record to survive RemoveEntry (graved, not deleted), got %v", err)
+	}
+
+	entries, err = db.ListGraveyard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].InodeID != id || !entries[0].DeletedAt.Equal(deletedAt) {
+		t.Fatalf("expected one graveyard entry {%d, %s}, got %+v", id, deletedAt, entries)
+	}
+
+	// DeleteInode + RemoveGraveyardEntry are what a Sweep past grace
+	// does to finish reclaiming this entry.
+	if err := db.DeleteInode(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetInode(id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected the inode record to be gone after DeleteInode, got %v", err)
+	}
+	if err := db.RemoveGraveyardEntry(entries[0]); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = db.ListGraveyard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected the graveyard to be empty after RemoveGraveyardEntry, got %d entries", len(entries))
+	}
+}
+
+// TestListGraveyardOrdersOldestFirst exercises the key-ordering claim
+// ListGraveyard's doc comment makes: entries come back oldest-deletion
+// first regardless of insertion order.
+func TestListGraveyardOrdersOldestFirst(t *testing.T) {
+	db := openTestDB(t)
+	idA, err := db.CommitFile(RootInode, "a.txt", InodeRecord{Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := db.CommitFile(RootInode, "b.txt", InodeRecord{Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newer := time.Unix(2000, 0)
+	older := time.Unix(1000, 0)
+	if err := db.RemoveEntry(RootInode, "a.txt", newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RemoveEntry(RootInode, "b.txt", older); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := db.ListGraveyard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 graveyard entries, got %d", len(entries))
+	}
+	if entries[0].InodeID != idB || entries[1].InodeID != idA {
+		t.Fatalf("expected oldest-first order [b(%d), a(%d)], got %+v", idB, idA, entries)
+	}
+}
+
+// TestDeleteLocatorIsIdempotent matches DeleteLocator's doc comment: a
+// Sweep run retried after a partial failure must be able to delete an
+// already-absent locator without error.
+func TestDeleteLocatorIsIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	id := chunk.Sum([]byte("payload"))
+	if err := db.DeleteLocator("local", id); err != nil {
+		t.Fatalf("expected deleting an absent locator to be a no-op, got %v", err)
+	}
+	if err := db.PutLocator("local", id, pack.Locator{Container: "c", Length: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteLocator("local", id); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := db.HasLocator("local", id); err != nil || found {
+		t.Fatalf("expected the locator to be gone, found=%v err=%v", found, err)
+	}
+	if err := db.DeleteLocator("local", id); err != nil {
+		t.Fatalf("expected a second delete of the same key to still be a no-op, got %v", err)
 	}
 }
 

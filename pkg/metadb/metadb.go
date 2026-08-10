@@ -23,6 +23,15 @@
 // the same bbolt transaction as the inode/dentry mutation they guard —
 // the single-node stand-in for §18.3's "the counter can be updated in
 // the same FDB transaction as the mutation using an atomic add."
+//
+// The graveyard (DESIGN.md §19.3) is this build's stand-in for nlink
+// reaching zero: this build has no hardlinks, so RemoveEntry's dentry
+// removal always is the last reference, and it records a
+// (deleteTsNano||inodeID) graveyard entry rather than deleting the
+// inode record outright. pkg/repo.Sweep is the mark-and-sweep
+// implementation (DESIGN.md §19.1) that later reclaims a graveyard
+// entry's chunks once it is past the grace period and deletes the
+// entry and inode record; metadb itself only records and enumerates.
 package metadb
 
 import (
@@ -46,11 +55,12 @@ type InodeID uint64
 const RootInode InodeID = 1
 
 var (
-	bucketDentry  = []byte("dentry")  // (dirInode||0x00||name) -> childInode
-	bucketInode   = []byte("inode")   // inodeID -> gob(InodeRecord)
-	bucketLocator = []byte("locator") // (region||0x00||chunkID) -> gob(pack.Locator)
-	bucketMeta    = []byte("meta")    // "next_inode" -> uint64
-	bucketQuota   = []byte("quota")   // "root" -> gob(quotaRecord), see package doc
+	bucketDentry  = []byte("dentry")    // (dirInode||0x00||name) -> childInode
+	bucketInode   = []byte("inode")     // inodeID -> gob(InodeRecord)
+	bucketLocator = []byte("locator")   // (region||0x00||chunkID) -> gob(pack.Locator)
+	bucketMeta    = []byte("meta")      // "next_inode" -> uint64
+	bucketQuota   = []byte("quota")     // "root" -> gob(quotaRecord), see package doc
+	bucketGravey  = []byte("graveyard") // (deleteTsNano||inodeID) -> empty, see package doc
 )
 
 var ErrNotFound = errors.New("metadb: not found")
@@ -97,7 +107,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("metadb: open: %w", err)
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota} {
+		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -282,11 +292,10 @@ func setDentryTx(tx *bbolt.Tx, dir InodeID, name string, child InodeID) error {
 }
 
 // RemoveDentry unbinds name within dir. Returns ErrNotFound if no such
-// binding exists. Does not touch the target inode record — this build
-// has no reference-counted GC (DESIGN.md §19 is a later phase), so an
-// unlinked inode's record and chunks simply become unreachable rather
-// than being reclaimed; that is a real, stated gap, not a leak this
-// build hides.
+// binding exists. Does not touch the target inode record or graveyard —
+// callers that need the full unlink semantics (quota credit + graveyard
+// entry) use RemoveEntry instead. Kept only for callers that genuinely
+// just want to unbind a name without those side effects.
 func (db *DB) RemoveDentry(dir InodeID, name string) error {
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketDentry)
@@ -298,13 +307,16 @@ func (db *DB) RemoveDentry(dir InodeID, name string) error {
 	})
 }
 
-// RemoveEntry is RemoveDentry plus the quota release the write path
-// needs: it unbinds name in dir and, in the same bbolt transaction,
-// credits back the removed inode's charge (its stored Size in bytes,
-// one inode) so quota usage tracks live content across unlink/rmdir
-// rather than only ever growing (DESIGN.md §18.3). Like RemoveDentry,
-// the inode record itself is left in place.
-func (db *DB) RemoveEntry(dir InodeID, name string) error {
+// RemoveEntry unbinds name in dir and, in the same bbolt transaction:
+// credits back the removed inode's quota charge (its stored Size in
+// bytes, one inode — DESIGN.md §18.3) and moves the inode into the
+// graveyard at deletedAt rather than deleting its record outright
+// (DESIGN.md §19.3 — this build has no hardlinks, so the one dentry
+// binding removed here is always the last reference). deletedAt is
+// supplied by the caller rather than computed here, matching how the
+// rest of this package's timestamps (InodeRecord.MTime) are always
+// caller-supplied — see pkg/repo.Repo.Clock.
+func (db *DB) RemoveEntry(dir InodeID, name string, deletedAt time.Time) error {
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
 		id, err := lookupTx(tx, dir, name)
 		if err != nil {
@@ -317,7 +329,82 @@ func (db *DB) RemoveEntry(dir InodeID, name string) error {
 		if err := tx.Bucket(bucketDentry).Delete(dentryKey(dir, name)); err != nil {
 			return err
 		}
-		return applyQuotaDeltaTx(tx, -int64(rec.Size), -1)
+		if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
+			return err
+		}
+		return addToGraveyardTx(tx, id, deletedAt)
+	})
+}
+
+// DeleteInode removes id's record outright. The only caller is
+// pkg/repo.Sweep, and only for a graveyard entry already past DESIGN.md
+// §19.2's grace period — by then nothing can still resolve to id via a
+// dentry (RemoveEntry already removed the only one) or via a
+// not-yet-expired graveyard entry (Sweep's mark phase treats those as
+// reachable and never sweeps them).
+func (db *DB) DeleteInode(id InodeID) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketInode).Delete(inodeKey(id))
+	})
+}
+
+// DeleteLocator removes a chunk's locator entry for region. Deleting an
+// already-absent key is not an error (bbolt's own Delete semantics),
+// which matters here: a Sweep run interrupted after removing some
+// locators but before removing the graveyard entry must be safe to
+// retry against the same, now-partially-swept entry.
+func (db *DB) DeleteLocator(region string, id chunk.ID) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketLocator).Delete(locatorKey(region, id))
+	})
+}
+
+// --- graveyard (DESIGN.md §19.3) -----------------------------------------
+
+// GraveyardEntry records an inode whose one dentry binding was removed,
+// and when. DESIGN.md §19.1's mark phase treats a graveyard entry as
+// reachable until DeletedAt+T_grace, so a chunk it alone references
+// survives until then.
+type GraveyardEntry struct {
+	InodeID   InodeID
+	DeletedAt time.Time
+}
+
+// graveyardKey is (deleteTsNano||inodeID) big-endian, so bbolt's
+// lexicographic key order is also oldest-deletion-first — ListGraveyard
+// relies on this rather than sorting after the fact.
+func graveyardKey(deletedAt time.Time, id InodeID) []byte {
+	var k [16]byte
+	binary.BigEndian.PutUint64(k[:8], uint64(deletedAt.UnixNano()))
+	binary.BigEndian.PutUint64(k[8:], uint64(id))
+	return k[:]
+}
+
+func addToGraveyardTx(tx *bbolt.Tx, id InodeID, deletedAt time.Time) error {
+	return tx.Bucket(bucketGravey).Put(graveyardKey(deletedAt, id), []byte{})
+}
+
+// ListGraveyard returns every graveyard entry, oldest deletion first.
+func (db *DB) ListGraveyard() ([]GraveyardEntry, error) {
+	var out []GraveyardEntry
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		c := tx.Bucket(bucketGravey).Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			ts := int64(binary.BigEndian.Uint64(k[:8]))
+			id := InodeID(binary.BigEndian.Uint64(k[8:]))
+			out = append(out, GraveyardEntry{InodeID: id, DeletedAt: time.Unix(0, ts)})
+		}
+		return nil
+	})
+	return out, err
+}
+
+// RemoveGraveyardEntry deletes e's graveyard record. The only caller is
+// pkg/repo.Sweep, once e is past grace and its chunks have been
+// evaluated (DESIGN.md §19.1's sweep step).
+func (db *DB) RemoveGraveyardEntry(e GraveyardEntry) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketGravey).Delete(graveyardKey(e.DeletedAt, e.InodeID))
 	})
 }
 

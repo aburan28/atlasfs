@@ -87,6 +87,15 @@ type Repo struct {
 	// container code path without allocating and hashing real 64 MiB
 	// files.
 	SingleObjectThreshold int64
+
+	// Clock is the source of "now" for every graveyard timestamp this
+	// repo records (Unlink, Rmdir) and for Sweep's grace-period
+	// comparisons (DESIGN.md §19). Reuses coherence.Clock rather than a
+	// second time-abstraction — same role, same interface, and tests can
+	// override it exactly like they already do for a Manager's clock
+	// (see pkg/coherence's tests) to exercise a grace period without
+	// sleeping for real hours.
+	Clock coherence.Clock
 }
 
 // Open opens (or initializes) a repo rooted at dir: dir/meta.db for
@@ -143,6 +152,7 @@ func OpenWithClass(dir string, backend store.Backend, region string, class Class
 		Class:                 actualClass,
 		ChunkSize:             chunk.DefaultSize,
 		SingleObjectThreshold: pack.SingleObjectThreshold,
+		Clock:                 coherence.RealClock{},
 	}
 	if d := actualClass.leaseDuration(); d > 0 {
 		r.Coherence = coherence.New(coherence.RealClock{}, d)
