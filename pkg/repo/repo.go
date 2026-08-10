@@ -44,6 +44,14 @@ const (
 	ClassImmutable Class = "immutable"
 	ClassRelaxed   Class = "relaxed"
 	ClassSession   Class = "session"
+
+	// ClassPosix is DESIGN.md §8's linearizable class. Its staleness
+	// bound is D = 0, achieved by §10.6's blocking recall rather than by
+	// a short lease — see LeaseDuration. It is served by cmd/atlas-mds,
+	// which has real remote holders to recall from; the in-process
+	// pkg/fuseserver path does not offer it, because a single holder
+	// cannot demonstrate the property that distinguishes the class.
+	ClassPosix Class = "posix"
 )
 
 // leaseDuration returns DESIGN.md §8's stated default lease duration
@@ -55,10 +63,27 @@ func (c Class) leaseDuration() time.Duration {
 		return 5 * time.Second
 	case ClassRelaxed:
 		return 30 * time.Second
+	case ClassPosix:
+		return posixLeaseDuration
 	default:
 		return 0
 	}
 }
+
+// LeaseDuration exports leaseDuration for callers outside this package
+// (cmd/atlas-mds configures a pkg/mds.Server from it).
+func (c Class) LeaseDuration() time.Duration { return c.leaseDuration() }
+
+// posixLeaseDuration is long on purpose, and it is not a contradiction
+// of §8.1's "D = 0" for the `posix` class. D bounds *staleness*, and for
+// posix that bound is enforced by §10.6's blocking recall — a mutation
+// cannot commit until holders have given their copies up — not by
+// waiting for a lease to lapse. A short lease would add revalidation
+// traffic on every read while changing the staleness bound not at all,
+// since recall already drives it to zero. The lease still exists so that
+// a holder which loses contact with the authority eventually stops
+// trusting its cache on its own clock (§10.7).
+const posixLeaseDuration = time.Hour
 
 // KernelCacheTTL is how long a kernel-side attribute or dentry cache
 // entry may be trusted for this class — the `D` of DESIGN.md §10 applied
@@ -76,10 +101,22 @@ func (c Class) leaseDuration() time.Duration {
 // legal, and a client that cached the old binding forever would never
 // see it.
 func (c Class) KernelCacheTTL() time.Duration {
-	if c == ClassImmutable || c == "" {
+	switch c {
+	case ClassImmutable, "":
 		return immutableKernelCacheTTL
+	case ClassPosix:
+		// Zero, and not posixLeaseDuration. The kernel's attr cache
+		// cannot participate in §10.6's recall — there is no way to ask
+		// it to drop an entry and acknowledge — so any non-zero TTL here
+		// would let the kernel answer a getattr from a copy the recall
+		// protocol believes was surrendered. `posix` buys D = 0 by paying
+		// a round trip per operation; caching in the one layer that
+		// cannot be recalled would spend the guarantee to get the cost
+		// back.
+		return 0
+	default:
+		return c.leaseDuration()
 	}
-	return c.leaseDuration()
 }
 
 // immutableKernelCacheTTL bounds how stale an `immutable` binding may be

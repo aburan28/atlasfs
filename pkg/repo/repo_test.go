@@ -473,6 +473,21 @@ func TestKernelCacheTTLMatchesLeaseDuration(t *testing.T) {
 	}
 }
 
+// TestPosixKernelCacheTTLIsZero pins the one class where the kernel must
+// not cache at all. §10.6 gets D = 0 by recalling holders, and the
+// kernel's attr cache cannot be recalled — a non-zero TTL here would let
+// it answer a getattr from a copy the protocol believes was surrendered,
+// which is the exact staleness `posix` exists to eliminate.
+func TestPosixKernelCacheTTLIsZero(t *testing.T) {
+	if ttl := ClassPosix.KernelCacheTTL(); ttl != 0 {
+		t.Fatalf("posix kernel TTL = %s, want 0 — the kernel cannot participate in recall", ttl)
+	}
+	// The lease itself is still long: recall bounds staleness, not expiry.
+	if d := ClassPosix.LeaseDuration(); d <= 0 {
+		t.Fatalf("posix lease duration = %s; a holder that loses the authority must still time out eventually", d)
+	}
+}
+
 // TestImmutableKernelCacheTTLIsFinite guards DESIGN.md §8.2: `immutable`
 // means the content behind a binding never changes, not that a path can
 // never be republished. An infinite kernel TTL would make a republish

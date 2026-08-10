@@ -1,0 +1,244 @@
+package mds
+
+import (
+	"context"
+	"io"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+
+	"github.com/aburan28/atlasfs/pkg/coherence"
+	"github.com/aburan28/atlasfs/pkg/metadb"
+)
+
+// Client is one holder: a process that caches metadata under leases
+// granted by a Server, and gives those leases up when told to.
+//
+// The cache below is the client half of DESIGN.md §10, and the two rules
+// it follows are the ones that make the whole protocol work:
+//
+//   - An entry is trusted only while `clock.Now()` is inside the window
+//     the client itself computed from the lease's TTL (§10.7). The
+//     authority's clock never enters the decision, so clock skew between
+//     the two cannot produce a stale read.
+//   - A push arriving on the stream drops the entry early. That is the
+//     only thing push does. Losing every push message costs
+//     responsiveness and nothing else, which is why the tests can drop
+//     the stream entirely and still assert correctness.
+type Client struct {
+	cc     *grpc.ClientConn
+	holder string
+	clock  coherence.Clock
+
+	mu    sync.Mutex
+	cache map[string]*cacheEntry
+
+	// onRecall, when set, runs before the client acks a recall. Tests use
+	// it to observe ordering; a real client drops any derived state here.
+	onRecall func(object string)
+
+	streamCancel context.CancelFunc
+	streamDone   chan struct{}
+}
+
+type cacheEntry struct {
+	record  metadb.InodeRecord
+	version uint64
+	expiry  time.Time
+	// noExpiry marks an `immutable`-class lease: nothing can invalidate
+	// it because nothing can change (DESIGN.md §8.2's republish caveat is
+	// handled a layer up, by not reusing a Client across a republish).
+	noExpiry bool
+}
+
+// NewClient wraps an established connection. holder must be unique per
+// process — it is the identity the authority grants leases to and
+// recalls them from.
+func NewClient(cc *grpc.ClientConn, holder string, clock coherence.Clock) *Client {
+	if clock == nil {
+		clock = coherence.RealClock{}
+	}
+	return &Client{cc: cc, holder: holder, clock: clock, cache: map[string]*cacheEntry{}}
+}
+
+// DialOption returns the call options a connection to this service needs.
+// The content-subtype is what selects this package's codec; without it
+// grpc-go would try to marshal these plain structs as protobuf.
+func DialOption() grpc.DialOption {
+	return grpc.WithDefaultCallOptions(grpc.CallContentSubtype(codecName))
+}
+
+func (c *Client) Holder() string { return c.holder }
+
+// SetRecallHook installs a callback invoked when a recall arrives, before
+// the ack is sent.
+func (c *Client) SetRecallHook(f func(object string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onRecall = f
+}
+
+// CachedInode returns a locally cached record if this client's lease on
+// it is still valid *by its own clock*, without contacting the server.
+func (c *Client) CachedInode(id metadb.InodeID) (metadb.InodeRecord, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.cache[inodeObj(id)]
+	if e == nil {
+		return metadb.InodeRecord{}, false
+	}
+	if !e.noExpiry && c.clock.Now().After(e.expiry) {
+		return metadb.InodeRecord{}, false
+	}
+	return e.record, true
+}
+
+// GetInode returns the record for id, from cache when the lease permits
+// and from the authority otherwise.
+func (c *Client) GetInode(ctx context.Context, id metadb.InodeID) (metadb.InodeRecord, error) {
+	if rec, ok := c.CachedInode(id); ok {
+		return rec, nil
+	}
+	var resp GetInodeResponse
+	if err := c.cc.Invoke(ctx, MethodGetInode, &GetInodeRequest{Holder: c.holder, Inode: id}, &resp); err != nil {
+		return metadb.InodeRecord{}, err
+	}
+	c.store(inodeObj(id), resp.Record, resp.Lease)
+	return resp.Record, nil
+}
+
+func (c *Client) Lookup(ctx context.Context, dir metadb.InodeID, name string) (LookupResponse, error) {
+	var resp LookupResponse
+	err := c.cc.Invoke(ctx, MethodLookup, &LookupRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+	if err == nil && resp.Found {
+		c.store(inodeObj(resp.Inode), resp.Record, resp.Lease)
+	}
+	return resp, err
+}
+
+func (c *Client) Readdir(ctx context.Context, dir metadb.InodeID) ([]metadb.DirEntry, error) {
+	var resp ReaddirResponse
+	if err := c.cc.Invoke(ctx, MethodReaddir, &ReaddirRequest{Holder: c.holder, Dir: dir}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Entries, nil
+}
+
+func (c *Client) Commit(ctx context.Context, dir metadb.InodeID, name string, rec metadb.InodeRecord) (CommitResponse, error) {
+	var resp CommitResponse
+	err := c.cc.Invoke(ctx, MethodCommit, &CommitRequest{Holder: c.holder, Dir: dir, Name: name, Record: rec}, &resp)
+	if err == nil {
+		// The mutator's own cache must not keep the pre-write record: it
+		// was not recalled (a holder does not recall itself) and its lease
+		// is still nominally valid.
+		c.invalidate(inodeObj(resp.Inode))
+	}
+	return resp, err
+}
+
+func (c *Client) Unlink(ctx context.Context, dir metadb.InodeID, name string) error {
+	var resp UnlinkResponse
+	return c.cc.Invoke(ctx, MethodUnlink, &UnlinkRequest{Holder: c.holder, Dir: dir, Name: name}, &resp)
+}
+
+func (c *Client) store(obj string, rec metadb.InodeRecord, l Lease) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := &cacheEntry{record: rec, version: l.Version}
+	if l.TTL <= 0 {
+		e.noExpiry = true
+	} else {
+		// Measured from now, on this client's clock — never from a
+		// server-supplied timestamp (§10.7).
+		e.expiry = c.clock.Now().Add(l.TTL)
+	}
+	c.cache[obj] = e
+}
+
+func (c *Client) invalidate(obj string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.cache, obj)
+}
+
+// Subscribe opens the push stream and services it until the context is
+// cancelled or Close is called. It returns once the stream is
+// established, having spawned the reader; errors after that are the
+// protocol's business, not the caller's, because losing the stream is
+// explicitly survivable (§10.2).
+func (c *Client) Subscribe(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	stream, err := c.cc.NewStream(ctx, &serviceDesc.Streams[0], MethodSubscribe)
+	if err != nil {
+		cancel()
+		return err
+	}
+	if err := stream.SendMsg(&SubscribeRequest{Holder: c.holder}); err != nil {
+		cancel()
+		return err
+	}
+	if err := stream.CloseSend(); err != nil {
+		cancel()
+		return err
+	}
+
+	done := make(chan struct{})
+	c.mu.Lock()
+	c.streamCancel, c.streamDone = cancel, done
+	c.mu.Unlock()
+
+	// Wait for the server to accept the stream before returning, so a
+	// caller that immediately mutates from another client cannot race
+	// ahead of this holder's registration.
+	ready := make(chan struct{})
+	go func() {
+		defer close(done)
+		close(ready)
+		for {
+			var ev Event
+			if err := stream.RecvMsg(&ev); err != nil {
+				if err == io.EOF {
+					return
+				}
+				return
+			}
+			c.handleEvent(ev)
+		}
+	}()
+	<-ready
+	return nil
+}
+
+func (c *Client) handleEvent(ev Event) {
+	c.invalidate(ev.Object)
+	if ev.Kind != EventRecall {
+		return
+	}
+	c.mu.Lock()
+	hook := c.onRecall
+	c.mu.Unlock()
+	if hook != nil {
+		hook(ev.Object)
+	}
+	// Ack only after the local copy is gone. Acking first would tell the
+	// writer it is safe to commit while this holder could still answer a
+	// read from the entry it has not yet dropped.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var resp AckRecallResponse
+	_ = c.cc.Invoke(ctx, MethodAckRecall, &AckRecallRequest{Holder: c.holder, RecallID: ev.RecallID}, &resp)
+}
+
+// Close stops the push stream. The connection itself belongs to the
+// caller.
+func (c *Client) Close() {
+	c.mu.Lock()
+	cancel, done := c.streamCancel, c.streamDone
+	c.streamCancel, c.streamDone = nil, nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+}
