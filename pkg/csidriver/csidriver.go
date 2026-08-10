@@ -1,12 +1,21 @@
 // Package csidriver implements the CSI Identity and Node services for
-// AtlasFS's static, read-only PV case (DESIGN.md §22.1, §22.2's ROX row).
-// There is deliberately no Controller service: static provisioning means
-// an admin creates the PersistentVolume directly with volumeHandle and
-// volumeAttributes already pointing at a published subtree, so kubelet
-// calls NodePublishVolume straight from the PV spec — CreateVolume is
-// never in the flow. Implementing a Controller for dynamic provisioning
-// across regions/backends is real, unbuilt scope (DESIGN.md §28 Phase 2+),
-// not something this package pretends to cover.
+// AtlasFS's static PV case (DESIGN.md §22.1). There is deliberately no
+// Controller service: static provisioning means an admin creates the
+// PersistentVolume directly with volumeHandle and volumeAttributes
+// already pointing at a published subtree, so kubelet calls
+// NodePublishVolume straight from the PV spec — CreateVolume is never in
+// the flow. Implementing a Controller for dynamic provisioning across
+// regions/backends is real, unbuilt scope (DESIGN.md §28 Phase 2+), not
+// something this package pretends to cover.
+//
+// Per DESIGN.md §22.2, most non-read-only requests are still rejected:
+// this build's mutable path only backs the `relaxed`/`session` classes
+// (pkg/fuseserver), and RWX specifically requires the caller to opt into
+// the `rwxContract: disjoint-writers` VolumeContext parameter on a
+// `relaxed` subtree — the one row §22.2 carves out as opt-in rather than
+// flatly rejected. Everything else non-read-only (immutable class, no
+// contract, or a class this build doesn't support for RWX) is rejected
+// exactly as before.
 //
 // This driver does not advertise STAGE_UNSTAGE_VOLUME, so kubelet skips
 // NodeStageVolume/NodeUnstageVolume entirely and calls
@@ -58,7 +67,8 @@ func (IdentityServer) Probe(context.Context, *csi.ProbeRequest) (*csi.ProbeRespo
 }
 
 // NodeServer implements the CSI Node service against a repo.Repo mounted
-// read-only over FUSE (pkg/fuseserver) for each published volume.
+// over FUSE (pkg/fuseserver) for each published volume — read-only in
+// the common case, read-write for the §22.2 disjoint-writers carve-out.
 type NodeServer struct {
 	csi.UnimplementedNodeServer
 
@@ -94,11 +104,20 @@ func (n *NodeServer) NodeGetCapabilities(context.Context, *csi.NodeGetCapabiliti
 	return &csi.NodeGetCapabilitiesResponse{}, nil
 }
 
-// NodePublishVolume mounts the subtree named by req's VolumeContext
-// read-only at req.TargetPath. DESIGN.md §22.2: this driver only ever
-// serves ROX for the `immutable` class this build implements, so any
-// request that isn't read-only is rejected here rather than silently
-// downgraded.
+// rwxContractDisjointWriters is the only value accepted for the
+// VolumeContext's rwxContract key (DESIGN.md §22.2). It opts a RWX
+// request into the `relaxed` class's disjoint-writers pattern instead of
+// being rejected outright.
+const rwxContractDisjointWriters = "disjoint-writers"
+
+// NodePublishVolume mounts the subtree named by req's VolumeContext at
+// req.TargetPath. DESIGN.md §22.2: a non-read-only request is rejected
+// unless the caller declared rwxContract: disjoint-writers, in which case
+// it's allowed but only once the opened repo's persisted class confirms
+// it's actually `relaxed` — every other class this build can open (in
+// particular `immutable`, and `session` since disjoint-writers is a
+// `relaxed`-only contract in this build) still gets rejected exactly as
+// the ROX-only build did.
 func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
@@ -107,8 +126,10 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	if target == "" {
 		return nil, status.Error(codes.InvalidArgument, "target_path is required")
 	}
-	if !isReadOnlyRequest(req) {
-		return nil, status.Error(codes.InvalidArgument, "csi.atlas.io only serves read-only volumes in this build (DESIGN.md §22.2: immutable class is ROX-only)")
+	readOnly := isReadOnlyRequest(req)
+	disjointWriters := req.GetVolumeContext()["rwxContract"] == rwxContractDisjointWriters
+	if !readOnly && !disjointWriters {
+		return nil, status.Error(codes.InvalidArgument, "csi.atlas.io only serves read-only volumes in this build unless rwxContract: disjoint-writers is set (DESIGN.md §22.2)")
 	}
 
 	repoDir, params, err := repoopen.ParamsFromMap(req.GetVolumeContext())
@@ -132,6 +153,11 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	r, err := repoopen.Open(ctx, repoDir, params)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "open repo: %v", err)
+	}
+
+	if !readOnly && r.Class != repo.ClassRelaxed {
+		r.Close()
+		return nil, status.Errorf(codes.InvalidArgument, "csi.atlas.io: rwxContract: disjoint-writers is only valid on a relaxed-class subtree (DESIGN.md §22.2); this subtree is class %q", r.Class)
 	}
 
 	mounted := make(chan *fuse.Server, 1)

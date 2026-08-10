@@ -104,4 +104,5 @@ checker against a formal model rather than from prose review.
 - The directory/inode lease-domain split (§10.5) as two separate
   invalidation scopes — collapsed to one object-level lease here.
 - Rehoming (§7.4) and the namespace-map epoch fencing — a separate TLA+
-  deliverable per DESIGN.md §27, not attempted in this build.
+  deliverable per DESIGN.md §27. That deliverable now exists: see
+  `spec/rehoming.tla` and `spec/rehoming-README.md`.

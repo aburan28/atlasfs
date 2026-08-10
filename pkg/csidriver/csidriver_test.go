@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -177,6 +178,187 @@ func TestNodePublishVolumeRejectsReadWrite(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected a read-write request to be rejected (this build is ROX-only)")
+	}
+}
+
+// rwxDisjointWritersRequest builds a MULTI_NODE_MULTI_WRITER
+// NodePublishVolumeRequest for repoDir/target with the given rwxContract
+// value (omit by passing ""), reused by the three tests below so they
+// exercise the exact same request shape except for the one field each is
+// isolating (DESIGN.md §22.2).
+func rwxDisjointWritersRequest(volumeID, repoDir, target, class, rwxContract string) *csi.NodePublishVolumeRequest {
+	vc := map[string]string{"repoPath": repoDir}
+	if class != "" {
+		vc["class"] = class
+	}
+	if rwxContract != "" {
+		vc["rwxContract"] = rwxContract
+	}
+	return &csi.NodePublishVolumeRequest{
+		VolumeId:   volumeID,
+		TargetPath: target,
+		Readonly:   false,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER},
+		},
+		VolumeContext: vc,
+	}
+}
+
+// TestNodePublishVolumeRWXDisjointWriters is the DESIGN.md §22.2
+// disjoint-writers carve-out end to end over the real CSI gRPC wire
+// protocol: a fresh `relaxed`-class repo, RWX access mode plus
+// rwxContract: disjoint-writers, and the resulting mount is genuinely
+// writable through the kernel — not just accepted and then silently
+// still read-only.
+func TestNodePublishVolumeRWXDisjointWriters(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("no /dev/fuse in this environment")
+	}
+
+	_, nodeClient, _ := startTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	repoDir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "target")
+	req := rwxDisjointWritersRequest("vol-rwx", repoDir, target, "relaxed", "disjoint-writers")
+	if _, err := nodeClient.NodePublishVolume(ctx, req); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = nodeClient.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+			VolumeId:   "vol-rwx",
+			TargetPath: target,
+		})
+	})
+
+	path := filepath.Join(target, "hello.txt")
+	if err := os.WriteFile(path, []byte("written through rwx csi mount"), 0o644); err != nil {
+		t.Fatalf("create+write through the CSI-mounted target: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back through a fresh open: %v", err)
+	}
+	if string(got) != "written through rwx csi mount" {
+		t.Fatalf("got %q, want %q", got, "written through rwx csi mount")
+	}
+}
+
+// TestNodePublishVolumeRWXWithoutContractStillRejected is the same
+// request as TestNodePublishVolumeRWXDisjointWriters, minus the
+// rwxContract parameter: DESIGN.md §22.2 says RWX on `relaxed` is
+// opt-in only, so dropping the contract must still reject exactly as it
+// did before this build understood disjoint-writers at all.
+func TestNodePublishVolumeRWXWithoutContractStillRejected(t *testing.T) {
+	_, nodeClient, _ := startTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req := rwxDisjointWritersRequest("vol-rwx-no-contract", t.TempDir(), filepath.Join(t.TempDir(), "target"), "relaxed", "")
+	if _, err := nodeClient.NodePublishVolume(ctx, req); err == nil {
+		t.Fatal("expected RWX without rwxContract to be rejected even on a relaxed-class repo")
+	}
+}
+
+// TestNodePublishVolumeRWXContractRejectedForImmutable is the same
+// request again, this time with the contract present but no class
+// parameter — repoopen.Params' zero value is ClassImmutable, so the
+// opened repo's persisted class is immutable, and DESIGN.md §22.2 rejects
+// RWX on immutable unconditionally: the contract does not override the
+// class check.
+func TestNodePublishVolumeRWXContractRejectedForImmutable(t *testing.T) {
+	_, nodeClient, _ := startTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req := rwxDisjointWritersRequest("vol-rwx-immutable", t.TempDir(), filepath.Join(t.TempDir(), "target"), "", "disjoint-writers")
+	if _, err := nodeClient.NodePublishVolume(ctx, req); err == nil {
+		t.Fatal("expected rwxContract: disjoint-writers on an immutable-class repo to be rejected")
+	}
+}
+
+// TestRWXDisjointWritersFlockIsLocalOnly investigates DESIGN.md §22.2's
+// "mounts with lock=error" clause for the disjoint-writers case. This
+// build has no RPC-level fcntl/flock forwarding in pkg/fuseserver (real,
+// separate, unbuilt scope), and NodePublishVolume does not (and, being
+// CSI-layer plumbing, cannot) change that. What this test establishes is
+// what a real flock(2) against a disjoint-writers-mounted file actually
+// does today: nothing about the mount asks the kernel to forward FUSE_LK
+// requests to userspace (fuseserver.Mount never sets
+// fuse.MountOptions.EnableLocks), so the kernel's generic VFS flock
+// implementation handles the call entirely in-kernel, node-locally, the
+// same as it would for any other filesystem. That is not a lie: two
+// independent local opens really do exclude each other, as asserted
+// below. But it is not DESIGN.md §17's `error` mode either — a second
+// node's disjoint-writers-violating flock() would get the same "success"
+// this test observes rather than the loud ENOLCK §22.2 specifies, because
+// nothing in this build's mount path implements `lock=error`. Wiring
+// EnableLocks + GetLk/SetLk/SetLkw into pkg/fuseserver to close that gap
+// is out of pkg/csidriver's scope; this test just pins down and
+// documents the current, honestly-labeled behavior.
+func TestRWXDisjointWritersFlockIsLocalOnly(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("no /dev/fuse in this environment")
+	}
+
+	_, nodeClient, _ := startTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	repoDir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "target")
+	req := rwxDisjointWritersRequest("vol-rwx-flock", repoDir, target, "relaxed", "disjoint-writers")
+	if _, err := nodeClient.NodePublishVolume(ctx, req); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = nodeClient.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+			VolumeId:   "vol-rwx-flock",
+			TargetPath: target,
+		})
+	})
+
+	path := filepath.Join(target, "lockme.txt")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatalf("create through the mount: %v", err)
+	}
+
+	f1, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f1.Close()
+	f2, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+
+	if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("first LOCK_EX|LOCK_NB: got %v, want success (nothing else holds a lock yet)", err)
+	}
+	// A second, independent local open contending for the same lock must
+	// still fail: this confirms today's behavior is real in-kernel,
+	// node-local mutual exclusion (matching DESIGN.md §17's `local`
+	// mode), not a no-op that would grant every locker "success"
+	// regardless of contention.
+	if err := syscall.Flock(int(f2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != syscall.EWOULDBLOCK {
+		t.Fatalf("contended LOCK_EX|LOCK_NB: got %v, want EWOULDBLOCK from real local exclusion", err)
+	}
+	if err := syscall.Flock(int(f1.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	// This is the crux of the gap this test documents: nothing rejected
+	// this lock attempt with ENOLCK even though the mount is under the
+	// disjoint-writers contract, because lock=error is not implemented.
+	// A caller on a second node attempting the same flock() against its
+	// own local kernel would observe the identical "success" seen here,
+	// with no cross-node exclusion behind it.
+	if err := syscall.Flock(int(f2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("LOCK_EX|LOCK_NB after release: got %v, want success (this is the gap: DESIGN.md §22.2 wants ENOLCK here under disjoint-writers, but lock=error isn't wired up)", err)
 	}
 }
 

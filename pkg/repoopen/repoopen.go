@@ -17,6 +17,8 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/aburan28/atlasfs/pkg/repo"
+	"github.com/aburan28/atlasfs/pkg/store/azure"
+	"github.com/aburan28/atlasfs/pkg/store/gcs"
 	"github.com/aburan28/atlasfs/pkg/store/local"
 	"github.com/aburan28/atlasfs/pkg/store/s3"
 )
@@ -24,12 +26,26 @@ import (
 // Params selects a backend and, for a brand-new repo, its consistency
 // class. The zero value is "local" backend, immutable class.
 type Params struct {
-	Backend    string // "local" | "s3"
+	Backend    string // "local" | "s3" | "gcs" | "azure"
 	S3Bucket   string
 	S3Region   string
 	S3Endpoint string
 	S3Prefix   string
-	Region     string // AtlasFS locator region (DESIGN.md §7.5), not the AWS region
+
+	GCSBucket string
+	GCSPrefix string
+
+	// AzureServiceURL is the account's blob endpoint, e.g.
+	// "https://<account>.blob.core.windows.net/" — or that URL plus a
+	// SAS query string, since pkg/store/azure is anonymous/SAS-only in
+	// this build (see its package doc: real AAD credential support is
+	// out of scope here, same as every other backend's auth being the
+	// SDK's own default chain rather than something this build adds to).
+	AzureServiceURL string
+	AzureContainer  string
+	AzurePrefix     string
+
+	Region string // AtlasFS locator region (DESIGN.md §7.5), not the cloud provider's region
 
 	// Class is only a hint used when repoDir holds no repo yet — see
 	// repo.OpenWithClass: reopening an existing repo always returns its
@@ -80,8 +96,26 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 			return nil, fmt.Errorf("repoopen: open s3 backend: %w", err)
 		}
 		return repo.OpenWithClass(repoDir, backend, region, class)
+	case "gcs":
+		if p.GCSBucket == "" {
+			return nil, fmt.Errorf("repoopen: gcs backend requires a bucket")
+		}
+		backend, err := gcs.New(ctx, gcs.Config{Bucket: p.GCSBucket, Prefix: p.GCSPrefix})
+		if err != nil {
+			return nil, fmt.Errorf("repoopen: open gcs backend: %w", err)
+		}
+		return repo.OpenWithClass(repoDir, backend, region, class)
+	case "azure":
+		if p.AzureServiceURL == "" || p.AzureContainer == "" {
+			return nil, fmt.Errorf("repoopen: azure backend requires a service URL and a container")
+		}
+		backend, err := azure.New(ctx, p.AzureServiceURL, azure.Config{Container: p.AzureContainer, Prefix: p.AzurePrefix})
+		if err != nil {
+			return nil, fmt.Errorf("repoopen: open azure backend: %w", err)
+		}
+		return repo.OpenWithClass(repoDir, backend, region, class)
 	default:
-		return nil, fmt.Errorf("repoopen: unknown backend %q (want local|s3)", p.Backend)
+		return nil, fmt.Errorf("repoopen: unknown backend %q (want local|s3|gcs|azure)", p.Backend)
 	}
 }
 
@@ -94,8 +128,16 @@ const (
 	KeyS3Region   = "s3Region"
 	KeyS3Endpoint = "s3Endpoint"
 	KeyS3Prefix   = "s3Prefix"
-	KeyRegion     = "region"
-	KeyClass      = "class"
+
+	KeyGCSBucket = "gcsBucket"
+	KeyGCSPrefix = "gcsPrefix"
+
+	KeyAzureServiceURL = "azureServiceURL"
+	KeyAzureContainer  = "azureContainer"
+	KeyAzurePrefix     = "azurePrefix"
+
+	KeyRegion = "region"
+	KeyClass  = "class"
 )
 
 // ParamsFromMap reads repoDir and Params out of a generic string map —
@@ -112,8 +154,16 @@ func ParamsFromMap(m map[string]string) (repoDir string, p Params, err error) {
 		S3Region:   m[KeyS3Region],
 		S3Endpoint: m[KeyS3Endpoint],
 		S3Prefix:   m[KeyS3Prefix],
-		Region:     m[KeyRegion],
-		Class:      m[KeyClass],
+
+		GCSBucket: m[KeyGCSBucket],
+		GCSPrefix: m[KeyGCSPrefix],
+
+		AzureServiceURL: m[KeyAzureServiceURL],
+		AzureContainer:  m[KeyAzureContainer],
+		AzurePrefix:     m[KeyAzurePrefix],
+
+		Region: m[KeyRegion],
+		Class:  m[KeyClass],
 	}
 	return repoDir, p, nil
 }
