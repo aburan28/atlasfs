@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
@@ -559,8 +560,44 @@ type FileReader struct {
 	m       *manifest.Manifest
 	offsets []int64
 
+	// mu guards cache/cacheQ. One FileReader backs one open fd, and the
+	// kernel serves concurrent READ requests on a single fd from several
+	// go-fuse goroutines at once — so "one handle, one goroutine" is not
+	// true here. Without this the chunk cache takes concurrent map writes
+	// and the process dies with a fatal error, not a recoverable one.
+	// (Found by a benchmark: a 16 MiB sequential read is enough
+	// parallelism to hit it, and `go test -race` never did because no
+	// test read one handle from two goroutines.)
+	mu     sync.Mutex
 	cache  map[chunk.ID][]byte
 	cacheQ []chunk.ID
+}
+
+// cached looks a chunk up under the lock.
+func (fr *FileReader) cached(id chunk.ID) ([]byte, bool) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	b, ok := fr.cache[id]
+	return b, ok
+}
+
+// store adds a chunk to the cache, evicting the oldest past the bound.
+func (fr *FileReader) store(id chunk.ID, buf []byte) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if _, dup := fr.cache[id]; dup {
+		// Another goroutine fetched the same chunk concurrently. Keeping
+		// the first is arbitrary but must be consistent: appending to
+		// cacheQ twice would evict the entry while the map still held it.
+		return
+	}
+	fr.cache[id] = buf
+	fr.cacheQ = append(fr.cacheQ, id)
+	if len(fr.cacheQ) > fileReaderCacheEntries {
+		old := fr.cacheQ[0]
+		fr.cacheQ = fr.cacheQ[1:]
+		delete(fr.cache, old)
+	}
 }
 
 const fileReaderCacheEntries = 16
@@ -617,24 +654,23 @@ func (fr *FileReader) readChunkInto(id chunk.ID, p []byte) error {
 // one by doubling — the same bytes end up cached either way, but the
 // transient garbage does not.
 func (fr *FileReader) chunkBytes(id chunk.ID) ([]byte, error) {
-	if b, ok := fr.cache[id]; ok {
+	if b, ok := fr.cached(id); ok {
 		return b, nil
 	}
 	loc, err := fr.locate(id)
 	if err != nil {
 		return nil, err
 	}
+	// The fetch happens outside the lock: it is a network round trip, and
+	// holding the cache lock across it would serialize every concurrent
+	// reader of the file behind the slowest one. Two goroutines racing on
+	// the same chunk both fetch it; store keeps one. Duplicated work on a
+	// rare race beats a lock held across I/O.
 	buf := make([]byte, loc.Length)
 	if err := pack.FetchInto(fr.ctx, fr.repo.Backend, id, loc, buf); err != nil {
 		return nil, err
 	}
-	fr.cache[id] = buf
-	fr.cacheQ = append(fr.cacheQ, id)
-	if len(fr.cacheQ) > fileReaderCacheEntries {
-		old := fr.cacheQ[0]
-		fr.cacheQ = fr.cacheQ[1:]
-		delete(fr.cache, old)
-	}
+	fr.store(id, buf)
 	return buf, nil
 }
 
@@ -680,7 +716,7 @@ func (fr *FileReader) ReadAt(p []byte, off int64) (int, error) {
 		// GPUDirect destination would take, which is why it is worth
 		// having even though the sequential-read win alone would justify
 		// it (a whole-file read is entirely made of such chunks).
-		if _, cached := fr.cache[entry.ChunkID]; !cached && localOff == 0 && len(p)-total >= int(entry.Length) {
+		if _, isCached := fr.cached(entry.ChunkID); !isCached && localOff == 0 && len(p)-total >= int(entry.Length) {
 			dst := p[total : total+int(entry.Length)]
 			if err := fr.readChunkInto(entry.ChunkID, dst); err != nil {
 				return total, err

@@ -401,11 +401,18 @@ func (r *reader) chunkBytes(ctx context.Context, id chunk.ID) ([]byte, error) {
 	}
 
 	r.mu.Lock()
-	r.cache[id] = buf
-	r.order = append(r.order, id)
-	if len(r.order) > readerCacheEntries {
-		delete(r.cache, r.order[0])
-		r.order = r.order[1:]
+	if _, dup := r.cache[id]; !dup {
+		// Two goroutines can fetch the same chunk concurrently — the
+		// fetch deliberately happens outside the lock. Appending the id
+		// to order twice would let one eviction drop an entry the second
+		// copy still accounts for, so the cache would shrink below its
+		// bound over time.
+		r.cache[id] = buf
+		r.order = append(r.order, id)
+		if len(r.order) > readerCacheEntries {
+			delete(r.cache, r.order[0])
+			r.order = r.order[1:]
+		}
 	}
 	r.mu.Unlock()
 	return buf, nil
