@@ -492,6 +492,8 @@ func errnoFor(err error) syscall.Errno {
 		return syscall.ENOTDIR
 	case errors.Is(err, repo.ErrNotEmpty):
 		return syscall.ENOTEMPTY
+	case errors.Is(err, repo.ErrQuotaExceeded):
+		return syscall.EDQUOT
 	default:
 		return syscall.EIO
 	}

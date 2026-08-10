@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -350,6 +352,59 @@ func TestWriteFileHandleMultipleFlushesCommitLatestContent(t *testing.T) {
 	}
 	if string(got) != "the actual new content" {
 		t.Fatalf("got %q, want %q — a later Flush must still be able to commit after an earlier one already fired", got, "the actual new content")
+	}
+}
+
+// TestMountWriteOverQuotaFailsWithEDQUOT is the end-to-end check for
+// DESIGN.md §18.3 the task calls for: a write past the repo's byte
+// quota must fail at the real syscall level (EDQUOT), not merely at the
+// pkg/repo API. Node.Create commits an empty file first (0 bytes, 1
+// inode, within any reasonable limit), so the rejection has to come
+// from the buffered content's Flush-on-close — exactly the ordinary
+// close(2) path a shell redirection or a real application would hit.
+func TestMountWriteOverQuotaFailsWithEDQUOT(t *testing.T) {
+	repoDir := t.TempDir()
+	r, err := repo.OpenWithClass(repoDir, mustLocalBackend(t, repoDir), repo.DefaultRegion, repo.ClassRelaxed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.SetQuota(5, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	mountpoint := mountForTest(t, r)
+	path := filepath.Join(mountpoint, "toobig.bin")
+
+	err = os.WriteFile(path, bytes.Repeat([]byte("x"), 4096), 0o644)
+	if err == nil {
+		t.Fatal("expected a write past the byte quota to fail")
+	}
+	if !errors.Is(err, syscall.EDQUOT) {
+		t.Fatalf("expected EDQUOT, got %v", err)
+	}
+
+	// Node.Create commits an empty file before the buffered write is
+	// ever flushed (see its doc comment), so the pre-write state here is
+	// a real, empty file — not absence — and that is what must survive
+	// the rejected content commit: no partial/oversized content, but
+	// also nothing spuriously deleted.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("expected the pre-write (empty) file to still exist, got %v", err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("expected the rejected write to leave the file at its pre-write size 0, got %d", info.Size())
+	}
+	bytesUsed, inodesUsed, err := r.QuotaUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesUsed != 0 {
+		t.Fatalf("bytesUsed after a rejected write = %d, want 0", bytesUsed)
+	}
+	if inodesUsed != 1 {
+		t.Fatalf("inodesUsed after a rejected write = %d, want 1 (the empty file Create committed)", inodesUsed)
 	}
 }
 

@@ -30,15 +30,30 @@ import (
 // like pkg/fuseserver can map each one to the right errno instead of a
 // generic EIO for everything.
 var (
-	ErrReadOnly    = errors.New("repo: repo is immutable-class, read-only")
-	ErrExists      = errors.New("repo: name already exists")
-	ErrIsDirectory = errors.New("repo: is a directory")
-	ErrNotDir      = errors.New("repo: not a directory")
-	ErrNotEmpty    = errors.New("repo: directory not empty")
+	ErrReadOnly      = errors.New("repo: repo is immutable-class, read-only")
+	ErrExists        = errors.New("repo: name already exists")
+	ErrIsDirectory   = errors.New("repo: is a directory")
+	ErrNotDir        = errors.New("repo: not a directory")
+	ErrNotEmpty      = errors.New("repo: directory not empty")
+	ErrQuotaExceeded = errors.New("repo: quota exceeded")
 )
 
 func InodeCoherenceKey(id metadb.InodeID) string { return fmt.Sprintf("inode:%d", id) }
 func DirCoherenceKey(id metadb.InodeID) string   { return fmt.Sprintf("dir:%d", id) }
+
+// SetQuota sets this repo's byte and inode limits (DESIGN.md §18.3). A
+// zero value means unlimited for that dimension. This build has exactly
+// one subtree per repo (see pkg/metadb's package doc), so there is one
+// quota scope rather than a per-subtree one.
+func (r *Repo) SetQuota(bytesLimit, inodesLimit uint64) error {
+	return r.DB.SetQuotaLimits(bytesLimit, inodesLimit)
+}
+
+// QuotaUsage reports current byte and inode usage against this repo's
+// quota (DESIGN.md §18.3).
+func (r *Repo) QuotaUsage() (bytesUsed, inodesUsed uint64, err error) {
+	return r.DB.GetQuotaUsage()
+}
 
 // WriteHandle buffers a new or replacement file's content. Nothing is
 // visible in the namespace until Commit.
@@ -88,6 +103,44 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 	h.done = true
 	r := h.repo
 
+	// Resolve the target name before doing any real storage work, both
+	// to compute the byte delta an overwrite charges (new size minus old
+	// size — an overwrite must not double-count the bytes it replaces)
+	// and to reject an over-quota write via CheckQuota before chunking,
+	// hashing, and packing content that would just be thrown away: a
+	// rejection here leaves no dangling chunk locator. CommitFile below
+	// re-resolves and re-checks atomically with the actual write, which
+	// is what actually enforces the limit (DESIGN.md §18.3) — this is
+	// only the fast, non-authoritative path that keeps the common case
+	// cheap and trace-free.
+	existing, lookupErr := r.DB.Lookup(h.dir, h.name)
+	isNew := errors.Is(lookupErr, metadb.ErrNotFound)
+	var oldSize uint64
+	switch {
+	case lookupErr == nil:
+		existingRec, err := r.DB.GetInode(existing)
+		if err != nil {
+			return 0, err
+		}
+		if existingRec.IsDir {
+			return 0, fmt.Errorf("%w: %q", ErrIsDirectory, h.name)
+		}
+		oldSize = existingRec.Size
+	case isNew:
+		// nothing bound yet: oldSize stays 0
+	default:
+		return 0, lookupErr
+	}
+
+	inodeDelta := int64(0)
+	if isNew {
+		inodeDelta = 1
+	}
+	byteDelta := int64(h.buf.Len()) - int64(oldSize)
+	if err := r.DB.CheckQuota(byteDelta, inodeDelta); err != nil {
+		return 0, ErrQuotaExceeded
+	}
+
 	content, err := r.storeContent(ctx, bytes.NewReader(h.buf.Bytes()), int64(h.buf.Len()))
 	if err != nil {
 		return 0, err
@@ -104,35 +157,17 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 		return 0, err
 	}
 
-	existing, lookupErr := r.DB.Lookup(h.dir, h.name)
-	var id metadb.InodeID
-	isNew := errors.Is(lookupErr, metadb.ErrNotFound)
-	switch {
-	case lookupErr == nil:
-		existingRec, err := r.DB.GetInode(existing)
-		if err != nil {
-			return 0, err
-		}
-		if existingRec.IsDir {
-			return 0, fmt.Errorf("%w: %q", ErrIsDirectory, h.name)
-		}
-		id = existing
-	case isNew:
-		id, err = r.DB.AllocInode()
-		if err != nil {
-			return 0, err
-		}
-	default:
-		return 0, lookupErr
-	}
-
 	rec := metadb.InodeRecord{Mode: 0o644, MTime: time.Now(), NLink: 1}
 	content.apply(&rec)
-	if err := r.DB.PutInode(id, rec); err != nil {
-		return 0, err
-	}
-	if isNew {
-		if err := r.DB.SetDentry(h.dir, h.name, id); err != nil {
+
+	id, err := r.DB.CommitFile(h.dir, h.name, rec)
+	if err != nil {
+		switch {
+		case errors.Is(err, metadb.ErrIsDirectory):
+			return 0, fmt.Errorf("%w: %q", ErrIsDirectory, h.name)
+		case errors.Is(err, metadb.ErrQuotaExceeded):
+			return 0, ErrQuotaExceeded
+		default:
 			return 0, err
 		}
 	}
@@ -154,7 +189,7 @@ func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 	if !r.Class.Mutable() {
 		return ErrReadOnly
 	}
-	if err := r.DB.RemoveDentry(dir, name); err != nil {
+	if err := r.DB.RemoveEntry(dir, name); err != nil {
 		return err
 	}
 	if r.Coherence != nil {
@@ -170,20 +205,16 @@ func (r *Repo) Mkdir(dir metadb.InodeID, name string) (metadb.InodeID, error) {
 	if !r.Class.Mutable() {
 		return 0, ErrReadOnly
 	}
-	if _, err := r.DB.Lookup(dir, name); err == nil {
-		return 0, fmt.Errorf("%w: %q", ErrExists, name)
-	} else if !errors.Is(err, metadb.ErrNotFound) {
-		return 0, err
-	}
-	id, err := r.DB.AllocInode()
+	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2})
 	if err != nil {
-		return 0, err
-	}
-	if err := r.DB.PutInode(id, metadb.InodeRecord{IsDir: true, Mode: 0o755, MTime: time.Now(), NLink: 2}); err != nil {
-		return 0, err
-	}
-	if err := r.DB.SetDentry(dir, name, id); err != nil {
-		return 0, err
+		switch {
+		case errors.Is(err, metadb.ErrExists):
+			return 0, fmt.Errorf("%w: %q", ErrExists, name)
+		case errors.Is(err, metadb.ErrQuotaExceeded):
+			return 0, ErrQuotaExceeded
+		default:
+			return 0, err
+		}
 	}
 	if r.Coherence != nil {
 		r.Coherence.BumpDir(DirCoherenceKey(dir))
@@ -216,7 +247,7 @@ func (r *Repo) Rmdir(dir metadb.InodeID, name string) error {
 	if len(entries) > 0 {
 		return fmt.Errorf("%w: %q", ErrNotEmpty, name)
 	}
-	if err := r.DB.RemoveDentry(dir, name); err != nil {
+	if err := r.DB.RemoveEntry(dir, name); err != nil {
 		return err
 	}
 	if r.Coherence != nil {

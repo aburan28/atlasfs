@@ -14,6 +14,15 @@
 // single-process build has no second holder to exercise (see
 // pkg/coherence's doc comment). `immutable`, `relaxed`, and `session`
 // are.
+//
+// Quotas (DESIGN.md §18.3) are per-subtree in the general design, but
+// this build has exactly one subtree per repo (no subtree-boundary
+// tracking, same simplification as the consistency class above), so
+// there is a single root-scope quota record rather than one keyed by
+// subtree_id. The commit paths (CommitFile, CommitMkdir) charge it in
+// the same bbolt transaction as the inode/dentry mutation they guard —
+// the single-node stand-in for §18.3's "the counter can be updated in
+// the same FDB transaction as the mutation using an atomic add."
 package metadb
 
 import (
@@ -41,11 +50,14 @@ var (
 	bucketInode   = []byte("inode")   // inodeID -> gob(InodeRecord)
 	bucketLocator = []byte("locator") // (region||0x00||chunkID) -> gob(pack.Locator)
 	bucketMeta    = []byte("meta")    // "next_inode" -> uint64
+	bucketQuota   = []byte("quota")   // "root" -> gob(quotaRecord), see package doc
 )
 
 var ErrNotFound = errors.New("metadb: not found")
 var ErrExists = errors.New("metadb: already exists")
 var ErrNotDir = errors.New("metadb: not a directory")
+var ErrIsDirectory = errors.New("metadb: is a directory")
+var ErrQuotaExceeded = errors.New("metadb: quota exceeded")
 
 // InodeRecord is the attrs+content-pointer record from DESIGN.md §7's
 // inode layer. A file is either a manifest reference (multi-chunk) or an
@@ -85,7 +97,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("metadb: open: %w", err)
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta} {
+		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -155,15 +167,20 @@ func advanceSeqTo(tx *bbolt.Tx, n uint64) error {
 	return nil
 }
 
+func allocInodeTx(tx *bbolt.Tx) (InodeID, error) {
+	n, err := tx.Bucket(bucketMeta).NextSequence()
+	if err != nil {
+		return 0, err
+	}
+	return InodeID(n), nil
+}
+
 func (db *DB) AllocInode() (InodeID, error) {
 	var id InodeID
 	err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		n, err := tx.Bucket(bucketMeta).NextSequence()
-		if err != nil {
-			return err
-		}
-		id = InodeID(n)
-		return nil
+		var err error
+		id, err = allocInodeTx(tx)
+		return err
 	})
 	return id, err
 }
@@ -254,10 +271,14 @@ func (db *DB) SetDentry(dir InodeID, name string, child InodeID) error {
 		if !rec.IsDir {
 			return ErrNotDir
 		}
-		var v [8]byte
-		binary.BigEndian.PutUint64(v[:], uint64(child))
-		return tx.Bucket(bucketDentry).Put(dentryKey(dir, name), v[:])
+		return setDentryTx(tx, dir, name, child)
 	})
+}
+
+func setDentryTx(tx *bbolt.Tx, dir InodeID, name string, child InodeID) error {
+	var v [8]byte
+	binary.BigEndian.PutUint64(v[:], uint64(child))
+	return tx.Bucket(bucketDentry).Put(dentryKey(dir, name), v[:])
 }
 
 // RemoveDentry unbinds name within dir. Returns ErrNotFound if no such
@@ -277,6 +298,29 @@ func (db *DB) RemoveDentry(dir InodeID, name string) error {
 	})
 }
 
+// RemoveEntry is RemoveDentry plus the quota release the write path
+// needs: it unbinds name in dir and, in the same bbolt transaction,
+// credits back the removed inode's charge (its stored Size in bytes,
+// one inode) so quota usage tracks live content across unlink/rmdir
+// rather than only ever growing (DESIGN.md §18.3). Like RemoveDentry,
+// the inode record itself is left in place.
+func (db *DB) RemoveEntry(dir InodeID, name string) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		id, err := lookupTx(tx, dir, name)
+		if err != nil {
+			return err
+		}
+		rec, err := getInodeTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketDentry).Delete(dentryKey(dir, name)); err != nil {
+			return err
+		}
+		return applyQuotaDeltaTx(tx, -int64(rec.Size), -1)
+	})
+}
+
 func getInodeTx(tx *bbolt.Tx, id InodeID) (InodeRecord, error) {
 	var rec InodeRecord
 	v := tx.Bucket(bucketInode).Get(inodeKey(id))
@@ -287,15 +331,20 @@ func getInodeTx(tx *bbolt.Tx, id InodeID) (InodeRecord, error) {
 	return rec, err
 }
 
+func lookupTx(tx *bbolt.Tx, dir InodeID, name string) (InodeID, error) {
+	v := tx.Bucket(bucketDentry).Get(dentryKey(dir, name))
+	if v == nil {
+		return 0, ErrNotFound
+	}
+	return InodeID(binary.BigEndian.Uint64(v)), nil
+}
+
 func (db *DB) Lookup(dir InodeID, name string) (InodeID, error) {
 	var id InodeID
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		v := tx.Bucket(bucketDentry).Get(dentryKey(dir, name))
-		if v == nil {
-			return ErrNotFound
-		}
-		id = InodeID(binary.BigEndian.Uint64(v))
-		return nil
+		var err error
+		id, err = lookupTx(tx, dir, name)
+		return err
 	})
 	return id, err
 }
@@ -418,4 +467,232 @@ func (db *DB) GetLocator(region string, id chunk.ID) (pack.Locator, bool, error)
 func (db *DB) HasLocator(region string, id chunk.ID) (bool, error) {
 	_, found, err := db.GetLocator(region, id)
 	return found, err
+}
+
+// --- quotas (DESIGN.md §18.3) --------------------------------------------
+
+// quotaKeyRoot is the sole key in bucketQuota — see the package doc
+// comment on why this build has one quota scope rather than one per
+// subtree_id.
+var quotaKeyRoot = []byte("root")
+
+type quotaRecord struct {
+	BytesUsed, InodesUsed   uint64
+	BytesLimit, InodesLimit uint64 // 0 means unlimited
+}
+
+func getQuotaTx(tx *bbolt.Tx) (quotaRecord, error) {
+	var q quotaRecord
+	v := tx.Bucket(bucketQuota).Get(quotaKeyRoot)
+	if v == nil {
+		return q, nil // no limits set yet: zero value is "unlimited, nothing used"
+	}
+	err := gob.NewDecoder(bytes.NewReader(v)).Decode(&q)
+	return q, err
+}
+
+func putQuotaTx(tx *bbolt.Tx, q quotaRecord) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(q); err != nil {
+		return err
+	}
+	return tx.Bucket(bucketQuota).Put(quotaKeyRoot, buf.Bytes())
+}
+
+// addDelta applies delta (which may be negative, e.g. an unlink or a
+// shrinking overwrite) to u, clamping at zero rather than wrapping —
+// defensive only: a correct caller never drives usage negative, but
+// uint64 underflow on a bug here would silently corrupt the counter
+// instead of erroring.
+func addDelta(u uint64, delta int64) uint64 {
+	if delta >= 0 {
+		return u + uint64(delta)
+	}
+	dec := uint64(-delta)
+	if dec > u {
+		return 0
+	}
+	return u - dec
+}
+
+// checkQuota reports ErrQuotaExceeded if applying the deltas to q would
+// cross a set (non-zero) limit. A negative delta (freeing usage) never
+// rejects, regardless of limit.
+func checkQuota(q quotaRecord, byteDelta, inodeDelta int64) error {
+	if q.BytesLimit > 0 && byteDelta > 0 && addDelta(q.BytesUsed, byteDelta) > q.BytesLimit {
+		return ErrQuotaExceeded
+	}
+	if q.InodesLimit > 0 && inodeDelta > 0 && addDelta(q.InodesUsed, inodeDelta) > q.InodesLimit {
+		return ErrQuotaExceeded
+	}
+	return nil
+}
+
+// applyQuotaDeltaTx is the one place usage is ever mutated: check then
+// write, both inside the caller's existing bbolt transaction. Every
+// commit path below calls this in the same tx.Update as its
+// inode/dentry write, which is what makes a quota rejection abort the
+// whole transaction — DESIGN.md §18.3's "the counter can be updated in
+// the same ... transaction as the mutation using an atomic add" — rather
+// than a separate check-then-write that could persist the mutation the
+// check meant to block.
+func applyQuotaDeltaTx(tx *bbolt.Tx, byteDelta, inodeDelta int64) error {
+	q, err := getQuotaTx(tx)
+	if err != nil {
+		return err
+	}
+	if err := checkQuota(q, byteDelta, inodeDelta); err != nil {
+		return err
+	}
+	q.BytesUsed = addDelta(q.BytesUsed, byteDelta)
+	q.InodesUsed = addDelta(q.InodesUsed, inodeDelta)
+	return putQuotaTx(tx, q)
+}
+
+// SetQuotaLimits sets this repo's byte and inode limits. A zero limit
+// means unlimited for that dimension.
+func (db *DB) SetQuotaLimits(bytesLimit, inodesLimit uint64) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		q, err := getQuotaTx(tx)
+		if err != nil {
+			return err
+		}
+		q.BytesLimit = bytesLimit
+		q.InodesLimit = inodesLimit
+		return putQuotaTx(tx, q)
+	})
+}
+
+// GetQuotaUsage reports current byte and inode usage.
+func (db *DB) GetQuotaUsage() (bytesUsed, inodesUsed uint64, err error) {
+	err = db.bolt.View(func(tx *bbolt.Tx) error {
+		q, err := getQuotaTx(tx)
+		if err != nil {
+			return err
+		}
+		bytesUsed, inodesUsed = q.BytesUsed, q.InodesUsed
+		return nil
+	})
+	return
+}
+
+// CheckQuota reports ErrQuotaExceeded if applying (byteDelta, inodeDelta)
+// to current usage would cross a set limit, without changing anything.
+// It is a cheap, non-authoritative early-out: a caller like
+// WriteHandle.Commit uses it to reject an over-quota write before doing
+// any real chunking/storage work, so a rejection leaves no dangling
+// chunk locator behind. The actual guarantee against exceeding a limit
+// comes from CommitFile/CommitMkdir's atomic check-and-update in the
+// same transaction as their mutation, not from this pre-check.
+func (db *DB) CheckQuota(byteDelta, inodeDelta int64) error {
+	return db.bolt.View(func(tx *bbolt.Tx) error {
+		q, err := getQuotaTx(tx)
+		if err != nil {
+			return err
+		}
+		return checkQuota(q, byteDelta, inodeDelta)
+	})
+}
+
+// --- atomic commit paths (mutation + quota charge in one transaction) ---
+
+// CommitFile atomically resolves name within dir to an inode — reusing
+// the existing inode if name is already bound to a (non-directory) file,
+// allocating a fresh one and binding a new dentry otherwise — writes rec
+// as that inode's record, and charges the quota for the resulting byte
+// and inode delta, all within one bbolt transaction. Returns
+// ErrIsDirectory if name is already bound to a directory, ErrNotDir if
+// dir is not a directory, and ErrQuotaExceeded (transaction aborted,
+// nothing persisted) if applying rec would exceed a set limit.
+func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID, err error) {
+	err = db.bolt.Update(func(tx *bbolt.Tx) error {
+		dirRec, err := getInodeTx(tx, dir)
+		if err != nil {
+			return err
+		}
+		if !dirRec.IsDir {
+			return ErrNotDir
+		}
+
+		existing, lookupErr := lookupTx(tx, dir, name)
+		isNew := errors.Is(lookupErr, ErrNotFound)
+		var oldSize uint64
+		switch {
+		case lookupErr == nil:
+			existingRec, err := getInodeTx(tx, existing)
+			if err != nil {
+				return err
+			}
+			if existingRec.IsDir {
+				return ErrIsDirectory
+			}
+			id = existing
+			oldSize = existingRec.Size
+		case isNew:
+			newID, err := allocInodeTx(tx)
+			if err != nil {
+				return err
+			}
+			id = newID
+		default:
+			return lookupErr
+		}
+
+		inodeDelta := int64(0)
+		if isNew {
+			inodeDelta = 1
+		}
+		if err := applyQuotaDeltaTx(tx, int64(rec.Size)-int64(oldSize), inodeDelta); err != nil {
+			return err
+		}
+		if err := putInode(tx, id, rec); err != nil {
+			return err
+		}
+		if isNew {
+			return setDentryTx(tx, dir, name, id)
+		}
+		return nil
+	})
+	return id, err
+}
+
+// CommitMkdir atomically binds a new directory inode at (dir, name) and
+// charges the quota for one inode — lookup, alloc, quota check, inode
+// write, and dentry bind all happen in the same bbolt transaction, so a
+// quota rejection aborts cleanly: no orphan inode, no dangling dentry.
+// Returns ErrExists if name is already bound to anything, ErrNotDir if
+// dir is not a directory, and ErrQuotaExceeded (nothing persisted) if
+// the new inode would exceed a set inode limit.
+func (db *DB) CommitMkdir(dir InodeID, name string, rec InodeRecord) (InodeID, error) {
+	var id InodeID
+	err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		dirRec, err := getInodeTx(tx, dir)
+		if err != nil {
+			return err
+		}
+		if !dirRec.IsDir {
+			return ErrNotDir
+		}
+		if _, err := lookupTx(tx, dir, name); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		newID, err := allocInodeTx(tx)
+		if err != nil {
+			return err
+		}
+		if err := applyQuotaDeltaTx(tx, 0, 1); err != nil {
+			return err
+		}
+		if err := putInode(tx, newID, rec); err != nil {
+			return err
+		}
+		if err := setDentryTx(tx, dir, name, newID); err != nil {
+			return err
+		}
+		id = newID
+		return nil
+	})
+	return id, err
 }
