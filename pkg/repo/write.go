@@ -264,8 +264,19 @@ func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 	if !r.Class.Mutable() {
 		return ErrReadOnly
 	}
+	// Resolve before removing: the inode's own lease has to be bumped
+	// too. DESIGN.md §10.5 puts nlink in the inode's domain — "bumped by
+	// ... link/unlink (via nlink)" — and an unlink changes it. Without
+	// this a holder that reached the file by another name keeps serving
+	// the pre-unlink link count for a full lease, which xfstests
+	// generic/002 catches by removing twenty links one at a time and
+	// watching the count fail to move.
+	id, lookupErr := r.DB.Lookup(dir, name)
 	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
 		return err
+	}
+	if lookupErr == nil && r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
 	}
 	r.bumpDirEntries(dir)
 	return nil
@@ -322,6 +333,9 @@ func (r *Repo) Rmdir(dir metadb.InodeID, name string) error {
 	}
 	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
 		return err
+	}
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
 	}
 	r.bumpDirEntries(dir)
 	return nil

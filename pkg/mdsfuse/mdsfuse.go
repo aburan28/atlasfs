@@ -83,6 +83,12 @@ type Config struct {
 	ChunkSize      int
 	ChunkAlignment int
 
+	// FsName is the source name reported in /proc/mounts; empty means
+	// "atlasfs-mds". A mount(8) helper needs to control it, since
+	// mount(8) and findmnt identify a mount by the device string they
+	// were given.
+	FsName string
+
 	// AllowOther lets users other than the mounting one reach the
 	// filesystem. Without it the kernel refuses every access from a
 	// different uid before any permission check runs. A CSI volume needs
@@ -121,6 +127,10 @@ func Mount(ctx context.Context, cfg Config, mountpoint string, onMounted func(*f
 	if cfg.AllowOther {
 		opts = append(opts, "allow_other")
 	}
+	fsName := cfg.FsName
+	if fsName == "" {
+		fsName = "atlasfs-mds"
+	}
 	ttl := cfg.KernelCacheTTL
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
 		EntryTimeout: &ttl,
@@ -137,7 +147,7 @@ func Mount(ctx context.Context, cfg Config, mountpoint string, onMounted func(*f
 		// kernel-side miss cache would mask a create on another holder
 		// with no way to invalidate it.
 		MountOptions: fuse.MountOptions{
-			FsName:      "atlasfs-mds",
+			FsName:      fsName,
 			Name:        "atlasfs",
 			DirectMount: true,
 			Options:     opts,

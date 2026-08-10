@@ -1003,7 +1003,18 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 // disturb existing callers.
 type MountOption func(*mountConfig)
 
-type mountConfig struct{ allowOther bool }
+type mountConfig struct {
+	allowOther bool
+	fsName     string
+}
+
+// FsName sets the source name the mount reports in /proc/mounts.
+//
+// It defaults to "atlasfs". A mount(8) helper needs to control it,
+// because mount(8) and findmnt identify a mount by the device string
+// they were given — an xfstests run, for one, cannot find its own test
+// filesystem otherwise.
+func FsName(name string) MountOption { return func(c *mountConfig) { c.fsName = name } }
 
 // AllowOther lets users other than the one who mounted reach the
 // filesystem.
@@ -1051,6 +1062,10 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 	if cfg.allowOther {
 		opts = append(opts, "allow_other")
 	}
+	fsName := cfg.fsName
+	if fsName == "" {
+		fsName = "atlasfs"
+	}
 	// Let the kernel cache attrs and dentries for exactly this class's
 	// D (repo.Class.KernelCacheTTL). Leaving these nil — go-fuse's
 	// default — means a zero timeout, so every getattr and every lookup
@@ -1077,7 +1092,7 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 		// masked for up to ttl with no way to invalidate it. Paying the
 		// round trip on misses is the cost of keeping §10.4's guarantee.
 		MountOptions: fuse.MountOptions{
-			FsName: "atlasfs",
+			FsName: fsName,
 			Name:   "atlasfs",
 			// DirectMount: call mount(2) ourselves instead of shelling
 			// out to fusermount, which is frequently absent (e.g.

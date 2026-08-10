@@ -210,3 +210,43 @@ func TestHardLinkOnAFifo(t *testing.T) {
 		}
 	}
 }
+
+// TestUnlinkInvalidatesTheInodesOwnLease: DESIGN.md §10.5 puts nlink in
+// the inode's lease domain — "bumped by ... link/unlink (via nlink)" —
+// and an unlink changes it. Bumping only the directory leaves a holder
+// that reached the file by another name serving the pre-unlink count for
+// a full lease. xfstests generic/002 catches it by removing twenty links
+// one at a time and watching the count fail to move.
+func TestUnlinkInvalidatesTheInodesOwnLease(t *testing.T) {
+	_, mnt := mountWritable(t)
+	a := filepath.Join(mnt, "a")
+	if err := os.WriteFile(a, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"b", "c", "d"}
+	for _, n := range names {
+		if err := os.Link(a, filepath.Join(mnt, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := statOf(t, a).Nlink; n != 4 {
+		t.Fatalf("nlink after three links = %d, want 4", n)
+	}
+	// Stat every name first, so each is cached under its lease, then
+	// remove them one at a time and check the survivor's count each time.
+	want := uint64(4)
+	for _, n := range names {
+		for _, name := range append([]string{"a"}, names...) {
+			if _, err := os.Lstat(filepath.Join(mnt, name)); err == nil {
+				continue
+			}
+		}
+		if err := os.Remove(filepath.Join(mnt, n)); err != nil {
+			t.Fatal(err)
+		}
+		want--
+		if got := statOf(t, a).Nlink; got != want {
+			t.Fatalf("after removing %q, the surviving name reports nlink %d, want %d", n, got, want)
+		}
+	}
+}
