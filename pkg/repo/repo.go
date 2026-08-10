@@ -227,6 +227,25 @@ func OpenWithClass(dir string, backend store.Backend, region string, class Class
 	return r, nil
 }
 
+// SetChunkAlignment makes every chunk this repo packs from now on start
+// on an n-byte boundary within its container. Pass pack.GDSAlignment to
+// make containers readable by GPUDirect Storage without falling into its
+// bounce-buffer path; pass 0 for tight packing (the default).
+//
+// This is a per-deployment choice with a real cost, not a free
+// improvement: measured at ~4x container inflation for 1 KiB files
+// (pkg/pack's TestAlignmentPaddingCost), because DESIGN.md §14's
+// small-file packing is exactly what padding undoes. Datasets read by
+// GPUs want it; a repo full of small files read by CPUs does not.
+//
+// Existing chunks are unaffected — their locators already point at
+// wherever they were written, and alignment changes nothing about how a
+// locator is interpreted.
+func (r *Repo) SetChunkAlignment(n int) { r.packer.SetAlignment(n) }
+
+// ChunkAlignment reports the current chunk-start alignment.
+func (r *Repo) ChunkAlignment() int { return r.packer.Alignment() }
+
 func (r *Repo) Close() error { return r.DB.Close() }
 
 func manifestKey(id manifest.ID) string {

@@ -51,6 +51,21 @@ func newContainerID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// GDSAlignment is the 4 KiB boundary NVIDIA GPUDirect Storage requires
+// of a read's file offset, size, device pointer, and device-buffer
+// offset. An I/O missing any of those is "unaligned" and GDS handles it
+// by staging through internal GPU bounce buffers — which works, and
+// costs exactly the copy that GDS exists to remove.
+//
+// This matters here because of how containers are built. DESIGN.md §5.5
+// packs chunks back to back, so a chunk's offset within its container is
+// wherever the previous chunk happened to end: essentially never 4 KiB
+// aligned. A GDS read of such a chunk is therefore unaligned by
+// construction, every time, and the whole feature degrades to a slower
+// POSIX read with extra steps. Alignment is not an optimization on top
+// of a GDS backend, it is a precondition for one.
+const GDSAlignment = 4096
+
 // Packer accumulates chunks into a container buffer and seals it to a
 // Backend once it reaches sealSize (or on an explicit Seal call). It is
 // not safe for concurrent use — DESIGN.md's per-node packer (§5.5) is
@@ -59,6 +74,15 @@ type Packer struct {
 	backend  store.Backend
 	region   string
 	sealSize int
+
+	// align, when > 0, pads each chunk's start to a multiple of it, so
+	// every locator offset is aligned (see GDSAlignment). Off by default
+	// because it is not free: padding is wasted bytes in the container,
+	// and §14's whole point is packing many small files tightly. A 1 KiB
+	// file padded to 4 KiB is a 4x storage penalty on exactly the
+	// workload packing was designed for, so this is a deployment choice
+	// — turn it on where GPUs read the data, leave it off elsewhere.
+	align int
 
 	buf     bytes.Buffer
 	pending []pendingEntry
@@ -77,10 +101,35 @@ func NewPacker(backend store.Backend, region string, sealSize int) *Packer {
 	return &Packer{backend: backend, region: region, sealSize: sealSize}
 }
 
+// SetAlignment makes every subsequent chunk start on a multiple of n
+// bytes within its container. Pass GDSAlignment for GPUDirect; pass 0 to
+// pack tightly (the default). Changing it mid-container only affects
+// chunks added after the call — already-recorded offsets are not moved,
+// since a locator handed out earlier must keep pointing at the same
+// bytes.
+func (p *Packer) SetAlignment(n int) {
+	if n < 0 {
+		n = 0
+	}
+	p.align = n
+}
+
+// Alignment reports the current chunk-start alignment (0 = packed
+// tightly).
+func (p *Packer) Alignment() int { return p.align }
+
 // Add appends c to the current container buffer, recording its offset.
 // Locators for it are only valid once the container containing it is
 // sealed — call Full to know when to Seal.
 func (p *Packer) Add(c chunk.Chunk) {
+	if p.align > 1 {
+		// Pad forward to the next boundary. The padding bytes are never
+		// read: a locator addresses (offset, length) exactly, so the gap
+		// is invisible to every reader and costs only storage.
+		if rem := p.buf.Len() % p.align; rem != 0 {
+			p.buf.Write(make([]byte, p.align-rem))
+		}
+	}
 	off := int64(p.buf.Len())
 	p.buf.Write(c.Data)
 	p.pending = append(p.pending, pendingEntry{id: c.ID, offset: off, length: int64(len(c.Data))})

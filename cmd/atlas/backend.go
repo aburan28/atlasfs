@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 
+	"github.com/aburan28/atlasfs/pkg/pack"
 	"github.com/aburan28/atlasfs/pkg/repo"
 	"github.com/aburan28/atlasfs/pkg/repoopen"
+	"github.com/aburan28/atlasfs/pkg/store/dragonfly"
 )
 
 // backendFlags is the CLI's surface for DESIGN.md §24's pluggable
@@ -26,6 +28,10 @@ type backendFlags struct {
 	azureContainer  string
 	azurePrefix     string
 
+	dragonflyProxy string
+	dragonflyTag   string
+	gdsAlign       bool
+
 	region string
 	class  string
 }
@@ -41,6 +47,11 @@ func addBackendFlags(fs *flag.FlagSet, bf *backendFlags) {
 	fs.StringVar(&bf.azureServiceURL, "azure-service-url", "", "account blob endpoint, optionally with a SAS query string (--backend=azure); this build is anonymous/SAS-only, no AAD credentials")
 	fs.StringVar(&bf.azureContainer, "azure-container", "", "container name (--backend=azure)")
 	fs.StringVar(&bf.azurePrefix, "azure-prefix", "", "key prefix within the container (--backend=azure)")
+	fs.StringVar(&bf.dragonflyProxy, "dragonfly-proxy", "",
+		"route object GETs through a Dragonfly (d7y.io) peer for P2P chunk exchange (DESIGN.md §11.1); \"auto\" uses "+dragonfly.DefaultProxyURL+". Applies to -backend=s3.")
+	fs.StringVar(&bf.dragonflyTag, "dragonfly-tag", "", "X-Dragonfly-Tag, separating otherwise-identical URLs into distinct P2P tasks")
+	fs.BoolVar(&bf.gdsAlign, "gds-align", false,
+		"pad every chunk to a 4 KiB boundary within its container so GPUDirect Storage reads are aligned (pack.GDSAlignment). Costs container space — ~4x for 1 KiB files — so enable it only where GPUs read the data.")
 	fs.StringVar(&bf.region, "region", repo.DefaultRegion, "AtlasFS region label for chunk locators (DESIGN.md §7.5) — not the cloud provider's region")
 	fs.StringVar(&bf.class, "class", string(repo.ClassImmutable),
 		"consistency class for a brand-new repo (DESIGN.md §8): immutable|relaxed|session. Ignored when repo-dir already holds a repo — its persisted class always wins. posix is served by atlas-mds, not by a local mount.")
@@ -52,6 +63,17 @@ func addBackendFlags(fs *flag.FlagSet, bf *backendFlags) {
 // IMDS) via awsconfig.LoadDefaultConfig — this CLI never takes a
 // secret key as a flag.
 func openRepo(ctx context.Context, repoDir string, bf backendFlags) (*repo.Repo, error) {
+	r, err := openRepoInner(ctx, repoDir, bf)
+	if err != nil {
+		return nil, err
+	}
+	if bf.gdsAlign {
+		r.SetChunkAlignment(pack.GDSAlignment)
+	}
+	return r, nil
+}
+
+func openRepoInner(ctx context.Context, repoDir string, bf backendFlags) (*repo.Repo, error) {
 	return repoopen.Open(ctx, repoDir, repoopen.Params{
 		Backend:    bf.kind,
 		S3Bucket:   bf.s3Bucket,
@@ -65,6 +87,9 @@ func openRepo(ctx context.Context, repoDir string, bf backendFlags) (*repo.Repo,
 		AzureServiceURL: bf.azureServiceURL,
 		AzureContainer:  bf.azureContainer,
 		AzurePrefix:     bf.azurePrefix,
+
+		DragonflyProxy: bf.dragonflyProxy,
+		DragonflyTag:   bf.dragonflyTag,
 
 		Region: bf.region,
 		Class:  bf.class,

@@ -159,3 +159,120 @@ func TestFetchIntoRejectsWrongSizedBuffer(t *testing.T) {
 		}
 	}
 }
+
+// TestAlignedPackingProducesAlignedLocators is the GPUDirect
+// precondition (see GDSAlignment): with alignment on, every chunk's
+// offset within its container must be 4 KiB aligned, or every GDS read
+// falls into the bounce-buffer path the feature exists to avoid.
+func TestAlignedPackingProducesAlignedLocators(t *testing.T) {
+	ctx := context.Background()
+	backend := newTestBackend(t)
+	p := NewPacker(backend, "local", 1<<20)
+	p.SetAlignment(GDSAlignment)
+
+	// Deliberately awkward sizes: none is a multiple of 4 KiB, so an
+	// unaligned packer would put almost every chunk off a boundary.
+	var ids []chunk.ID
+	for _, size := range []int{1, 100, 4095, 4097, 9000, 13} {
+		data := bytes.Repeat([]byte{byte(size)}, size)
+		c := chunk.Chunk{ID: chunk.Sum(data), Data: data}
+		ids = append(ids, c.ID)
+		p.Add(c)
+	}
+	locs, err := p.Seal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locs) != len(ids) {
+		t.Fatalf("got %d locators, want %d", len(locs), len(ids))
+	}
+	for _, id := range ids {
+		loc, ok := locs[id]
+		if !ok {
+			t.Fatalf("no locator for chunk %s", id)
+		}
+		if loc.Offset%GDSAlignment != 0 {
+			t.Fatalf("chunk %s at offset %d is not %d-aligned", id, loc.Offset, GDSAlignment)
+		}
+	}
+
+	// Alignment must not change what the bytes are: padding is storage
+	// only, never visible through a locator.
+	for i, id := range ids {
+		data, err := Fetch(ctx, backend, id, locs[id])
+		if err != nil {
+			t.Fatalf("chunk %d: %v", i, err)
+		}
+		if chunk.Sum(data) != id {
+			t.Fatalf("chunk %d read back wrong bytes through an aligned locator", i)
+		}
+	}
+}
+
+// TestUnalignedPackingIsStillTheDefault pins the default, because
+// turning alignment on globally would silently inflate every small-file
+// dataset (DESIGN.md §14 packs small files precisely to avoid waste).
+func TestUnalignedPackingIsStillTheDefault(t *testing.T) {
+	p := NewPacker(newTestBackend(t), "local", 1<<20)
+	if p.Alignment() != 0 {
+		t.Fatalf("default alignment = %d, want 0 (tight packing)", p.Alignment())
+	}
+
+	// And with the default, small chunks really do sit back to back.
+	ctx := context.Background()
+	a := chunk.Chunk{ID: chunk.Sum([]byte("aaa")), Data: []byte("aaa")}
+	b := chunk.Chunk{ID: chunk.Sum([]byte("bbbb")), Data: []byte("bbbb")}
+	p.Add(a)
+	p.Add(b)
+	locs, err := p.Seal(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := locs[b.ID].Offset; got != 3 {
+		t.Fatalf("second chunk starts at %d, want 3 (tightly packed)", got)
+	}
+}
+
+// TestAlignmentPaddingCost measures what alignment actually costs on the
+// workload it hurts most — many small files — so the tradeoff is a
+// number in the repo rather than a hand-wave.
+func TestAlignmentPaddingCost(t *testing.T) {
+	ctx := context.Background()
+	const nFiles = 200
+	const fileSize = 1024 // 1 KiB: the small-file case §14 targets
+
+	measure := func(align int) int64 {
+		backend := newTestBackend(t)
+		p := NewPacker(backend, "local", 1<<30) // never auto-seal
+		p.SetAlignment(align)
+		for i := 0; i < nFiles; i++ {
+			data := bytes.Repeat([]byte{byte(i)}, fileSize)
+			p.Add(chunk.Chunk{ID: chunk.Sum(data), Data: data})
+		}
+		locs, err := p.Seal(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var maxEnd int64
+		for _, l := range locs {
+			if end := l.Offset + l.Length; end > maxEnd {
+				maxEnd = end
+			}
+		}
+		return maxEnd
+	}
+
+	tight := measure(0)
+	aligned := measure(GDSAlignment)
+	if aligned <= tight {
+		t.Fatalf("aligned container (%d) should be larger than tight (%d)", aligned, tight)
+	}
+	ratio := float64(aligned) / float64(tight)
+	t.Logf("%d x %d B files: tight=%d aligned=%d (%.2fx)", nFiles, fileSize, tight, aligned, ratio)
+	// 1 KiB chunks padded to 4 KiB is a 4x blowup; assert the shape so a
+	// future change that silently made alignment cheaper or costlier
+	// shows up here.
+	if ratio < 3.5 || ratio > 4.5 {
+		t.Fatalf("expected roughly 4x inflation for 1 KiB chunks at 4 KiB alignment, got %.2fx", ratio)
+	}
+}

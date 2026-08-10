@@ -18,6 +18,7 @@ import (
 
 	"github.com/aburan28/atlasfs/pkg/repo"
 	"github.com/aburan28/atlasfs/pkg/store/azure"
+	"github.com/aburan28/atlasfs/pkg/store/dragonfly"
 	"github.com/aburan28/atlasfs/pkg/store/gcs"
 	"github.com/aburan28/atlasfs/pkg/store/local"
 	"github.com/aburan28/atlasfs/pkg/store/s3"
@@ -44,6 +45,16 @@ type Params struct {
 	AzureServiceURL string
 	AzureContainer  string
 	AzurePrefix     string
+
+	// DragonflyProxy, when set, routes object GETs through a Dragonfly
+	// (d7y.io) peer at this address, implementing DESIGN.md §11.1's P2P
+	// chunk exchange without AtlasFS speaking a peer protocol itself.
+	// The win is §12.2's: origin GET charges collapse from once-per-node
+	// to once-per-cluster for a shared dataset. Applies to the s3 backend
+	// (the one whose SDK takes an HTTP client here); "auto" uses the
+	// default dfdaemon address.
+	DragonflyProxy string
+	DragonflyTag   string
 
 	Region string // AtlasFS locator region (DESIGN.md §7.5), not the cloud provider's region
 
@@ -94,6 +105,19 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(s3Region))
 		if err != nil {
 			return nil, fmt.Errorf("repoopen: load AWS config: %w", err)
+		}
+		if p.DragonflyProxy != "" {
+			proxy := p.DragonflyProxy
+			if proxy == "auto" {
+				proxy = dragonfly.DefaultProxyURL
+			}
+			// Swapping the HTTP client is the whole integration: the S3
+			// backend is untouched and unaware.
+			dfClient, err := dragonfly.NewHTTPClient(dragonfly.Config{ProxyURL: proxy, Tag: p.DragonflyTag})
+			if err != nil {
+				return nil, fmt.Errorf("repoopen: %w", err)
+			}
+			awsCfg.HTTPClient = dfClient
 		}
 		var optFns []func(*awss3.Options)
 		if p.S3Endpoint != "" {
@@ -147,6 +171,9 @@ const (
 	KeyAzureContainer  = "azureContainer"
 	KeyAzurePrefix     = "azurePrefix"
 
+	KeyDragonflyProxy = "dragonflyProxy"
+	KeyDragonflyTag   = "dragonflyTag"
+
 	KeyRegion = "region"
 	KeyClass  = "class"
 )
@@ -172,6 +199,9 @@ func ParamsFromMap(m map[string]string) (repoDir string, p Params, err error) {
 		AzureServiceURL: m[KeyAzureServiceURL],
 		AzureContainer:  m[KeyAzureContainer],
 		AzurePrefix:     m[KeyAzurePrefix],
+
+		DragonflyProxy: m[KeyDragonflyProxy],
+		DragonflyTag:   m[KeyDragonflyTag],
 
 		Region: m[KeyRegion],
 		Class:  m[KeyClass],

@@ -94,6 +94,37 @@ Adding the kernel attr/entry timeouts (above) was worth **~170×** on the metada
 
 ## GPUDirect / cuFile status
 
+Full plan, including the Dragonfly P2P half: [`docs/gds-p2p-integration.md`](docs/gds-p2p-integration.md).
+
+Two things landed since the seam below was written, both grounded in NVIDIA's published API:
+
+- **4 KiB container alignment** (`pack.GDSAlignment`, `-gds-align`). NVIDIA defines an I/O as unaligned if the file offset, size, device pointer, *or* device-buffer offset is not 4 KiB aligned, and serves unaligned I/O through GPU bounce buffers. §5.5 packs chunks back to back, so **every GDS read of a normally-packed AtlasFS chunk would be unaligned by construction** — the feature would degrade to a slower POSIX read. Alignment is a precondition, not a tuning knob. It is opt-in because it costs: measured **3.98× container inflation** for 1 KiB files, which is exactly what §14's small-file packing exists to avoid.
+- **`store.Dest` and `pkg/gds`** — a destination spanning host and device memory (mirroring `cuFileRead`'s base+offset shape), plus a cgo binding behind `-tags cufile` with a stub that **fails closed** rather than silently falling back to a host read. The cgo file has never been compiled — there is no CUDA here — and says so in its package doc.
+
+## Dragonfly P2P (DESIGN.md §11.1)
+
+Container reads can route through a [Dragonfly](https://d7y.io) peer, making §11.1's P2P chunk exchange a deployment option without AtlasFS implementing a peer protocol. This is a **cost** feature: §12.2 calls request charges the binding constraint ($1,717/hour for its worked cold-read fleet), and P2P collapses origin GETs from once-per-node to once-per-cluster. Safe with no invalidation protocol because containers are immutable and content-addressed.
+
+The whole integration is an `*http.Client` handed to the S3 backend — `pkg/store/s3` is untouched and unaware. Enable with `-dragonfly-proxy=auto`, or `dragonflyProxy` in a CSI VolumeContext.
+
+Verified against a real forwarding proxy, checking the *path* rather than the payload (if the wiring were wrong the bytes would still arrive, straight from origin): requests must land as absolute URIs, `Range` must survive intact, and a full S3 publish/read cycle put 5 requests through the proxy with the capability probe agreeing with the direct path.
+
+## Go vs. Rust, measured
+
+A filesystem in Go invites the question, so here are the three usual arguments with numbers from this codebase rather than from general principle:
+
+| Claim | Measured here |
+|---|---|
+| "GC costs throughput" | **No.** `GOGC=off` was *slower* (1316–1568 MB/s) than default GC (1639–1791 MB/s) on the 64 MiB read — an unbounded heap hurts locality more than collection costs. |
+| "GC pauses wreck tail latency" | STW pauses are **20–200 µs typical**, one 1.7 ms outlier. Against a 2–4 ms local chunk read, or 10–100 ms from S3, that is noise. Against a **718 ns cached `stat`** it is 140×, so it *does* matter for metadata-heavy tree walks (§18.1). |
+| "cgo will strangle the cuFile path" | cgo call overhead is **56 ns** (vs 0.16 ns for a Go call). A 4 MiB GDS read at 10 GB/s is ~400 µs, so cgo is **0.014%** of it. Quantitatively irrelevant. |
+
+**Recommendation: no rewrite.** The decisive argument isn't the table above, it's this: the FUSE path is ~5× off its §21.1 target, and that gap is caused by unimplemented §21.2 mechanisms — FUSE_PASSTHROUGH, writeback caching, large reads, multi-queue. Rewriting in Rust without implementing those reproduces the same 5× gap in a different language. **The measured bottleneck is architectural, not linguistic.** Against that, a rewrite costs 6–12 months to return to parity — working FUSE, gRPC, CSI, a metadata service, formal specs wired to the implementation — and buys no capability.
+
+Where Rust would genuinely earn its place is narrower and worth naming: a metadata path under heavy tree-walk load, where 100 µs pauses are large next to sub-microsecond operations. That is a component-sized argument, not a rewrite-sized one, and it can be taken later without disturbing the control plane — which is an argument for *not* pre-committing now.
+
+## GPUDirect / cuFile: the seam
+
 AtlasFS targets checkpoint and dataset I/O (§2), so NVIDIA GPUDirect Storage — DMA from storage straight into GPU memory, no CPU bounce buffer — is a natural fit. **The seam is built; the cuFile binding is not.** Being precise about the line:
 
 **Done.** The read path from `repo.FileReader.ReadAt` through `pack.FetchInto` down to `store.GetInto` no longer allocates buffers of its own, and the destination belongs to the caller. That was the blocking structural problem: an API whose only shape is "here is a stream, you find somewhere to put it" cannot express a DMA target at all.
@@ -124,6 +155,8 @@ Code layout:
 | `pkg/csidriver` | §22.1/§22.2 | CSI Identity + Node gRPC services — read-only PVs, plus writable RWX for the `disjoint-writers` carve-out |
 | `pkg/costmodel` | §12 | Egress/request cost estimation and budget admission |
 | `pkg/libatlas` | §21.3 | Materialize-then-passthrough escape hatch for mmap-heavy workloads |
+| `pkg/gds` | — | cuFile/GPUDirect binding (`-tags cufile`) and its fail-closed stub |
+| `pkg/store/dragonfly` | §11.1 | Route container GETs through a Dragonfly peer for P2P chunk exchange |
 | `cmd/atlas` | — | CLI (publish/ls/cat/stat/mount/gc/quota) |
 | `cmd/atlas-csi` | — | CSI node plugin binary |
 | `cmd/atlas-mds` | §7, §10 | Metadata authority server |
