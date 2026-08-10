@@ -1,9 +1,12 @@
 name: CI
 
 on:
+  # Every branch, not just main: a CI config that only runs once a change
+  # has already landed cannot stop anything from landing.
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
