@@ -17,6 +17,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/aburan28/atlasfs/pkg/repo"
+	"github.com/aburan28/atlasfs/pkg/store"
 	"github.com/aburan28/atlasfs/pkg/store/azure"
 	"github.com/aburan28/atlasfs/pkg/store/dragonfly"
 	"github.com/aburan28/atlasfs/pkg/store/gcs"
@@ -152,6 +153,78 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 	default:
 		return nil, fmt.Errorf("repoopen: unknown backend %q (want local|s3|gcs|azure)", p.Backend)
 	}
+}
+
+// OpenBackend builds only the object backend Params selects, without
+// touching repoDir's metadata store.
+//
+// It exists for the mds-backed mount (pkg/mdsfuse): there the metadata
+// lives behind a remote authority, so opening a local metadb would be
+// both wrong and actively harmful — two processes with the same bbolt
+// file open is a lock fight at best. repoDir still names where the local
+// backend's objects live, because DESIGN.md §11 keeps chunk bytes out of
+// the authority's path.
+func OpenBackend(ctx context.Context, repoDir string, p Params) (store.Backend, error) {
+	switch p.Backend {
+	case "", "local":
+		return local.New(filepath.Join(repoDir, "objects"))
+	case "s3", "gcs", "azure":
+		// The cloud backends are constructed identically whether or not a
+		// metadata store is involved, so route through the same code
+		// rather than duplicating credential and probe handling. Opening
+		// a throwaway repo would defeat the point, so this is the one
+		// place the switch is repeated — kept minimal on purpose.
+		return openCloudBackend(ctx, p)
+	default:
+		return nil, fmt.Errorf("repoopen: unknown backend %q (want local|s3|gcs|azure)", p.Backend)
+	}
+}
+
+func openCloudBackend(ctx context.Context, p Params) (store.Backend, error) {
+	switch p.Backend {
+	case "s3":
+		if p.S3Bucket == "" {
+			return nil, fmt.Errorf("repoopen: s3 backend requires a bucket")
+		}
+		s3Region := p.S3Region
+		if s3Region == "" {
+			s3Region = "us-east-1"
+		}
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(s3Region))
+		if err != nil {
+			return nil, fmt.Errorf("repoopen: load AWS config: %w", err)
+		}
+		if p.DragonflyProxy != "" {
+			proxy := p.DragonflyProxy
+			if proxy == "auto" {
+				proxy = dragonfly.DefaultProxyURL
+			}
+			dfClient, err := dragonfly.NewHTTPClient(dragonfly.Config{ProxyURL: proxy, Tag: p.DragonflyTag})
+			if err != nil {
+				return nil, fmt.Errorf("repoopen: %w", err)
+			}
+			awsCfg.HTTPClient = dfClient
+		}
+		var optFns []func(*awss3.Options)
+		if p.S3Endpoint != "" {
+			optFns = append(optFns, func(o *awss3.Options) {
+				o.UsePathStyle = true
+				o.BaseEndpoint = aws.String(p.S3Endpoint)
+			})
+		}
+		return s3.New(ctx, awsCfg, s3.Config{Bucket: p.S3Bucket, Prefix: p.S3Prefix}, optFns...)
+	case "gcs":
+		if p.GCSBucket == "" {
+			return nil, fmt.Errorf("repoopen: gcs backend requires a bucket")
+		}
+		return gcs.New(ctx, gcs.Config{Bucket: p.GCSBucket, Prefix: p.GCSPrefix})
+	case "azure":
+		if p.AzureServiceURL == "" || p.AzureContainer == "" {
+			return nil, fmt.Errorf("repoopen: azure backend requires a service URL and a container")
+		}
+		return azure.New(ctx, p.AzureServiceURL, azure.Config{Container: p.AzureContainer, Prefix: p.AzurePrefix})
+	}
+	return nil, fmt.Errorf("repoopen: unknown backend %q", p.Backend)
 }
 
 // Known parameter keys used by ParamsFromMap — the CSI VolumeContext

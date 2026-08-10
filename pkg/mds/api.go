@@ -31,7 +31,9 @@ package mds
 import (
 	"time"
 
+	"github.com/aburan28/atlasfs/pkg/chunk"
 	"github.com/aburan28/atlasfs/pkg/metadb"
+	"github.com/aburan28/atlasfs/pkg/pack"
 )
 
 // ServiceName is the gRPC service this package implements.
@@ -156,13 +158,32 @@ type AckRecallRequest struct {
 
 type AckRecallResponse struct{}
 
+// GetLocatorRequest resolves a chunk ID to where its bytes live in this
+// region.
+//
+// A locator is metadata, so the authority owns it — but note what is
+// *not* here: the chunk's bytes. The client takes the (container,
+// offset, length) this returns and fetches straight from store.Backend,
+// which is DESIGN.md §11's split holding even at the RPC boundary. The
+// authority never sees file data.
+type GetLocatorRequest struct {
+	Holder  string   `json:"holder"`
+	ChunkID chunk.ID `json:"chunkId"`
+}
+
+type GetLocatorResponse struct {
+	Found   bool         `json:"found"`
+	Locator pack.Locator `json:"locator"`
+}
+
 // Full method names, as they appear on the wire.
 const (
-	MethodGetInode  = "/" + ServiceName + "/GetInode"
-	MethodLookup    = "/" + ServiceName + "/Lookup"
-	MethodReaddir   = "/" + ServiceName + "/Readdir"
-	MethodCommit    = "/" + ServiceName + "/Commit"
-	MethodUnlink    = "/" + ServiceName + "/Unlink"
-	MethodSubscribe = "/" + ServiceName + "/Subscribe"
-	MethodAckRecall = "/" + ServiceName + "/AckRecall"
+	MethodGetInode   = "/" + ServiceName + "/GetInode"
+	MethodLookup     = "/" + ServiceName + "/Lookup"
+	MethodReaddir    = "/" + ServiceName + "/Readdir"
+	MethodCommit     = "/" + ServiceName + "/Commit"
+	MethodUnlink     = "/" + ServiceName + "/Unlink"
+	MethodSubscribe  = "/" + ServiceName + "/Subscribe"
+	MethodAckRecall  = "/" + ServiceName + "/AckRecall"
+	MethodGetLocator = "/" + ServiceName + "/GetLocator"
 )

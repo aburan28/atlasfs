@@ -74,7 +74,14 @@ func openRepo(ctx context.Context, repoDir string, bf backendFlags) (*repo.Repo,
 }
 
 func openRepoInner(ctx context.Context, repoDir string, bf backendFlags) (*repo.Repo, error) {
-	return repoopen.Open(ctx, repoDir, repoopen.Params{
+	return repoopen.Open(ctx, repoDir, bf.params())
+}
+
+// params is the single translation from CLI flags to repoopen.Params,
+// shared by the repo-opening and backend-only paths so the two cannot
+// drift.
+func (bf backendFlags) params() repoopen.Params {
+	return repoopen.Params{
 		Backend:    bf.kind,
 		S3Bucket:   bf.s3Bucket,
 		S3Region:   bf.s3Region,
@@ -93,5 +100,5 @@ func openRepoInner(ctx context.Context, repoDir string, bf backendFlags) (*repo.
 
 		Region: bf.region,
 		Class:  bf.class,
-	})
+	}
 }

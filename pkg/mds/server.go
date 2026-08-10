@@ -40,6 +40,10 @@ type Config struct {
 	// RecallDeadline overrides DefaultRecallDeadline.
 	RecallDeadline time.Duration
 
+	// Region is the locator keyspace this authority serves (DESIGN.md
+	// §7.5). Empty means repo.DefaultRegion.
+	Region string
+
 	Clock coherence.Clock
 }
 
@@ -50,6 +54,7 @@ type Server struct {
 	posix    bool
 	drecall  time.Duration
 	leaseTTL time.Duration
+	region   string
 
 	mu      sync.Mutex
 	streams map[string]*holderStream // by holder ID
@@ -72,7 +77,11 @@ func NewServer(cfg Config) *Server {
 		posix:    cfg.Posix,
 		drecall:  cfg.RecallDeadline,
 		leaseTTL: cfg.LeaseDuration,
+		region:   cfg.Region,
 		streams:  map[string]*holderStream{},
+	}
+	if s.region == "" {
+		s.region = defaultRegion
 	}
 	if s.drecall <= 0 {
 		s.drecall = DefaultRecallDeadline
@@ -260,6 +269,21 @@ func (s *Server) Subscribe(req *SubscribeRequest, stream grpc.ServerStream) erro
 	}
 }
 
+// GetLocator resolves a chunk to its container placement. Deliberately
+// grants no lease: a locator for an immutable, content-addressed chunk
+// cannot go stale in a way that matters. Compaction (DESIGN.md §19.1
+// step 3) can move the bytes, but it retires the old container only
+// after the grace period, so a client holding a slightly old locator
+// still reads correct bytes — and reads are hash-verified regardless
+// (§24.4).
+func (s *Server) GetLocator(ctx context.Context, req *GetLocatorRequest) (*GetLocatorResponse, error) {
+	loc, found, err := s.db.GetLocator(s.region, req.ChunkID)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &GetLocatorResponse{Found: found, Locator: loc}, nil
+}
+
 func (s *Server) AckRecall(ctx context.Context, req *AckRecallRequest) (*AckRecallResponse, error) {
 	if s.coh != nil {
 		s.coh.AckRecall(req.RecallID, req.Holder)
@@ -281,3 +305,9 @@ func toStatus(err error) error {
 		return status.Error(codes.Internal, err.Error())
 	}
 }
+
+// defaultRegion mirrors repo.DefaultRegion without importing pkg/repo,
+// which would be a dependency cycle: repo does not import mds today, but
+// the mds-backed mount will, and an authority needing the client's
+// package to name its own keyspace would be backwards.
+const defaultRegion = "local"

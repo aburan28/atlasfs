@@ -24,6 +24,7 @@ type MetadataServer interface {
 	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
 	Unlink(context.Context, *UnlinkRequest) (*UnlinkResponse, error)
 	AckRecall(context.Context, *AckRecallRequest) (*AckRecallResponse, error)
+	GetLocator(context.Context, *GetLocatorRequest) (*GetLocatorResponse, error)
 	Subscribe(*SubscribeRequest, grpc.ServerStream) error
 }
 
@@ -66,6 +67,7 @@ var serviceDesc = grpc.ServiceDesc{
 		{MethodName: "Commit", Handler: unaryHandler(MetadataServer.Commit, MethodCommit)},
 		{MethodName: "Unlink", Handler: unaryHandler(MetadataServer.Unlink, MethodUnlink)},
 		{MethodName: "AckRecall", Handler: unaryHandler(MetadataServer.AckRecall, MethodAckRecall)},
+		{MethodName: "GetLocator", Handler: unaryHandler(MetadataServer.GetLocator, MethodGetLocator)},
 	},
 	Streams: []grpc.StreamDesc{
 		{StreamName: "Subscribe", Handler: subscribeHandler, ServerStreams: true},

@@ -2,14 +2,19 @@ package mds
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 
+	"github.com/aburan28/atlasfs/pkg/chunk"
 	"github.com/aburan28/atlasfs/pkg/coherence"
 	"github.com/aburan28/atlasfs/pkg/metadb"
+	"github.com/aburan28/atlasfs/pkg/pack"
 )
 
 // Client is one holder: a process that caches metadata under leases
@@ -241,4 +246,48 @@ func (c *Client) Close() {
 		cancel()
 		<-done
 	}
+}
+
+// GetLocator resolves a chunk to its container placement. The bytes
+// themselves are then fetched straight from store.Backend — the
+// authority is never in the data path (DESIGN.md §11).
+func (c *Client) GetLocator(ctx context.Context, id chunk.ID) (pack.Locator, bool, error) {
+	var resp GetLocatorResponse
+	err := c.cc.Invoke(ctx, MethodGetLocator, &GetLocatorRequest{Holder: c.holder, ChunkID: id}, &resp)
+	if err != nil {
+		return pack.Locator{}, false, err
+	}
+	return resp.Locator, resp.Found, nil
+}
+
+// Resolve walks a "/"-rooted path to its inode and record, one Lookup
+// per component. Each component's answer is cached under its own lease,
+// so a repeated walk down the same directory chain costs nothing after
+// the first — which is what makes a per-component walk affordable
+// instead of needing a batched server-side resolve.
+func (c *Client) Resolve(ctx context.Context, p string) (metadb.InodeID, metadb.InodeRecord, error) {
+	cur := metadb.RootInode
+	rec, err := c.GetInode(ctx, cur)
+	if err != nil {
+		return 0, metadb.InodeRecord{}, err
+	}
+	for _, name := range splitPath(p) {
+		resp, err := c.Lookup(ctx, cur, name)
+		if err != nil {
+			return 0, metadb.InodeRecord{}, err
+		}
+		if !resp.Found {
+			return 0, metadb.InodeRecord{}, fmt.Errorf("mds: %q: %w", p, metadb.ErrNotFound)
+		}
+		cur, rec = resp.Inode, resp.Record
+	}
+	return cur, rec, nil
+}
+
+func splitPath(p string) []string {
+	p = strings.Trim(path.Clean("/"+p), "/")
+	if p == "" {
+		return nil
+	}
+	return strings.Split(p, "/")
 }
