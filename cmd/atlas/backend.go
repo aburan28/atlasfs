@@ -43,7 +43,7 @@ func addBackendFlags(fs *flag.FlagSet, bf *backendFlags) {
 	fs.StringVar(&bf.azurePrefix, "azure-prefix", "", "key prefix within the container (--backend=azure)")
 	fs.StringVar(&bf.region, "region", repo.DefaultRegion, "AtlasFS region label for chunk locators (DESIGN.md §7.5) — not the cloud provider's region")
 	fs.StringVar(&bf.class, "class", string(repo.ClassImmutable),
-		"consistency class for a brand-new repo (DESIGN.md §8): immutable|relaxed|session. Ignored when repo-dir already holds a repo — its persisted class always wins.")
+		"consistency class for a brand-new repo (DESIGN.md §8): immutable|relaxed|session. Ignored when repo-dir already holds a repo — its persisted class always wins. posix is served by atlas-mds, not by a local mount.")
 }
 
 // openRepo opens repoDir's metadata locally and points its object

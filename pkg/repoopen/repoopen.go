@@ -65,6 +65,17 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 	if class == "" {
 		class = repo.ClassImmutable
 	}
+	if class == repo.ClassPosix {
+		// Refuse rather than quietly hand back a mount labelled `posix`
+		// that cannot deliver it. §10.6's guarantee comes from recalling
+		// *other* holders' leases, and a repo opened here has no other
+		// holders to recall — the coherence manager is in-process. A
+		// mount that accepted the flag would give a caller the class's
+		// cost with none of its semantics, which is worse than an error.
+		return nil, fmt.Errorf("repoopen: class %q is served by cmd/atlas-mds, not by a local mount: "+
+			"its D=0 guarantee depends on blocking recall against remote holders (DESIGN.md §10.6), "+
+			"which an in-process coherence manager has none of", repo.ClassPosix)
+	}
 	switch p.Backend {
 	case "", "local":
 		backend, err := local.New(filepath.Join(repoDir, "objects"))
