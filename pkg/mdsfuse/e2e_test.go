@@ -115,6 +115,9 @@ func mustLocal(t *testing.T, dir string) *local.Backend {
 // any of the coherence assertions below to mean anything.
 func (c *cluster) mountAt(t *testing.T, holder string, ttl time.Duration) string {
 	t.Helper()
+	// See pkg/fuseserver's mountForTest: a wedged FUSE test produces a
+	// goroutine dump that cannot name it, and t.Log never flushes.
+	fmt.Fprintf(os.Stderr, "=== mounting %s for %s\n", holder, t.Name())
 	cc, err := grpc.NewClient(c.addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()), mds.DialOption())
 	if err != nil {

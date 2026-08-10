@@ -278,6 +278,11 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 }
 
 func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if len(name) > metadb.MaxNameLen {
+		// POSIX requires ENAMETOOLONG rather than a plain miss, and the
+		// kernel does not enforce NAME_MAX for a FUSE filesystem.
+		return nil, syscall.ENAMETOOLONG
+	}
 	resp, err := n.cfg.Client.Lookup(ctx, n.ino, name)
 	if err != nil {
 		return nil, errnoFor(err)

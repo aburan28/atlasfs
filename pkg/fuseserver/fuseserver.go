@@ -341,6 +341,12 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 		return nil, syscall.ENOTDIR
 	}
 
+	if len(name) > metadb.MaxNameLen {
+		// POSIX requires ENAMETOOLONG rather than a plain miss, and the
+		// kernel does not enforce NAME_MAX for a FUSE filesystem.
+		return nil, syscall.ENAMETOOLONG
+	}
+
 	dirKey := repo.DirCoherenceKey(n.ino)
 	if n.repo.Coherence != nil && n.repo.Coherence.NegativeTrusted(coherenceHolder, dirKey, name) {
 		return nil, syscall.ENOENT
@@ -741,6 +747,8 @@ func errnoFor(err error) syscall.Errno {
 		return syscall.ENOTEMPTY
 	case errors.Is(err, metadb.ErrInvalidRename):
 		return syscall.EINVAL
+	case errors.Is(err, metadb.ErrNameTooLong):
+		return syscall.ENAMETOOLONG
 	case errors.Is(err, repo.ErrQuotaExceeded), errors.Is(err, metadb.ErrQuotaExceeded):
 		return syscall.EDQUOT
 	default:

@@ -131,6 +131,11 @@ func (s *Server) bumpDir(dir metadb.InodeID) {
 	}
 	s.coh.BumpDir(dirObj(dir))
 	s.coh.Bump(dirObj(dir))
+	// The directory's own inode too, not just its version: adding or
+	// removing an entry moves the directory's mtime and ctime, and those
+	// live in the inode's lease domain (§10.5). Bumping only the version
+	// leaves a holder serving pre-change timestamps.
+	s.coh.Bump(inodeObj(dir))
 }
 
 func (s *Server) push(holder string, ev Event) {
@@ -324,6 +329,8 @@ func toStatus(err error) error {
 		return withErrno(codes.FailedPrecondition, syscall.ENOTEMPTY, err)
 	case errors.Is(err, metadb.ErrInvalidRename):
 		return withErrno(codes.InvalidArgument, syscall.EINVAL, err)
+	case errors.Is(err, metadb.ErrNameTooLong):
+		return withErrno(codes.InvalidArgument, syscall.ENAMETOOLONG, err)
 	case errors.Is(err, metadb.ErrQuotaExceeded):
 		return withErrno(codes.ResourceExhausted, syscall.EDQUOT, err)
 	default:

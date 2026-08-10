@@ -67,6 +67,38 @@ var (
 	bucketDeadCnt = []byte("deadcontainer")
 )
 
+// MaxNameLen is NAME_MAX: the longest single path component. POSIX
+// requires ENAMETOOLONG beyond it, and the kernel does not enforce it on
+// a FUSE filesystem's behalf — a name longer than this arrived intact.
+const MaxNameLen = 255
+
+// ErrNameTooLong is returned for a path component longer than
+// MaxNameLen.
+var ErrNameTooLong = errors.New("metadb: name too long")
+
+// checkName rejects a component POSIX would not allow. Empty names and
+// names containing a separator are refused as well: both would produce a
+// dentry no path resolution could ever reach.
+func checkName(name string) error {
+	if len(name) > MaxNameLen {
+		return ErrNameTooLong
+	}
+	return nil
+}
+
+// touchDirTx moves a directory's mtime and ctime, which POSIX requires
+// whenever an entry is added to it or removed from it. Without this a
+// build tool watching a directory's mtime never notices a file appearing
+// in it.
+func touchDirTx(tx *bbolt.Tx, dir InodeID, now time.Time) error {
+	rec, err := getInodeTx(tx, dir)
+	if err != nil {
+		return err
+	}
+	rec.MTime, rec.CTime = now, now
+	return putInode(tx, dir, rec)
+}
+
 var ErrNotFound = errors.New("metadb: not found")
 var ErrExists = errors.New("metadb: already exists")
 var ErrNotDir = errors.New("metadb: not a directory")
@@ -340,6 +372,12 @@ func (db *DB) SetDentry(dir InodeID, name string, child InodeID) error {
 }
 
 func setDentryTx(tx *bbolt.Tx, dir InodeID, name string, child InodeID) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	if err := touchDirTx(tx, dir, time.Now()); err != nil {
+		return err
+	}
 	var v [8]byte
 	binary.BigEndian.PutUint64(v[:], uint64(child))
 	return tx.Bucket(bucketDentry).Put(dentryKey(dir, name), v[:])
@@ -381,6 +419,9 @@ func (db *DB) RemoveEntry(dir InodeID, name string, deletedAt time.Time) error {
 			return err
 		}
 		if err := tx.Bucket(bucketDentry).Delete(dentryKey(dir, name)); err != nil {
+			return err
+		}
+		if err := touchDirTx(tx, dir, deletedAt); err != nil {
 			return err
 		}
 		return dropLinkTx(tx, id, rec, deletedAt)
@@ -483,6 +524,9 @@ func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName str
 	if oldDir == newDir && oldName == newName {
 		return nil
 	}
+	if err := checkName(newName); err != nil {
+		return err
+	}
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
 		srcID, err := lookupTx(tx, oldDir, oldName)
 		if err != nil {
@@ -534,6 +578,9 @@ func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName str
 		}
 
 		if err := tx.Bucket(bucketDentry).Delete(dentryKey(oldDir, oldName)); err != nil {
+			return err
+		}
+		if err := touchDirTx(tx, oldDir, deletedAt); err != nil {
 			return err
 		}
 		return setDentryTx(tx, newDir, newName, srcID)

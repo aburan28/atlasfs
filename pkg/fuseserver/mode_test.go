@@ -2,10 +2,12 @@ package fuseserver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -272,5 +274,67 @@ func TestCtimeMovesOnMetadataChange(t *testing.T) {
 	_ = before
 	if after.Mtim.Sec != before.Mtim.Sec {
 		t.Fatalf("chmod changed mtime: %d -> %d", before.Mtim.Sec, after.Mtim.Sec)
+	}
+}
+
+// TestNameTooLong: NAME_MAX is 255 and POSIX requires ENAMETOOLONG past
+// it. The kernel does not enforce it for a FUSE filesystem — an
+// over-long name arrives intact — so the filesystem has to.
+func TestNameTooLong(t *testing.T) {
+	_, mnt := mountWritable(t)
+	long := filepath.Join(mnt, strings.Repeat("x", 256))
+
+	for _, tc := range []struct {
+		name string
+		op   func() error
+	}{
+		{"create", func() error { return os.WriteFile(long, []byte("x"), 0o644) }},
+		{"mkdir", func() error { return os.Mkdir(long, 0o755) }},
+		{"symlink", func() error { return os.Symlink("t", long) }},
+		{"stat", func() error { _, err := os.Stat(long); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.op()
+			var errno syscall.Errno
+			if !errors.As(err, &errno) || errno != syscall.ENAMETOOLONG {
+				t.Fatalf("got %v, want ENAMETOOLONG", err)
+			}
+		})
+	}
+}
+
+// TestDirectoryTimestampsMoveOnEntryChange: POSIX requires a directory's
+// mtime and ctime to move when an entry is added or removed. Without it
+// every tool that watches a directory's mtime — make, rsync, any file
+// watcher — never notices a file appearing in it.
+func TestDirectoryTimestampsMoveOnEntryChange(t *testing.T) {
+	_, mnt := mountWritable(t)
+	dir := filepath.Join(mnt, "d")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(dir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if got := statOf(t, dir).Mtim.Sec; got != old.Unix() {
+		t.Fatalf("setup: dir mtime %d, want %d", got, old.Unix())
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := statOf(t, dir).Mtim.Sec; got <= old.Unix() {
+		t.Fatalf("dir mtime did not move when a file was created in it: %d", got)
+	}
+
+	if err := os.Chtimes(dir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "f")); err != nil {
+		t.Fatal(err)
+	}
+	if got := statOf(t, dir).Mtim.Sec; got <= old.Unix() {
+		t.Fatalf("dir mtime did not move when a file was removed from it: %d", got)
 	}
 }

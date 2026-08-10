@@ -282,6 +282,8 @@ func (c *Client) Unlink(ctx context.Context, dir metadb.InodeID, name string) er
 // successful rmdir still resolved the name.
 func (c *Client) invalidateOwnMutation(dir metadb.InodeID) {
 	c.invalidate(dirObj(dir))
+	// And the directory's own record: its mtime/ctime just moved.
+	c.invalidate(inodeObj(dir))
 }
 
 func (c *Client) store(obj string, rec metadb.InodeRecord, l Lease, since uint64) {

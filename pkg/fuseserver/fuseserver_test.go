@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -142,6 +143,13 @@ func mountForTest(t *testing.T, r *repo.Repo) string {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("no /dev/fuse in this environment")
 	}
+	// A breadcrumb on stderr, not via t.Log: when a FUSE test wedges, Go
+	// kills the binary and dumps goroutines, and the test goroutine is
+	// routinely reported as "running on other thread; stack unavailable"
+	// — so the dump does not say which test hung. t.Log output is
+	// buffered until the test ends, which never happens. This line is the
+	// only thing that has actually identified the culprit.
+	fmt.Fprintf(os.Stderr, "=== mounting for %s\n", t.Name())
 	mountpoint := t.TempDir()
 	mounted := make(chan *fuse.Server, 1)
 	errCh := make(chan error, 1)

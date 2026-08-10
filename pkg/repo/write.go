@@ -39,7 +39,24 @@ var (
 )
 
 func InodeCoherenceKey(id metadb.InodeID) string { return fmt.Sprintf("inode:%d", id) }
-func DirCoherenceKey(id metadb.InodeID) string   { return fmt.Sprintf("dir:%d", id) }
+
+// bumpDirEntries invalidates everything a change to dir's contents makes
+// stale. That is two objects, not one (DESIGN.md §10.5's two lease
+// domains): the directory's version, which covers its name bindings and
+// negative entries, and the directory's own inode, because adding or
+// removing an entry moves its mtime and ctime. Bumping only the former
+// leaves a holder serving the pre-change timestamps from a lease nothing
+// invalidated — and a directory mtime that never moves is one every
+// build tool and file watcher relies on.
+func (r *Repo) bumpDirEntries(dir metadb.InodeID) {
+	if r.Coherence == nil {
+		return
+	}
+	r.Coherence.BumpDir(DirCoherenceKey(dir))
+	r.Coherence.Bump(DirCoherenceKey(dir))
+	r.Coherence.Bump(InodeCoherenceKey(dir))
+}
+func DirCoherenceKey(id metadb.InodeID) string { return fmt.Sprintf("dir:%d", id) }
 
 // SetQuota sets this repo's byte and inode limits (DESIGN.md §18.3). A
 // zero value means unlimited for that dimension. This build has exactly
@@ -214,8 +231,8 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 
 	if r.Coherence != nil {
 		r.Coherence.Bump(InodeCoherenceKey(id))
-		r.Coherence.BumpDir(DirCoherenceKey(h.dir))
 	}
+	r.bumpDirEntries(h.dir)
 	return id, nil
 }
 
@@ -234,9 +251,7 @@ func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
 		return err
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
-	}
+	r.bumpDirEntries(dir)
 	return nil
 }
 
@@ -260,9 +275,7 @@ func (r *Repo) Mkdir(dir metadb.InodeID, name string, mode uint32, owner Owner) 
 			return 0, err
 		}
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
-	}
+	r.bumpDirEntries(dir)
 	return id, nil
 }
 
@@ -294,9 +307,7 @@ func (r *Repo) Rmdir(dir metadb.InodeID, name string) error {
 	if err := r.DB.RemoveEntry(dir, name, r.Clock.Now()); err != nil {
 		return err
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
-	}
+	r.bumpDirEntries(dir)
 	return nil
 }
 
@@ -312,13 +323,9 @@ func (r *Repo) Rename(oldDir metadb.InodeID, oldName string, newDir metadb.Inode
 	if err := r.DB.Rename(oldDir, oldName, newDir, newName, r.Clock.Now()); err != nil {
 		return err
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(oldDir))
-		r.Coherence.Bump(DirCoherenceKey(oldDir))
-		if newDir != oldDir {
-			r.Coherence.BumpDir(DirCoherenceKey(newDir))
-			r.Coherence.Bump(DirCoherenceKey(newDir))
-		}
+	r.bumpDirEntries(oldDir)
+	if newDir != oldDir {
+		r.bumpDirEntries(newDir)
 	}
 	return nil
 }
@@ -336,9 +343,8 @@ func (r *Repo) Link(dir metadb.InodeID, name string, target metadb.InodeID) (met
 	}
 	if r.Coherence != nil {
 		r.Coherence.Bump(InodeCoherenceKey(target))
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
-		r.Coherence.Bump(DirCoherenceKey(dir))
 	}
+	r.bumpDirEntries(dir)
 	return rec, nil
 }
 
@@ -353,10 +359,7 @@ func (r *Repo) Mknod(dir metadb.InodeID, name string, typ, rdev, mode uint32, ow
 	if err != nil {
 		return 0, err
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
-		r.Coherence.Bump(DirCoherenceKey(dir))
-	}
+	r.bumpDirEntries(dir)
 	return id, nil
 }
 
@@ -369,10 +372,7 @@ func (r *Repo) Symlink(dir metadb.InodeID, name, target string, owner Owner) (me
 	if err != nil {
 		return 0, err
 	}
-	if r.Coherence != nil {
-		r.Coherence.BumpDir(DirCoherenceKey(dir))
-		r.Coherence.Bump(DirCoherenceKey(dir))
-	}
+	r.bumpDirEntries(dir)
 	return id, nil
 }
 
