@@ -299,7 +299,7 @@ func (r *Repo) PublishTree(ctx context.Context, srcDir string, destPath []string
 			}
 			uid, gid := ownerOf(info)
 			rec := metadb.InodeRecord{
-				IsDir: true, Mode: permOf(info.Mode(), 0o755),
+				IsDir: true, Mode: permOf(info.Mode()),
 				Uid: uid, Gid: gid, MTime: info.ModTime(), NLink: 2,
 			}
 			id, err := r.DB.CommitMkdir(parentInode, d.Name(), rec)
@@ -394,7 +394,7 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 	// tree of executables and mounting it has to give back executables,
 	// and a hardcoded 0o644 silently strips every exec bit in the tree.
 	uid, gid := ownerOf(info)
-	rec := metadb.InodeRecord{Mode: permOf(info.Mode(), 0o644), Uid: uid, Gid: gid, MTime: info.ModTime(), NLink: 1}
+	rec := metadb.InodeRecord{Mode: permOf(info.Mode()), Uid: uid, Gid: gid, MTime: info.ModTime(), NLink: 1}
 	content.apply(&rec)
 	if _, err := r.DB.PublishFile(dir, name, rec); err != nil {
 		return 0, publishBindErr(name, err)
@@ -402,16 +402,10 @@ func (r *Repo) publishFile(ctx context.Context, dir metadb.InodeID, name, srcPat
 	return size, nil
 }
 
-// permOf extracts the permission bits from a source file's mode,
-// falling back to def for the degenerate all-zero case (a source with no
-// permission bits at all would otherwise publish as unreadable).
-func permOf(m os.FileMode, def uint32) uint32 {
-	perm := uint32(m.Perm())
-	if perm == 0 {
-		return def
-	}
-	return perm
-}
+// permOf extracts the permission bits from a source file's mode.
+// A source file with no permission bits publishes with none: preserving
+// the tree means preserving it, not second-guessing an unusual mode.
+func permOf(m os.FileMode) uint32 { return uint32(m.Perm()) }
 
 // ownerOf reads a source file's uid/gid so a published tree keeps its
 // ownership (DESIGN.md §20). The syscall-level stat is behind an

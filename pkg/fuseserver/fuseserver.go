@@ -31,6 +31,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -192,11 +193,11 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 		sec = uint64(rec.MTime.Unix())
 	}
 	out.Mtime = sec
-	out.Atime = sec
-	out.Ctime = sec
+	out.Atime = unixOrZero(rec.Atime())
+	out.Ctime = unixOrZero(rec.Ctime())
 	switch {
 	case rec.IsDir:
-		out.Mode = syscall.S_IFDIR | permBits(rec.Mode, 0o755, mutable)
+		out.Mode = syscall.S_IFDIR | permBits(rec.Mode, mutable)
 		out.Nlink = 2
 	case rec.IsSymlink:
 		out.Mode = syscall.S_IFLNK | 0o777
@@ -207,12 +208,21 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 		// the type, the permissions, the device number — and the real
 		// link count, because link(2) works on a FIFO exactly as it does
 		// on a regular file.
-		out.Mode = rec.Type | permBits(rec.Mode, 0o644, mutable)
+		out.Mode = rec.Type | permBits(rec.Mode, mutable)
 		out.Nlink = nlinkOf(rec)
 	default:
-		out.Mode = syscall.S_IFREG | permBits(rec.Mode, 0o644, mutable)
+		out.Mode = syscall.S_IFREG | permBits(rec.Mode, mutable)
 		out.Nlink = nlinkOf(rec)
 	}
+}
+
+// unixOrZero converts a timestamp for fuse.Attr, mapping the zero time
+// to 0 rather than to a negative epoch value.
+func unixOrZero(t time.Time) uint64 {
+	if t.IsZero() {
+		return 0
+	}
+	return uint64(t.Unix())
 }
 
 // nlinkOf is the stored link count, never a constant: `ls -l` and
@@ -229,8 +239,10 @@ func nlinkOf(rec metadb.InodeRecord) uint32 {
 
 // permBits reports the permission bits to advertise: the record's own,
 // which is what preserves an executable published from a source tree or
-// set by a later chmod. def covers a record written before modes were
-// stored.
+// set by a later chmod. There is deliberately no "0 means default"
+// fallback: mode 0 is a legitimate thing to ask create(2) or mkdir(2)
+// for, and treating it as unset hands back a world-readable file to a
+// caller who asked for an unreadable one.
 //
 // On an immutable mount the write bits are cleared. That is presentation
 // rather than enforcement — the mount carries the `ro` option and Open
@@ -238,11 +250,8 @@ func nlinkOf(rec metadb.InodeRecord) uint32 {
 // filesystem that will refuse the write only invites a confusing error
 // later. The exec bit is deliberately *not* cleared: publishing a tree of
 // binaries read-only and then running them is the point.
-func permBits(mode uint32, def uint32, mutable bool) uint32 {
+func permBits(mode uint32, mutable bool) uint32 {
 	perm := mode & 0o7777
-	if perm == 0 {
-		perm = def
-	}
 	if !mutable {
 		perm &^= 0o222
 	}
@@ -451,7 +460,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	// is the mode the file should end up with.
 	h.SetMode(mode)
 	h.SetOwner(callerOwner(ctx))
-	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, mode: mode & 0o7777}
+	fh := &writeFileHandle{repo: n.repo, parent: n.ino, name: name, mode: mode & 0o7777, modeSet: true}
 	id, err := h.Commit(ctx)
 	if err != nil {
 		return nil, nil, 0, errnoFor(err)
@@ -680,13 +689,16 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 	if uid, ok := in.GetUID(); ok {
 		mut.Uid = &uid
 	}
+	if atime, ok := in.GetATime(); ok {
+		mut.ATime = &atime
+	}
 	if gid, ok := in.GetGID(); ok {
 		mut.Gid = &gid
 	}
 	if mtime, ok := in.GetMTime(); ok {
 		mut.MTime = &mtime
 	}
-	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil {
+	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil || mut.ATime != nil {
 		if !n.repo.Class.Mutable() {
 			return syscall.EROFS
 		}
@@ -772,11 +784,14 @@ type writeFileHandle struct {
 	repo   *repo.Repo
 	parent metadb.InodeID
 	name   string
-	// mode is what a create(2) asked for; it survives to the first commit
-	// so a file created executable is executable. Zero on a handle opened
-	// against an existing file, where the stored mode wins anyway.
-	mode uint32
-	node *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
+	// mode/modeSet is what a create(2) asked for, carried to the first
+	// commit so a file created executable is executable. Mode 0 is a
+	// legitimate request, so "not given" is a separate flag; a handle
+	// opened against an existing file leaves both unset, and the stored
+	// mode wins anyway.
+	mode    uint32
+	modeSet bool
+	node    *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
 
 	mu    sync.Mutex
 	buf   []byte
@@ -914,7 +929,9 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	if err != nil {
 		return errnoFor(err)
 	}
-	wh.SetMode(h.mode)
+	if h.modeSet {
+		wh.SetMode(h.mode)
+	}
 	if _, err := wh.Write(h.buf); err != nil {
 		return syscall.EIO
 	}
@@ -993,6 +1010,13 @@ func Mount(ctx context.Context, r *repo.Repo, mountpoint string, onMounted func(
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
 		EntryTimeout: &ttl,
 		AttrTimeout:  &ttl,
+		// NullPermissions: this filesystem sets every mode itself, so a
+		// zero one is a real answer. Without it go-fuse substitutes 0644
+		// whenever the permission bits are zero — a convenience for
+		// filesystems that do not track modes, and here it silently hands
+		// a world-readable file to a caller who asked create(2) for an
+		// unreadable one.
+		NullPermissions: true,
 		// NegativeTimeout is deliberately left at zero rather than set to
 		// ttl. §10.4 validates a negative entry against a directory
 		// version, which pkg/coherence implements and consults on every

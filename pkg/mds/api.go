@@ -335,6 +335,7 @@ type SetAttrRequest struct {
 	Uid    *uint32        `json:"uid,omitempty"`
 	Gid    *uint32        `json:"gid,omitempty"`
 	MTime  *time.Time     `json:"mtime,omitempty"`
+	ATime  *time.Time     `json:"atime,omitempty"`
 }
 
 type SetAttrResponse struct {

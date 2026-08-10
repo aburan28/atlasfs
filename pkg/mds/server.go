@@ -360,12 +360,8 @@ func (s *Server) HasLocator(ctx context.Context, req *HasLocatorRequest) (*HasLo
 // directory version, which is what invalidates every holder's negative
 // cache entry for this name in one step (§10.4).
 func (s *Server) Mkdir(ctx context.Context, req *MkdirRequest) (*MkdirResponse, error) {
-	perm := req.Mode & 0o7777
-	if perm == 0 {
-		perm = 0o755
-	}
 	rec := metadb.InodeRecord{
-		IsDir: true, Mode: perm, Uid: req.Uid, Gid: req.Gid, MTime: time.Now(), NLink: 2,
+		IsDir: true, Mode: req.Mode & 0o7777, Uid: req.Uid, Gid: req.Gid, MTime: time.Now(), NLink: 2,
 	}
 	id, err := s.db.CommitMkdir(req.Dir, req.Name, rec)
 	if err != nil {
@@ -445,7 +441,7 @@ func (s *Server) SetAttr(ctx context.Context, req *SetAttrRequest) (*SetAttrResp
 		}
 	}
 	rec, err := s.db.SetAttr(req.Inode, metadb.AttrMutation{
-		Mode: req.Mode, Uid: req.Uid, Gid: req.Gid, MTime: req.MTime,
+		Mode: req.Mode, Uid: req.Uid, Gid: req.Gid, MTime: req.MTime, ATime: req.ATime,
 	})
 	if err != nil {
 		return nil, toStatus(err)

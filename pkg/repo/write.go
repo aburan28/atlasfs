@@ -64,13 +64,17 @@ func (r *Repo) QuotaLimits() (bytesLimit, inodesLimit uint64, err error) {
 // WriteHandle buffers a new or replacement file's content. Nothing is
 // visible in the namespace until Commit.
 type WriteHandle struct {
-	repo  *Repo
-	dir   metadb.InodeID
-	name  string
-	mode  uint32
-	owner Owner
-	buf   bytes.Buffer
-	done  bool
+	repo *Repo
+	dir  metadb.InodeID
+	name string
+	// mode/modeSet: a create(2) asking for mode 0 is a legitimate
+	// request (an unreadable, unwritable file), so "no mode given" needs
+	// its own flag rather than being spelled as zero.
+	mode    uint32
+	modeSet bool
+	owner   Owner
+	buf     bytes.Buffer
+	done    bool
 }
 
 // Owner is the uid/gid a new inode is created with (DESIGN.md §20).
@@ -95,7 +99,7 @@ func (h *WriteHandle) SetOwner(o Owner) { h.owner = o }
 // Without this an open(2) with O_CREAT and mode 0755 produces a 0644
 // file, and every program that creates an executable directly — install,
 // tar restoring an archive, a build emitting a script — loses the bit.
-func (h *WriteHandle) SetMode(mode uint32) { h.mode = mode & 0o7777 }
+func (h *WriteHandle) SetMode(mode uint32) { h.mode, h.modeSet = mode&0o7777, true }
 
 // CreateFile opens a buffered write handle for name within dir. Fails
 // with ErrReadOnly outside a mutable class. Does not touch the
@@ -190,7 +194,7 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 	}
 
 	mode := h.mode
-	if mode == 0 {
+	if !h.modeSet {
 		mode = 0o644
 	}
 	rec := metadb.InodeRecord{Mode: mode, Uid: h.owner.Uid, Gid: h.owner.Gid, MTime: time.Now(), NLink: 1}
@@ -243,12 +247,8 @@ func (r *Repo) Mkdir(dir metadb.InodeID, name string, mode uint32, owner Owner) 
 	if !r.Class.Mutable() {
 		return 0, ErrReadOnly
 	}
-	perm := mode & 0o7777
-	if perm == 0 {
-		perm = 0o755
-	}
 	id, err := r.DB.CommitMkdir(dir, name, metadb.InodeRecord{
-		IsDir: true, Mode: perm, Uid: owner.Uid, Gid: owner.Gid, MTime: time.Now(), NLink: 2,
+		IsDir: true, Mode: mode & 0o7777, Uid: owner.Uid, Gid: owner.Gid, MTime: time.Now(), NLink: 2,
 	})
 	if err != nil {
 		switch {

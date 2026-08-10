@@ -24,6 +24,7 @@ type AttrMutation struct {
 	Uid   *uint32
 	Gid   *uint32
 	MTime *time.Time
+	ATime *time.Time
 }
 
 // SetAttr applies mut to id and returns the updated record.
@@ -49,6 +50,13 @@ func (db *DB) SetAttr(id InodeID, mut AttrMutation) (InodeRecord, error) {
 		if mut.MTime != nil {
 			rec.MTime = *mut.MTime
 		}
+		if mut.ATime != nil {
+			rec.ATime = *mut.ATime
+		}
+		// Any successful setattr changes the inode, so ctime moves — and
+		// unlike mtime it is not settable by the caller, which is the
+		// whole point of it.
+		rec.CTime = time.Now()
 		// chown(2) clears set-user-ID and set-group-ID on a successful
 		// change by a non-root caller, and clearing them unconditionally
 		// is the safe direction: leaving a setuid bit attached to a file

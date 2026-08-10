@@ -85,10 +85,18 @@ type InodeRecord struct {
 	// chown; a zero pair means "unset" for records written before
 	// ownership was tracked, and the mounts present that as root-owned,
 	// which is what an unowned inode already looked like.
-	Uid         uint32
-	Gid         uint32
-	Size        uint64
-	MTime       time.Time
+	Uid   uint32
+	Gid   uint32
+	Size  uint64
+	MTime time.Time
+	// ATime and CTime are the access and inode-change times. Both fall
+	// back to MTime when zero, which is what a record written before they
+	// were tracked has and what this filesystem reported for all three
+	// before that. ATime is only ever set explicitly (utimensat):
+	// updating it on every read would turn each read into a metadata
+	// write, which is the reason real filesystems default to relatime.
+	ATime       time.Time
+	CTime       time.Time
 	NLink       uint32
 	HasManifest bool
 	ManifestID  manifest.ID
@@ -111,6 +119,22 @@ type InodeRecord struct {
 	// record, the same way a real filesystem treats a fast symlink.
 	IsSymlink     bool
 	SymlinkTarget string
+}
+
+// Atime is the access time to report, falling back to MTime.
+func (r InodeRecord) Atime() time.Time {
+	if r.ATime.IsZero() {
+		return r.MTime
+	}
+	return r.ATime
+}
+
+// Ctime is the inode-change time to report, falling back to MTime.
+func (r InodeRecord) Ctime() time.Time {
+	if r.CTime.IsZero() {
+		return r.MTime
+	}
+	return r.CTime
 }
 
 type DirEntry struct {
@@ -380,6 +404,7 @@ func dropLinkTx(tx *bbolt.Tx, id InodeID, rec InodeRecord, deletedAt time.Time) 
 	// rmdir'd directory un-graved and its inode unreclaimable.
 	if !rec.IsDir && rec.NLink > 1 {
 		rec.NLink--
+		rec.CTime = deletedAt // a link-count change is an inode change
 		return putInode(tx, id, rec)
 	}
 	if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
@@ -419,6 +444,7 @@ func (db *DB) Link(dir InodeID, name string, target InodeID) (InodeRecord, error
 			rec.NLink = 1
 		}
 		rec.NLink++
+		rec.CTime = time.Now() // a link-count change is an inode change
 		if err := putInode(tx, target, rec); err != nil {
 			return err
 		}
@@ -1168,22 +1194,17 @@ func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID,
 			id = existing
 			oldSize = existingRec.Size
 			// The caller supplies content and mtime — not link count, not
-			// permissions. Taking rec's NLink verbatim would reset a
-			// hard-linked file's count to 1 on every overwrite, after
-			// which removing one of its names would grave an inode the
-			// other name still resolves to and GC would reclaim chunks a
-			// live file reads. Taking its Mode verbatim would strip the
-			// exec bit off any script the caller merely rewrote, which
-			// is what write-then-run workflows notice immediately.
-			if existingRec.NLink > 1 {
-				rec.NLink = existingRec.NLink
-			}
-			if existingRec.Mode != 0 {
-				rec.Mode = existingRec.Mode
-			}
-			// Ownership likewise: writing to a file you do not own must
-			// not quietly transfer it to you.
+			// permissions, not ownership. Taking rec's NLink verbatim
+			// would reset a hard-linked file's count to 1 on every
+			// overwrite, after which removing one of its names would
+			// grave an inode the other name still resolves to and GC
+			// would reclaim chunks a live file reads. Taking its Mode
+			// would strip the exec bit off any script the caller merely
+			// rewrote. Taking its Uid/Gid would transfer a file to
+			// whoever last wrote to it.
+			rec.NLink, rec.Mode = existingRec.NLink, existingRec.Mode
 			rec.Uid, rec.Gid = existingRec.Uid, existingRec.Gid
+			rec.CTime = time.Now()
 		case isNew:
 			newID, err := allocInodeTx(tx)
 			if err != nil {

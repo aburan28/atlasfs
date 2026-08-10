@@ -495,7 +495,7 @@ func (c *Client) SetAttr(ctx context.Context, id metadb.InodeID, mut metadb.Attr
 	err := c.cc.Invoke(ctx, MethodSetAttr,
 		&SetAttrRequest{
 			Holder: c.holder, Inode: id,
-			Mode: mut.Mode, Uid: mut.Uid, Gid: mut.Gid, MTime: mut.MTime,
+			Mode: mut.Mode, Uid: mut.Uid, Gid: mut.Gid, MTime: mut.MTime, ATime: mut.ATime,
 		}, &resp)
 	if err == nil {
 		// The mutator is excluded from its own recall, so nothing else

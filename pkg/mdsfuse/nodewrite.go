@@ -193,7 +193,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	// The kernel has already applied the caller's umask, so mode is what
 	// the file should end up with.
 	uid, gid := callerOwner(ctx)
-	h := &writeHandle{sess: &writeSession{cfg: n.cfg, dir: n.ino, name: name, mode: mode, uid: uid, gid: gid}}
+	h := &writeHandle{sess: &writeSession{cfg: n.cfg, dir: n.ino, name: name, mode: mode, modeSet: true, uid: uid, gid: gid}}
 	// Commit immediately so the name exists as soon as create(2) returns,
 	// which is what a caller that stats it straight afterwards expects.
 	// The empty record is replaced on the first real flush.
@@ -417,7 +417,10 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 	if mtime, ok := in.GetMTime(); ok {
 		mut.MTime = &mtime
 	}
-	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil {
+	if atime, ok := in.GetATime(); ok {
+		mut.ATime = &atime
+	}
+	if mut.Mode != nil || mut.Uid != nil || mut.Gid != nil || mut.MTime != nil || mut.ATime != nil {
 		rec, err := n.cfg.Client.SetAttr(ctx, n.ino, mut)
 		if err != nil {
 			return errnoFor(err)
@@ -427,7 +430,7 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 
 	size, ok := in.GetSize()
 	if !ok {
-		if mut.Mode == nil && mut.Uid == nil && mut.Gid == nil && mut.MTime == nil {
+		if mut.Mode == nil && mut.Uid == nil && mut.Gid == nil && mut.MTime == nil && mut.ATime == nil {
 			rec, errno := n.current(ctx)
 			if errno != 0 {
 				return errno

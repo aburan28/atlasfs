@@ -125,6 +125,13 @@ func Mount(ctx context.Context, cfg Config, mountpoint string, onMounted func(*f
 	server, err := fs.Mount(mountpoint, root, &fs.Options{
 		EntryTimeout: &ttl,
 		AttrTimeout:  &ttl,
+		// NullPermissions: this filesystem sets every mode itself, so a
+		// zero one is a real answer. Without it go-fuse substitutes 0644
+		// whenever the permission bits are zero — a convenience for
+		// filesystems that do not track modes, and here it silently hands
+		// a world-readable file to a caller who asked create(2) for an
+		// unreadable one.
+		NullPermissions: true,
 		// NegativeTimeout stays zero: §10.4 validates a negative entry
 		// against a directory version the kernel cannot see, so a
 		// kernel-side miss cache would mask a create on another holder
@@ -193,21 +200,31 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 	if !rec.MTime.IsZero() {
 		sec = uint64(rec.MTime.Unix())
 	}
-	out.Mtime, out.Atime, out.Ctime = sec, sec, sec
+	out.Mtime = sec
+	out.Atime, out.Ctime = unixOrZero(rec.Atime()), unixOrZero(rec.Ctime())
 	out.Rdev = rec.Rdev
 	switch {
 	case rec.IsDir:
-		out.Mode, out.Nlink = syscall.S_IFDIR|permBits(rec.Mode, 0o755, readOnly), 2
+		out.Mode, out.Nlink = syscall.S_IFDIR|permBits(rec.Mode, readOnly), 2
 	case rec.IsSymlink:
 		out.Mode, out.Nlink = syscall.S_IFLNK|0o777, 1
 	case rec.Type != 0:
 		// A special file: the VFS handles the FIFO or socket itself, and
 		// all this layer owes it is the type, permissions, rdev and the
 		// real link count — link(2) works on a FIFO like any other file.
-		out.Mode, out.Nlink = rec.Type|permBits(rec.Mode, 0o644, readOnly), nlinkOf(rec)
+		out.Mode, out.Nlink = rec.Type|permBits(rec.Mode, readOnly), nlinkOf(rec)
 	default:
-		out.Mode, out.Nlink = syscall.S_IFREG|permBits(rec.Mode, 0o644, readOnly), nlinkOf(rec)
+		out.Mode, out.Nlink = syscall.S_IFREG|permBits(rec.Mode, readOnly), nlinkOf(rec)
 	}
+}
+
+// unixOrZero converts a timestamp for fuse.Attr, mapping the zero time
+// to 0 rather than to a negative epoch value.
+func unixOrZero(t time.Time) uint64 {
+	if t.IsZero() {
+		return 0
+	}
+	return uint64(t.Unix())
 }
 
 // nlinkOf is the stored link count, never a constant: a hard-linked file
@@ -230,11 +247,8 @@ func nlinkOf(rec metadb.InodeRecord) uint32 {
 // advertising a writable file that will refuse the write only produces a
 // confusing error later. The exec bit stays: publishing a tree of
 // binaries read-only and running them is the point.
-func permBits(mode uint32, def uint32, readOnly bool) uint32 {
+func permBits(mode uint32, readOnly bool) uint32 {
 	perm := mode & 0o7777
-	if perm == 0 {
-		perm = def
-	}
 	if readOnly {
 		perm &^= 0o222
 	}

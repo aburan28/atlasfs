@@ -49,7 +49,10 @@ type writeSession struct {
 	// mode is what a create(2) asked for, carried to the first commit so
 	// a file created executable is executable. Zero means "use the
 	// default"; an overwrite keeps the stored mode regardless.
-	mode uint32
+	// mode/modeSet: mode 0 is a legitimate create(2) request, so "not
+	// given" needs its own flag rather than being spelled as zero.
+	mode    uint32
+	modeSet bool
 	// uid/gid are the creating process's, stamped on a new inode. An
 	// overwrite keeps the stored ownership — writing to a file you do not
 	// own must not quietly transfer it to you (metadb.CommitFile).
@@ -114,7 +117,7 @@ func (w *writeSession) commit(ctx context.Context) error {
 	}
 
 	mode := w.mode & 0o7777
-	if mode == 0 {
+	if !w.modeSet {
 		mode = 0o644
 	}
 	rec := metadb.InodeRecord{

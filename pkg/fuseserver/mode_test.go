@@ -195,3 +195,82 @@ func TestMkdirHonoursTheRequestedMode(t *testing.T) {
 		t.Fatalf("mkdir 0700 produced %v", fi.Mode().Perm())
 	}
 }
+
+// TestCreateWithModeZero: `open(path, O_CREAT|O_WRONLY, 0)` asks for a
+// file with no permission bits at all. That is a legitimate request, and
+// spelling "no mode given" as zero internally turned it into 0644 — a
+// file the caller explicitly wanted unreadable coming out world-readable.
+func TestCreateWithModeZero(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "locked")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0 {
+		t.Fatalf("O_CREAT with mode 0 produced %v", fi.Mode().Perm())
+	}
+}
+
+// TestUtimesSetsAtimeSeparately: atime and mtime are distinct
+// attributes, and reporting mtime for both makes utimensat look like it
+// silently ignored half its argument.
+func TestUtimesSetsAtimeSeparately(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "times")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	atime := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	mtime := time.Date(2011, 12, 13, 14, 15, 16, 0, time.UTC)
+	if err := os.Chtimes(path, atime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	st := statOf(t, path)
+	if got := time.Unix(st.Atim.Sec, 0).UTC(); !got.Equal(atime) {
+		t.Errorf("atime = %v, want %v", got, atime)
+	}
+	if got := time.Unix(st.Mtim.Sec, 0).UTC(); !got.Equal(mtime) {
+		t.Errorf("mtime = %v, want %v", got, mtime)
+	}
+}
+
+// TestCtimeMovesOnMetadataChange: ctime is the inode-change time and is
+// not settable by the caller — that is the whole point of it. A chmod
+// must move it even though it leaves mtime alone.
+func TestCtimeMovesOnMetadataChange(t *testing.T) {
+	_, mnt := mountWritable(t)
+	path := filepath.Join(mnt, "ct")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	before := statOf(t, path)
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after := statOf(t, path)
+	// Compared against mtime rather than against the previous ctime: both
+	// chmod and the utimes before it stamp ctime with "now", and at
+	// one-second stat granularity those are usually the same value.
+	if after.Ctim.Sec <= after.Mtim.Sec {
+		t.Fatalf("ctime %d did not move past the explicitly-set mtime %d on chmod", after.Ctim.Sec, after.Mtim.Sec)
+	}
+	_ = before
+	if after.Mtim.Sec != before.Mtim.Sec {
+		t.Fatalf("chmod changed mtime: %d -> %d", before.Mtim.Sec, after.Mtim.Sec)
+	}
+}
