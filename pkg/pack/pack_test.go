@@ -10,6 +10,15 @@ import (
 	"github.com/aburan28/atlasfs/pkg/store/local"
 )
 
+func newTestBackend(t *testing.T) store.Backend {
+	t.Helper()
+	b, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func TestPackerSealAndFetch(t *testing.T) {
 	backend, err := local.New(t.TempDir())
 	if err != nil {
@@ -95,5 +104,58 @@ func TestFetchDetectsCorruption(t *testing.T) {
 	}
 	if _, err := Fetch(ctx, backend, c, loc); err == nil {
 		t.Fatal("expected Fetch to detect corrupted content via hash verification")
+	}
+}
+
+// TestFetchIntoVerifiesHash: the caller-supplied-destination path must
+// uphold DESIGN.md §24.4 exactly as Fetch does. If FetchInto skipped
+// verification, the zero-copy read path added for GPUDirect would be a
+// hole straight through the filesystem's self-verification guarantee —
+// and it would be an invisible one, since the bytes would look fine.
+func TestFetchIntoVerifiesHash(t *testing.T) {
+	ctx := context.Background()
+	backend := newTestBackend(t)
+
+	data := []byte("content that will be corrupted underneath us")
+	c := chunk.Chunk{ID: chunk.Sum(data), Data: data}
+	loc, err := PutSingleObject(ctx, backend, "local", c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reading it honestly succeeds.
+	p := make([]byte, loc.Length)
+	if err := FetchInto(ctx, backend, c.ID, loc, p); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(p, data) {
+		t.Fatal("FetchInto returned the wrong bytes")
+	}
+
+	// Asking for the same range under a different chunk ID is exactly what
+	// a corrupted or substituted object looks like, and must be rejected.
+	other := chunk.Sum([]byte("something else entirely"))
+	if err := FetchInto(ctx, backend, other, loc, p); err == nil {
+		t.Fatal("FetchInto accepted bytes that do not hash to the requested chunk ID")
+	}
+}
+
+// TestFetchIntoRejectsWrongSizedBuffer: the contract is that p is exactly
+// the chunk. A caller passing a larger buffer would otherwise get a
+// partially-filled slice whose tail is stale or zero, and the hash check
+// would fail confusingly rather than the size check failing clearly.
+func TestFetchIntoRejectsWrongSizedBuffer(t *testing.T) {
+	ctx := context.Background()
+	backend := newTestBackend(t)
+	data := []byte("exact size matters")
+	c := chunk.Chunk{ID: chunk.Sum(data), Data: data}
+	loc, err := PutSingleObject(ctx, backend, "local", c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{0, len(data) - 1, len(data) + 1} {
+		if err := FetchInto(ctx, backend, c.ID, loc, make([]byte, size)); err == nil {
+			t.Fatalf("FetchInto accepted a %d-byte buffer for a %d-byte chunk", size, len(data))
+		}
 	}
 }

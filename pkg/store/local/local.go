@@ -50,6 +50,32 @@ func (b *Backend) path(key string) (string, error) {
 	return p, nil
 }
 
+// GetInto implements store.GetterInto: one pread(2) straight into the
+// caller's buffer, with no intermediate allocation and no stream to
+// drain. This is the local-disk analogue of what a GPUDirect backend
+// would do into device memory, and it is what makes the seam worth
+// having rather than merely tidy — see pkg/store/getinto.go.
+func (b *Backend) GetInto(_ context.Context, key string, off int64, p []byte) error {
+	path, err := b.path(key)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return store.ErrNotFound
+		}
+		return err
+	}
+	defer f.Close()
+	// ReadAt is documented to read len(p) bytes or return an error, which
+	// is exactly GetterInto's contract — no short-read handling needed.
+	if _, err := f.ReadAt(p, off); err != nil {
+		return fmt.Errorf("local backend: read %s at %d: %w", key, off, err)
+	}
+	return nil
+}
+
 func (b *Backend) Get(_ context.Context, key string, off, length int64) (io.ReadCloser, error) {
 	p, err := b.path(key)
 	if err != nil {

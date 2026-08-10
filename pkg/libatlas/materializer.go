@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/aburan28/atlasfs/pkg/chunk"
 	"github.com/aburan28/atlasfs/pkg/metadb"
 	"github.com/aburan28/atlasfs/pkg/repo"
 )
@@ -53,12 +54,20 @@ import (
 var ErrNotRegularFile = errors.New("libatlas: not a regular file")
 
 // materializeBufSize is the copy buffer OpenMapped streams chunk data
-// through when writing a cache entry. Large enough to keep syscall
-// count low for a multi-GB model file, and deliberately not "read the
-// whole file into memory first" the way repo.FileReader.ReadAll is
-// (fine for fuseserver's small buffered writes, wrong here where the
-// whole point is files too big to want resident twice).
-const materializeBufSize = 1 << 20 // 1 MiB
+// through when writing a cache entry. Deliberately not "read the whole
+// file into memory first" the way repo.FileReader.ReadAll is (fine for
+// fuseserver's small buffered writes, wrong here where the whole point
+// is files too big to want resident twice).
+//
+// Sized to one chunk rather than an arbitrary 1 MiB so that this copy —
+// which starts at offset 0 and advances a whole buffer at a time — is
+// chunk-aligned on every read. That is exactly the condition
+// repo.FileReader.ReadAt needs to take its zero-copy path and drop the
+// chunk straight into this buffer, instead of staging it through the
+// reader's cache first (see pkg/store/getinto.go). Costs 3 MiB more
+// resident per in-flight materialization, which is nothing against the
+// multi-GB files this path exists for.
+const materializeBufSize = chunk.DefaultSize
 
 // cacheEntry is one materialized file: its content key, on-disk path,
 // and byte size (for the LRU budget). Held as a list.Element.Value so

@@ -141,6 +141,35 @@ func PutSingleObject(ctx context.Context, backend store.Backend, region string, 
 	return Locator{Container: key, Offset: 0, Length: int64(len(c.Data))}, nil
 }
 
+// FetchInto reads a chunk into p, which must be exactly the chunk's
+// length, and verifies the content hash in place — no intermediate
+// buffer, no allocation. It is Fetch's caller-supplied-destination form
+// (see pkg/store/getinto.go for why that shape matters).
+//
+// The verification tension a GPUDirect backend will have to resolve,
+// stated now rather than discovered later: DESIGN.md §24.4 makes reads
+// self-verifying, and this function upholds that by hashing p after the
+// read. That works because p is host memory the CPU can read back. A
+// real GDS path DMAs storage straight into device memory, where hashing
+// on the CPU would mean copying it back and forfeiting the entire
+// benefit. Such a backend has exactly two honest options — verify on the
+// GPU, or declare verification waived for that path — and the choice
+// belongs to whoever builds it. What this seam guarantees is that the
+// choice is visible: every host-memory read through here is verified,
+// so an unverified path has to say so explicitly.
+func FetchInto(ctx context.Context, backend store.Backend, id chunk.ID, loc Locator, p []byte) error {
+	if int64(len(p)) != loc.Length {
+		return fmt.Errorf("pack: FetchInto buffer is %d bytes, chunk %s is %d", len(p), id, loc.Length)
+	}
+	if err := store.GetInto(ctx, backend, loc.Container, loc.Offset, p); err != nil {
+		return err
+	}
+	if got := chunk.Sum(p); got != id {
+		return fmt.Errorf("pack: chunk %s failed verification (got %s)", id, got)
+	}
+	return nil
+}
+
 // Fetch reads a chunk's bytes from the backend at its locator and
 // verifies the content hash, per DESIGN.md §24.4: reads are
 // self-verifying, so a backend can never serve wrong bytes undetected.

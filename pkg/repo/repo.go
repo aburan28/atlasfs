@@ -554,29 +554,55 @@ func (r *Repo) OpenFile(ctx context.Context, rec metadb.InodeRecord) (*FileReade
 	return fr, nil
 }
 
+// locate resolves a chunk ID to its locator in this repo's region.
+func (fr *FileReader) locate(id chunk.ID) (pack.Locator, error) {
+	loc, found, err := fr.repo.DB.GetLocator(fr.repo.Region, id)
+	if err != nil {
+		return pack.Locator{}, err
+	}
+	if !found {
+		return pack.Locator{}, fmt.Errorf("repo: chunk %s: no locator in region %s", id, fr.repo.Region)
+	}
+	return loc, nil
+}
+
+// readChunkInto fetches a whole chunk directly into p, which must be
+// exactly the chunk's length. This is the path that carries no
+// allocation at all: the destination is the caller's, and verification
+// happens in place (pack.FetchInto).
+func (fr *FileReader) readChunkInto(id chunk.ID, p []byte) error {
+	loc, err := fr.locate(id)
+	if err != nil {
+		return err
+	}
+	return pack.FetchInto(fr.ctx, fr.repo.Backend, id, loc, p)
+}
+
+// chunkBytes returns a chunk's bytes, caching them so repeated reads
+// within the same file (the random-access pattern) do not refetch. It
+// reuses a pooled buffer per fetch rather than letting io.ReadAll size
+// one by doubling — the same bytes end up cached either way, but the
+// transient garbage does not.
 func (fr *FileReader) chunkBytes(id chunk.ID) ([]byte, error) {
 	if b, ok := fr.cache[id]; ok {
 		return b, nil
 	}
-	loc, found, err := fr.repo.DB.GetLocator(fr.repo.Region, id)
+	loc, err := fr.locate(id)
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("repo: chunk %s: no locator in region %s", id, fr.repo.Region)
-	}
-	data, err := pack.Fetch(fr.ctx, fr.repo.Backend, id, loc)
-	if err != nil {
+	buf := make([]byte, loc.Length)
+	if err := pack.FetchInto(fr.ctx, fr.repo.Backend, id, loc, buf); err != nil {
 		return nil, err
 	}
-	fr.cache[id] = data
+	fr.cache[id] = buf
 	fr.cacheQ = append(fr.cacheQ, id)
 	if len(fr.cacheQ) > fileReaderCacheEntries {
 		old := fr.cacheQ[0]
 		fr.cacheQ = fr.cacheQ[1:]
 		delete(fr.cache, old)
 	}
-	return data, nil
+	return buf, nil
 }
 
 // ReadAt implements io.ReaderAt.
@@ -612,11 +638,29 @@ func (fr *FileReader) ReadAt(p []byte, off int64) (int, error) {
 			break
 		}
 		entry := fr.m.Entries[idx]
+		localOff := off - fr.offsets[idx]
+
+		// Fast path: this read starts exactly on a chunk boundary and has
+		// room for the whole chunk, and the chunk is not already cached.
+		// The chunk can then land directly in the caller's buffer — no
+		// intermediate allocation and no copy. This is the shape a
+		// GPUDirect destination would take, which is why it is worth
+		// having even though the sequential-read win alone would justify
+		// it (a whole-file read is entirely made of such chunks).
+		if _, cached := fr.cache[entry.ChunkID]; !cached && localOff == 0 && len(p)-total >= int(entry.Length) {
+			dst := p[total : total+int(entry.Length)]
+			if err := fr.readChunkInto(entry.ChunkID, dst); err != nil {
+				return total, err
+			}
+			total += int(entry.Length)
+			off += int64(entry.Length)
+			continue
+		}
+
 		data, err := fr.chunkBytes(entry.ChunkID)
 		if err != nil {
 			return total, err
 		}
-		localOff := off - fr.offsets[idx]
 		n := copy(p[total:], data[localOff:])
 		total += n
 		off += int64(n)

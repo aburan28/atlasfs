@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -499,5 +500,133 @@ func TestImmutableKernelCacheTTLIsFinite(t *testing.T) {
 	}
 	if ttl > time.Hour {
 		t.Fatalf("immutable kernel TTL = %s; too long for a republish to ever become visible (§8.2)", ttl)
+	}
+}
+
+// TestReadAtFastPathMatchesSlowPathExhaustively guards the zero-copy
+// fast path added for the GPUDirect seam (see pkg/store/getinto.go).
+// ReadAt now reads a chunk straight into the caller's buffer when the
+// read is chunk-aligned and has room, and falls back to the cached copy
+// otherwise. Those two paths must be indistinguishable — a discrepancy
+// would be silent data corruption on exactly the large sequential reads
+// this filesystem exists to serve.
+//
+// The sweep deliberately includes offsets and lengths that straddle
+// chunk boundaries in every way: aligned starts, one-byte-off starts,
+// reads shorter than a chunk, reads spanning several, and reads running
+// past EOF.
+func TestReadAtFastPathMatchesSlowPathExhaustively(t *testing.T) {
+	ctx := context.Background()
+	const chunkSize = 1024
+	const total = chunkSize*5 + 137 // deliberately not a chunk multiple
+
+	want := make([]byte, total)
+	for i := range want {
+		want[i] = byte(i*31 + 7)
+	}
+
+	src := t.TempDir()
+	writeFile(t, src, "data.bin", want)
+
+	r, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	r.ChunkSize = chunkSize
+	if _, _, _, err := r.PublishTree(ctx, src, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, rec, err := r.Resolve("/data.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	offsets := []int64{0, 1, chunkSize - 1, chunkSize, chunkSize + 1, 2 * chunkSize, 3*chunkSize + 500, total - 1}
+	lengths := []int{1, 2, chunkSize - 1, chunkSize, chunkSize + 1, 2 * chunkSize, total, total + 100}
+
+	for _, off := range offsets {
+		for _, length := range lengths {
+			// A fresh FileReader per case so the fast path is reachable:
+			// a warm cache would route every read through chunkBytes and
+			// the sweep would silently stop testing what it means to.
+			fr, err := r.OpenFile(ctx, rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := make([]byte, length)
+			n, err := fr.ReadAt(p, off)
+			if err != nil && err != io.EOF {
+				t.Fatalf("off=%d len=%d: %v", off, length, err)
+			}
+
+			expEnd := off + int64(length)
+			if expEnd > total {
+				expEnd = total
+			}
+			expN := int(expEnd - off)
+			if off >= total {
+				expN = 0
+			}
+			if n != expN {
+				t.Fatalf("off=%d len=%d: read %d bytes, want %d", off, length, n, expN)
+			}
+			if !bytes.Equal(p[:n], want[off:off+int64(n)]) {
+				t.Fatalf("off=%d len=%d: content mismatch", off, length)
+			}
+		}
+	}
+}
+
+// TestReadAtFastPathAndCachedPathAgree runs the same read twice on one
+// FileReader. The first goes down the zero-copy path (cache empty), the
+// second is served from cache. Identical bytes both times, or the
+// caching layer and the direct layer have diverged.
+func TestReadAtFastPathAndCachedPathAgree(t *testing.T) {
+	ctx := context.Background()
+	const chunkSize = 512
+	want := make([]byte, chunkSize*4)
+	for i := range want {
+		want[i] = byte(i % 251)
+	}
+	src := t.TempDir()
+	writeFile(t, src, "d.bin", want)
+
+	r, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	r.ChunkSize = chunkSize
+	if _, _, _, err := r.PublishTree(ctx, src, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, rec, err := r.Resolve("/d.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, err := r.OpenFile(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := make([]byte, chunkSize)
+	if _, err := fr.ReadAt(first, chunkSize); err != nil {
+		t.Fatal(err)
+	}
+	// Force the chunk into cache, then read the same range again.
+	mid := make([]byte, 10)
+	if _, err := fr.ReadAt(mid, chunkSize+5); err != nil {
+		t.Fatal(err)
+	}
+	second := make([]byte, chunkSize)
+	if _, err := fr.ReadAt(second, chunkSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("zero-copy read and cached read returned different bytes")
+	}
+	if !bytes.Equal(first, want[chunkSize:2*chunkSize]) {
+		t.Fatal("read returned the wrong bytes entirely")
 	}
 }
