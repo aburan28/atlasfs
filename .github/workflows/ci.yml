@@ -51,10 +51,17 @@ jobs:
         run: go vet ./...
 
       - name: go test
-        run: go test ./... -count=1
+        # -timeout well under the job ceiling: a hung FUSE test used to
+        # burn eleven minutes before Go dumped goroutines, and the dump
+        # did not even name the test. Failing in five is cheaper.
+        timeout-minutes: 8
+        run: go test ./... -count=1 -timeout 5m
 
       - name: go test -race
-        run: go test ./... -count=1 -race
+        # -race is slower, so it gets a larger budget than the plain run —
+        # still bounded, for the same reason.
+        timeout-minutes: 15
+        run: go test ./... -count=1 -race -timeout 10m
 
       # Benchmarks are compiled and run for one iteration only: this is a
       # correctness gate (a benchmark that no longer builds or panics is a

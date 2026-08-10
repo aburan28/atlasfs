@@ -74,8 +74,24 @@ func benchMount(b *testing.B, size int64) string {
 		b.Fatal("timed out waiting for FUSE mount")
 	}
 	b.Cleanup(func() {
-		_ = server.Unmount()
-		<-errCh
+		// Bounded, like the tests': a benchmark that blocks forever in
+		// cleanup takes the whole CI step down with it.
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			if err := server.Unmount(); err == nil {
+				break
+			} else if time.Now().After(deadline) {
+				b.Errorf("could not unmount the benchmark mount: %v", err)
+				r2.Close()
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		select {
+		case <-errCh:
+		case <-time.After(15 * time.Second):
+			b.Error("Mount did not return after a successful unmount")
+		}
 		r2.Close()
 	})
 

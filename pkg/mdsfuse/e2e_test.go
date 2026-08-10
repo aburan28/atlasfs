@@ -75,6 +75,31 @@ func startCluster(t *testing.T, cfg mds.Config) *cluster {
 	}
 }
 
+// unmountAndWait tears a test mount down without being able to hang the
+// suite. Unmount() then <-errCh deadlocks permanently if the unmount
+// fails, because Mount() only returns once the server is down — and a
+// mountpoint the kernel still holds busy is exactly when that happens.
+func unmountAndWait(t *testing.T, server *fuse.Server, errCh <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		err := server.Unmount()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("could not unmount the test mount: %v (leaving it mounted rather than blocking the suite)", err)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case <-errCh:
+	case <-time.After(15 * time.Second):
+		t.Errorf("Mount did not return after a successful unmount")
+	}
+}
+
 func mustLocal(t *testing.T, dir string) *local.Backend {
 	t.Helper()
 	b, err := local.New(dir)
@@ -115,10 +140,7 @@ func (c *cluster) mountAt(t *testing.T, holder string, ttl time.Duration) string
 	}()
 	select {
 	case server := <-mounted:
-		t.Cleanup(func() {
-			_ = server.Unmount()
-			<-errCh
-		})
+		t.Cleanup(func() { unmountAndWait(t, server, errCh) })
 	case err := <-errCh:
 		t.Fatalf("mount %s failed: %v", holder, err)
 	case <-time.After(10 * time.Second):

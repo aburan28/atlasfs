@@ -75,10 +75,7 @@ func TestMountReadBack(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for FUSE mount")
 	}
-	defer func() {
-		_ = server.Unmount()
-		<-errCh
-	}()
+	defer unmountAndWait(t, server, errCh)
 
 	got, err := os.ReadFile(filepath.Join(mountpoint, "hello.txt"))
 	if err != nil {
@@ -159,11 +156,39 @@ func mountForTest(t *testing.T, r *repo.Repo) string {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for FUSE mount")
 	}
-	t.Cleanup(func() {
-		_ = server.Unmount()
-		<-errCh
-	})
+	t.Cleanup(func() { unmountAndWait(t, server, errCh) })
 	return mountpoint
+}
+
+// unmountAndWait tears a test mount down without ever being able to hang
+// the suite.
+//
+// The naive version — Unmount() then <-errCh — deadlocks permanently
+// whenever Unmount fails: Mount() only returns once the server is torn
+// down, so a mountpoint the kernel still considers busy blocks the
+// receive forever. A test that execs anything from the mount can leave it
+// busy for a moment, and CI paid for that with an eleven-minute hang and
+// a goroutine dump that did not even name the responsible test. Bounded
+// waits plus a real error message are worth more here than tidiness.
+func unmountAndWait(t *testing.T, server *fuse.Server, errCh <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		err := server.Unmount()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("could not unmount the test mount: %v (leaving it mounted rather than blocking the suite)", err)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case <-errCh:
+	case <-time.After(15 * time.Second):
+		t.Errorf("Mount did not return after a successful unmount")
+	}
 }
 
 // TestMountReadWrite is the writable-class vertical slice, end to end,

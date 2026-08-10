@@ -110,10 +110,7 @@ func setupCfg(t *testing.T, readOnly bool, build func(t *testing.T, r *repo.Repo
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for the mds-backed mount")
 	}
-	t.Cleanup(func() {
-		_ = server.Unmount()
-		<-errCh
-	})
+	t.Cleanup(func() { unmountAndWait(t, server, errCh) })
 	_ = ctx
 	return env{mountpoint: mountpoint, repoDir: repoDir, client: client}
 }
@@ -277,10 +274,7 @@ func TestReadsGoThroughTheAuthority(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for mount")
 	}
-	defer func() {
-		_ = server.Unmount()
-		<-errCh
-	}()
+	defer unmountAndWait(t, server, errCh)
 
 	if _, err := os.ReadFile(filepath.Join(mountpoint, "f.txt")); err != nil {
 		t.Fatalf("precondition: read should work while the authority is up: %v", err)
