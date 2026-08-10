@@ -202,18 +202,23 @@ func fillAttrMode(rec metadb.InodeRecord, readOnly bool, out *fuse.Attr) {
 		out.Mode, out.Nlink = syscall.S_IFLNK|0o777, 1
 	case rec.Type != 0:
 		// A special file: the VFS handles the FIFO or socket itself, and
-		// all this layer owes it is the type, permissions and rdev.
-		out.Mode, out.Nlink = rec.Type|permBits(rec.Mode, 0o644, readOnly), 1
+		// all this layer owes it is the type, permissions, rdev and the
+		// real link count — link(2) works on a FIFO like any other file.
+		out.Mode, out.Nlink = rec.Type|permBits(rec.Mode, 0o644, readOnly), nlinkOf(rec)
 	default:
-		// The stored link count, not a constant: a hard-linked file
-		// reporting 1 would tell a caller it is safe to delete the last
-		// name when it is not.
-		nlink := uint32(rec.NLink)
-		if nlink == 0 {
-			nlink = 1
-		}
-		out.Mode, out.Nlink = syscall.S_IFREG|permBits(rec.Mode, 0o644, readOnly), nlink
+		out.Mode, out.Nlink = syscall.S_IFREG|permBits(rec.Mode, 0o644, readOnly), nlinkOf(rec)
 	}
+}
+
+// nlinkOf is the stored link count, never a constant: a hard-linked file
+// reporting 1 would tell a caller it is safe to delete the last name
+// when it is not. A record written before link counts were tracked reads
+// back as 0 and means one link.
+func nlinkOf(rec metadb.InodeRecord) uint32 {
+	if rec.NLink == 0 {
+		return 1
+	}
+	return uint32(rec.NLink)
 }
 
 // permBits reports the permission bits to advertise: the record's own,

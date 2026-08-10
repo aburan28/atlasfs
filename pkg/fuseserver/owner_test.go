@@ -188,3 +188,25 @@ func TestMknodRegularFileIsRefused(t *testing.T) {
 		t.Fatal("expected mknod of a regular file to be refused")
 	}
 }
+
+// TestHardLinkOnAFifo: link(2) works on a FIFO exactly as on a regular
+// file, so the reported link count has to come from the record rather
+// than from a constant for the special-file branch.
+func TestHardLinkOnAFifo(t *testing.T) {
+	_, mnt := mountWritable(t)
+	f := filepath.Join(mnt, "f")
+	if err := syscall.Mkfifo(f, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n := statOf(t, f).Nlink; n != 1 {
+		t.Fatalf("fresh fifo has nlink %d, want 1", n)
+	}
+	if err := os.Link(f, filepath.Join(mnt, "g")); err != nil {
+		t.Fatalf("link a fifo: %v", err)
+	}
+	for _, name := range []string{"f", "g"} {
+		if n := statOf(t, filepath.Join(mnt, name)).Nlink; n != 2 {
+			t.Errorf("%s reports nlink %d after the link, want 2", name, n)
+		}
+	}
+}

@@ -204,19 +204,27 @@ func fillAttrOut(rec metadb.InodeRecord, mutable bool, out *fuse.Attr) {
 	case rec.Type != 0:
 		// A special file: the VFS handles the FIFO or socket itself once
 		// getattr tells it what the inode is. All this layer owes it is
-		// the type, the permissions and the device number.
+		// the type, the permissions, the device number — and the real
+		// link count, because link(2) works on a FIFO exactly as it does
+		// on a regular file.
 		out.Mode = rec.Type | permBits(rec.Mode, 0o644, mutable)
-		out.Nlink = 1
+		out.Nlink = nlinkOf(rec)
 	default:
 		out.Mode = syscall.S_IFREG | permBits(rec.Mode, 0o644, mutable)
-		// The stored count, not a constant: `ls -l` and `find -links`
-		// read it, and a hard-linked file reporting 1 would tell a
-		// caller it is safe to delete the last name when it is not.
-		out.Nlink = uint32(rec.NLink)
-		if out.Nlink == 0 {
-			out.Nlink = 1
-		}
+		out.Nlink = nlinkOf(rec)
 	}
+}
+
+// nlinkOf is the stored link count, never a constant: `ls -l` and
+// `find -links` read it, and a hard-linked file reporting 1 would tell a
+// caller it is safe to delete the last name when it is not. Records
+// written before link counts were tracked read back as 0 and mean one
+// link.
+func nlinkOf(rec metadb.InodeRecord) uint32 {
+	if rec.NLink == 0 {
+		return 1
+	}
+	return uint32(rec.NLink)
 }
 
 // permBits reports the permission bits to advertise: the record's own,
