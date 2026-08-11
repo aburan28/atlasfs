@@ -294,11 +294,45 @@ file size. It is fixed for the repo's lifetime because re-chunking the
 same bytes at a different size changes every chunk ID and would silently
 disable dedup.
 
-What this does **not** claim: a 24-hour soak has still not been run, and
-GC-1 puts a floor of just over an hour on `T_grace` (default 24 h), so
-garbage stays on disk for at least that long by design. A soak still needs
-either a chunk size matched to its file size or headroom for a grace
-window's worth of rewrites.
+Both halves were then measured end to end on a real mount, same seed,
+same 20,000 fsx operations, both runs `All operations completed A-OK`:
+
+| chunk size | backing store after 20,000 fsx ops |
+|---|---|
+| 4 MiB (default) | **2500 MiB** |
+| 16 KiB (`-chunk-size 16384`) | **451 MiB** |
+
+2500 MiB × (170,000 / 20,000) ≈ 21 GB, which is what the original soak
+reached — the diagnosis reproduces to within the noise of a different
+seed.
+
+### The constraint that actually doomed the soak
+
+Even with the leak fixed, the soak could not have been rescued by running
+GC, because **GC cannot run while a mount is up**. metadb's bbolt file
+takes an exclusive inter-process lock, so `atlas gc` on a mounted repo
+blocks for as long as the mount holds it — verified: it hangs until
+killed. A long-running mount therefore never reclaimed anything, by
+construction.
+
+`atlas mount -gc-interval` is the fix. Sweeping from inside the mount's
+own process is also what makes it *correct* rather than merely possible:
+`Repo.OpenHandles` lives there, so the sweep can see which inodes still
+have descriptors open and skip them (§19.3). Verified under load — 15,000
+fsx operations all A-OK with a sweep firing every 20 s against the same
+live repo — and a `-gc-grace` below GC-1's floor is reported on every
+tick rather than silently doing nothing:
+
+```
+atlas: background gc: repo: graceDuration violates DESIGN.md §19.2 invariant GC-1:
+  got 5m0s, need > 1h0m30.5s (T_write_max=1h0m0s + D_max=30s + epsilon=500ms)
+```
+
+What this does **not** claim: a 24-hour soak still has not been run. GC-1
+puts a hard floor just over an hour on `T_grace`, so a grace window's
+worth of garbage is always on disk by design, and at the default chunk
+size that is a large number for a rewrite-heavy workload. A real soak
+wants a chunk size matched to its file size *and* background GC enabled.
 
 The soak also exposed a real errno bug: a full backend surfaced as **EIO**
 rather than **ENOSPC**, which tells an application its data is corrupt when
