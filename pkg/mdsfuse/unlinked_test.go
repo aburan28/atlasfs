@@ -105,6 +105,50 @@ func TestNlinkCountsDownToZeroThroughAuthority(t *testing.T) {
 	}
 }
 
+// A file unlinked while open for write must not come back when the
+// write flushes. Across the authority this needs the mount to tell the
+// authority which inode it is writing, because Commit binds a (dir,
+// name) pair and will happily recreate a dentry the unlink removed.
+// pjdfstest unlink/14 sees it as an rmdir returning ENOTEMPTY.
+func TestUnlinkWhileOpenForWriteDoesNotResurrectTheNameThroughAuthority(t *testing.T) {
+	c := startCluster(t, mds.Config{LeaseDuration: 30 * time.Second})
+	mnt := c.mountAt(t, "writer", 0)
+
+	dir := filepath.Join(mnt, "d")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "scratch")
+
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("written before the unlink"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	if err := f.Close(); err != nil { // the flush that used to rebind
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := os.Lstat(p); !os.IsNotExist(err) {
+		t.Errorf("the unlinked name came back after the write flushed: Lstat = %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("directory should be empty after unlinking its only file, got %d entries", len(entries))
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Errorf("rmdir of the now-empty directory: %v", err)
+	}
+}
+
 func nlinkOfPath(t *testing.T, path string) uint64 {
 	t.Helper()
 	var st syscall.Stat_t

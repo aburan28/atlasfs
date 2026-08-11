@@ -115,15 +115,36 @@ These remain. Each is a real limitation with a reason, not an unexplained
 skip — §27's standard is that "a skip list nobody has justified is
 indistinguishable from a failure list."
 
-### 1. Open-but-unlinked files are not kept alive (`unlink/14`, 2 assertions)
+### 1. Open-but-unlinked files — fixed since this table was written
 
-POSIX requires an unlinked file to stay readable through an already-open
-descriptor until the last one closes. This build graves an inode as soon as
-its last *name* goes, without waiting for open handles — the gap
-`pkg/repo/gc.go` has documented since GC was written, and §19.3's
-leased-open-handle registry is what would close it. It needs open-handle
-tracking across process boundaries, which is authority work rather than a
-mount-local fix.
+This listed `unlink/14` (2 assertions) as an accepted exception, on the
+reasoning that keeping an unlinked inode alive needed cross-process
+open-handle tracking and so was authority work. Reproducing it directly
+showed that was two separate gaps, only one of which was as described.
+
+Reads and writes through a descriptor held across the unlink *already*
+worked — the graveyard retains the inode record, so the data was there.
+What failed was narrower: `fstat` reported `nlink` 1 instead of 0.
+`dropLinkTx` graved the inode without ever storing the count reaching
+zero, and both mounts read a stored 0 as "never set" and substituted 1.
+That substitution is correct for directories, which never store 0, and
+wrong for files now that a 0 is written deliberately.
+
+The gap the exception did not name was worse than a conformance failure:
+GC could reclaim a file that was still open. Grace does not cover it —
+Invariant GC-1 sizes `T_grace` against `T_write_max`, the age of an
+uncommitted *write session*, whereas a descriptor may stay open for as
+long as its process lives. `Repo.OpenHandles` now pins an inode while any
+descriptor is open on it, and both phases of the sweep honour the pin.
+
+That registry is per-process, which is sufficient rather than a
+simplification for the in-process mount: metadb's bbolt file takes an
+exclusive inter-process lock, so no second process can open the repo
+while a mount holds it and any `Sweep` necessarily runs inside the
+mount's own process. Verified rather than assumed — a second opener
+blocks and times out. §19.3's *leased* handles remain the answer for the
+authority-backed mount, where nothing needs them yet because `pkg/mds`
+exposes no sweep.
 
 ### 2. pjdfstest's own Linux deviations
 
@@ -227,12 +248,47 @@ A one-hour `fsx --duration=3600` run was started and did **not** complete: it
 stopped with `domapwrite: ftruncate: Input/output error` after filling the
 volume. The repo had grown to **21 GB** for a file fsx keeps under 256 KB.
 
-That is not a leak, it is the write path's shape, and it is worth stating
-plainly: every commit rewrites the modified file's chunks, and nothing
-reclaims the superseded ones until §19's GC runs — which nothing runs
-automatically. A long random-write workload therefore grows storage without
-bound. `atlas gc` exists and reclaims it; a mount that never calls it does
-not.
+The first diagnosis written here was wrong, and the correction is the more
+useful finding: this said the superseded chunks were merely waiting for a
+GC nobody ran. **Running GC would not have reclaimed a single byte.**
+
+`Sweep` only ever walked the graveyard, and an overwrite creates no
+graveyard entry — the inode is repointed at new content and the old chunks
+are left referenced by nothing at all. So superseded chunks were invisible
+to both halves of mark-and-sweep and leaked permanently. Reproduced
+directly: 25 overwrites of one file left 25 live locators, and a full GC
+pass freed none of them (`TestRepeatedOverwritesDoNotGrowStorageWithoutBound`).
+That is now fixed — `sweepOrphans` collects every chunk the mark phase
+cannot reach, gated on its container's seal time so an in-flight write is
+never mistaken for garbage.
+
+The leak was the unbounded half. The other half is write amplification,
+and it is a policy gap rather than a bug. A commit re-chunks the whole
+file and stores whatever the locator index lacks, so the unit of
+amplification is the chunk: at the 4 MiB default, **every rewrite of a
+smaller file stores a complete new copy**. Measured over 200 rewrites of a
+256 KiB file changing 4 KiB each time:
+
+| chunk size | stored |
+|---|---|
+| 4 MiB (default) | 50.0 MiB |
+| 64 KiB | 13.3 MiB |
+| 16 KiB | 4.2 MiB |
+
+fsx keeps its file under 256 KB and ran 170k operations, which lands
+squarely on the 21 GB observed. DESIGN.md §14.3 already calls `chunk_size`
+a per-subtree policy "with defaults chosen per workload"; it is now
+persisted at creation and reachable as `atlas -chunk-size`, so a
+rewrite-heavy subtree can be created with a chunk size below its typical
+file size. It is fixed for the repo's lifetime because re-chunking the
+same bytes at a different size changes every chunk ID and would silently
+disable dedup.
+
+What this does **not** claim: a 24-hour soak has still not been run, and
+GC-1 puts a floor of just over an hour on `T_grace` (default 24 h), so
+garbage stays on disk for at least that long by design. A soak still needs
+either a chunk size matched to its file size or headroom for a grace
+window's worth of rewrites.
 
 The soak also exposed a real errno bug: a full backend surfaced as **EIO**
 rather than **ENOSPC**, which tells an application its data is corrupt when

@@ -252,6 +252,42 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 	return id, nil
 }
 
+// CommitDetached commits this handle's content into an existing inode
+// without binding any name to it — the write path for a file that was
+// unlinked while still open (DESIGN.md §19.3).
+//
+// The ordinary Commit cannot be used for that, and the reason is a bug
+// this fixed: it resolves (dir, name) and calls CommitFile, which
+// *creates* the dentry if it is missing. A file unlinked while open for
+// write therefore came back at flush — the name reappeared in its
+// directory, and an rmdir that should have succeeded returned ENOTEMPTY
+// (pjdfstest unlink/14).
+func (h *WriteHandle) CommitDetached(ctx context.Context, id metadb.InodeID) error {
+	if h.done {
+		return fmt.Errorf("repo: CommitDetached called on an already-committed or discarded handle")
+	}
+	h.done = true
+	r := h.repo
+
+	content, err := r.storeContent(ctx, bytes.NewReader(h.buf.Bytes()), int64(h.buf.Len()))
+	if err != nil {
+		return err
+	}
+	if err := r.flushPacker(ctx); err != nil {
+		return err
+	}
+
+	rec := metadb.InodeRecord{MTime: time.Now()}
+	content.apply(&rec)
+	if err := r.DB.UpdateInodeContent(id, rec); err != nil {
+		return err
+	}
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
+	}
+	return nil
+}
+
 // Unlink removes name from dir, moving the target inode into the
 // graveyard (DESIGN.md §19.3) rather than reclaiming it immediately —
 // pkg/repo.Sweep is what later collects its chunks, once past the grace

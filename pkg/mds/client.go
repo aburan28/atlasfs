@@ -165,6 +165,24 @@ func (c *Client) Lookup(ctx context.Context, dir metadb.InodeID, name string) (L
 	return resp, err
 }
 
+// LookupUncached resolves a name at the authority, ignoring this
+// client's dentry and negative caches and storing nothing.
+//
+// It exists for the one question a cache must not answer: "does this
+// name still bind the inode I have open?", asked when a write session
+// flushes. A stale hit there recreates a name the user deleted, and
+// §10.2's push invalidation is explicitly best-effort — a dropped
+// invalidate is legal, so the cache can say "still bound" about a file
+// another mount unlinked. Everything else on this client is happy with
+// a bounded-staleness answer; this is not.
+func (c *Client) LookupUncached(ctx context.Context, dir metadb.InodeID, name string) (found bool, id metadb.InodeID, rec metadb.InodeRecord, err error) {
+	var resp LookupResponse
+	if err := c.cc.Invoke(ctx, MethodLookup, &LookupRequest{Holder: c.holder, Dir: dir, Name: name}, &resp); err != nil {
+		return false, 0, metadb.InodeRecord{}, err
+	}
+	return resp.Found, resp.Inode, resp.Record, nil
+}
+
 // cachedDentry answers a lookup locally only if the directory's lease
 // still covers the binding *and* the target inode's own lease still
 // covers its record. Trusting the binding alone would serve a stale
@@ -257,6 +275,18 @@ func (c *Client) Commit(ctx context.Context, dir metadb.InodeID, name string, re
 	if err == nil {
 		c.invalidate(inodeObj(resp.Inode))
 		c.invalidateOwnMutation(dir)
+	}
+	return resp, err
+}
+
+// CommitDetached commits content into an inode without binding a name —
+// see CommitRequest.DetachedInode. No directory changed, so unlike
+// Commit it invalidates only the inode.
+func (c *Client) CommitDetached(ctx context.Context, id metadb.InodeID, rec metadb.InodeRecord) (CommitResponse, error) {
+	var resp CommitResponse
+	err := c.cc.Invoke(ctx, MethodCommit, &CommitRequest{Holder: c.holder, DetachedInode: id, Record: rec}, &resp)
+	if err == nil {
+		c.invalidate(inodeObj(id))
 	}
 	return resp, err
 }

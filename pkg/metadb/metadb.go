@@ -986,6 +986,35 @@ func (db *DB) PutLocator(region string, id chunk.ID, loc pack.Locator, sealedAt 
 // whether it is known at all. Unknown means the container predates seal-
 // time tracking; Sweep treats that as "do not collect" rather than
 // guessing an age (see pkg/repo's orphan sweep).
+// UpdateInodeContent replaces an inode's content pointer, size and mtime
+// in place, touching no dentry at all. It is what a write to an
+// unlinked-but-open file needs (DESIGN.md §19.3): POSIX says such a
+// write lands in the inode, which is discarded when the last descriptor
+// closes — it must not resurrect the name the unlink removed.
+//
+// Identity is preserved rather than taken from rec: mode, ownership and
+// link count belong to the inode that already exists, and a write does
+// not change them. The link count in particular is zero here, and
+// re-deriving it from rec would quietly un-grave the inode.
+//
+// No quota is charged. The unlink already released this inode's bytes
+// and its inode count, and an unreachable file that only its holders can
+// see should not re-consume a subtree's budget; Sweep reclaims the
+// chunks once the last handle closes.
+func (db *DB) UpdateInodeContent(id InodeID, rec InodeRecord) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		existing, err := getInodeTx(tx, id)
+		if err != nil {
+			return err
+		}
+		existing.Size = rec.Size
+		existing.HasManifest, existing.ManifestID = rec.HasManifest, rec.ManifestID
+		existing.HasInline, existing.InlineChunk = rec.HasInline, rec.InlineChunk
+		existing.MTime, existing.CTime = rec.MTime, rec.MTime
+		return putInode(tx, id, existing)
+	})
+}
+
 func (db *DB) ContainerSealedAt(container string) (time.Time, bool, error) {
 	var at time.Time
 	found := false

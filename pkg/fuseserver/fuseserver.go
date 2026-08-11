@@ -918,6 +918,24 @@ func (h *writeFileHandle) target() (metadb.InodeID, string) {
 	return h.parent, h.name
 }
 
+// detachedFrom reports this handle's inode and whether (parent, name) no
+// longer resolves to it — the file was unlinked, or the name now belongs
+// to some other inode. Either way the commit must not touch the dentry.
+//
+// A handle with no node cannot be checked (Create's, before its child
+// exists), and is treated as attached: that path has just bound the name
+// itself, so there is nothing to have been detached from.
+func (h *writeFileHandle) detachedFrom(parent metadb.InodeID, name string) (metadb.InodeID, bool) {
+	if h.node == nil || h.node.ino == 0 {
+		return 0, false
+	}
+	bound, err := h.repo.DB.Lookup(parent, name)
+	if err != nil || bound != h.node.ino {
+		return h.node.ino, true
+	}
+	return h.node.ino, false
+}
+
 // size is the in-flight length of the file this handle is writing,
 // which is ahead of the committed record until flush.
 func (h *writeFileHandle) size() uint64 {
@@ -1032,6 +1050,24 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	if _, err := wh.Write(h.buf); err != nil {
 		return syscall.EIO
 	}
+
+	// A file unlinked while this handle was open must not come back.
+	// The ordinary commit binds (parent, name) and would recreate the
+	// dentry the unlink removed, so writes go straight to the inode
+	// instead — which is what POSIX says happens to an unlinked-but-open
+	// file (§19.3). detachedFrom also covers the name having been taken
+	// over by a different inode in the meantime; committing then would
+	// clobber a file this handle never opened.
+	if id, detached := h.detachedFrom(parent, name); detached {
+		if err := wh.CommitDetached(ctx, id); err != nil {
+			return errnoFor(err)
+		}
+		if rec, err := h.repo.DB.GetInode(id); err == nil {
+			h.node.setCached(rec)
+		}
+		return 0
+	}
+
 	id, err := wh.Commit(ctx)
 	if err != nil {
 		return errnoFor(err)

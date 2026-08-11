@@ -92,6 +92,91 @@ func TestWriteThroughADescriptorSurvivesUnlink(t *testing.T) {
 	}
 }
 
+// A file unlinked while open for write must stay gone. Writes are
+// buffered and committed on flush (§16.1), and the commit used to bind
+// (dir, name) unconditionally — so closing the descriptor recreated the
+// dentry the unlink had removed, and the file reappeared in its
+// directory. pjdfstest unlink/14 catches it as an rmdir returning
+// ENOTEMPTY, which is a long way from the actual defect.
+func TestUnlinkWhileOpenForWriteDoesNotResurrectTheName(t *testing.T) {
+	_, mnt := mountWritable(t)
+	dir := filepath.Join(mnt, "d")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "scratch")
+
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("written before the unlink"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	// The close is what flushes, and what used to rebind the name.
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := os.Lstat(p); !os.IsNotExist(err) {
+		t.Errorf("the unlinked name came back after the write flushed: Lstat = %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("directory should be empty after unlinking its only file, contains %v", names)
+	}
+	// The symptom pjdfstest actually reports.
+	if err := os.Remove(dir); err != nil {
+		t.Errorf("rmdir of the now-empty directory: %v", err)
+	}
+}
+
+// The same guarantee where the name was taken over by a *different*
+// file while the first was open. Flushing the old handle must not
+// clobber the new inode's content — it is not the file this handle ever
+// had open.
+func TestFlushAfterTheNameWasReusedDoesNotClobberTheNewFile(t *testing.T) {
+	_, mnt := mountWritable(t)
+	p := filepath.Join(mnt, "reused")
+
+	first, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.WriteAt([]byte("content of the first file"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+
+	const replacement = "content of the replacement"
+	if err := os.WriteFile(p, []byte(replacement), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil { // flushes the stale handle
+		t.Fatalf("close of the handle to the replaced file: %v", err)
+	}
+
+	got, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != replacement {
+		t.Fatalf("flushing a handle whose name was reused overwrote the new file: got %q, want %q", got, replacement)
+	}
+}
+
 func readAllAt(f *os.File) ([]byte, error) {
 	st, err := f.Stat()
 	if err != nil {

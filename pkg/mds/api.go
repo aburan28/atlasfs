@@ -105,6 +105,18 @@ type CommitRequest struct {
 	Dir    metadb.InodeID     `json:"dir"`
 	Name   string             `json:"name"`
 	Record metadb.InodeRecord `json:"record"`
+
+	// DetachedInode, when non-zero, commits content into that inode and
+	// binds no name at all — the write path for a file unlinked while
+	// still open (DESIGN.md §19.3). Dir and Name are ignored.
+	//
+	// It has to be the client's call rather than the authority's: only
+	// the mount knows which inode a given descriptor was opened on, so
+	// only the mount can tell "the name is missing, recreate it" from
+	// "the name is missing because this file was unlinked underneath
+	// me". Without the distinction a flush recreates the dentry the
+	// unlink removed.
+	DetachedInode metadb.InodeID `json:"detached_inode,omitempty"`
 }
 
 type CommitResponse struct {
