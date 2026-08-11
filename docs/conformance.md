@@ -281,9 +281,31 @@ was `[not run] xfs_io fpunch failed` and now runs and passes. `generic/009`
 still does not run, but for an unrelated reason — `xfs_io fiemap failed`,
 the extent-mapping ioctl, which is a separate gap.
 
-**This is not §27's bar either.** §27 asks for "the `generic/` groups
-applicable to a network filesystem", which is hundreds of tests. What ran
-here is a handful plus a partial quick group.
+### What broader coverage found
+
+Pushing past that handful turned up two real failures, one of which was a
+genuine bug:
+
+- **`generic/035` — fixed.** Renaming onto an existing name drops that
+  inode's last link, and a descriptor still open on it must report
+  `nlink` 0. It reported the pre-rename count instead. This is §10.5
+  again, exactly as `generic/002` found in `Unlink`: nlink lives in the
+  *inode's* lease domain, and `Rename` bumped only the two directories,
+  so a holder with the displaced inode cached kept serving a stale count
+  until its lease lapsed — thirty seconds on the `relaxed` class.
+  Diagnosed by watching it resolve: 1 immediately, 1 after two seconds, 0
+  after thirty-three. The metadata was right the whole time; the cache in
+  front of it was not.
+
+- **`generic/003` — not fixed, and mostly by design.** It checks that
+  `atime` advances on access. This build never updates `atime` on read,
+  deliberately: doing so turns every read into a metadata write, which is
+  why real filesystems ship `relatime`. The test also reports a `ctime`
+  case that deserves a closer look, and that has not been done.
+
+**This is still not §27's bar.** §27 asks for "the `generic/` groups
+applicable to a network filesystem", which is hundreds of tests. What has
+run here is a few dozen.
 
 ## What the long fsx soak found
 
