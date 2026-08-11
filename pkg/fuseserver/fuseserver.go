@@ -530,22 +530,42 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if errno := errnoFor(n.repo.Unlink(n.ino, name)); errno != 0 {
 		return errno
 	}
-	// The kernel is a cache holder like any other (DESIGN.md §10) with one
-	// difference that matters: it cannot be recalled, only invalidated,
-	// and it has no reason to re-read attributes for an inode whose *name*
-	// it just saw removed — it already knows that dentry is gone. Without
-	// this, a descriptor still open on the inode reports the pre-unlink
-	// nlink for a full attribute timeout. Reproduced on the
-	// authority-backed mount, whose test stats the file through its other
-	// hard link first and so leaves the kernel holding a cached count.
-	//
-	// A negative offset is FUSE's "attributes only" form of
-	// NOTIFY_INVAL_INODE; (0, 0) means "invalidate zero bytes of data",
-	// which is a no-op.
-	if child != nil {
-		_ = child.NotifyContent(-1, -1)
-	}
+	notifyAttrsInvalid(child)
 	return 0
+}
+
+// notifyAttrsInvalid tells the kernel to drop its cached attributes for
+// an inode whose link count just changed.
+//
+// The kernel is a cache holder like any other (DESIGN.md §10) with one
+// difference that matters: it cannot be recalled, only invalidated, and
+// it has no reason to re-read attributes for an inode whose *name* it
+// just saw removed — it already knows that dentry is gone. Without this,
+// a descriptor still open on the inode reports the pre-unlink nlink for
+// a full attribute timeout.
+//
+// It runs on its own goroutine, and that is a correctness requirement
+// rather than an optimisation: NOTIFY_INVAL_INODE from inside a request
+// handler is a documented FUSE deadlock. The kernel can be holding the
+// inode lock for the very unlink being served while it processes the
+// notification, and this handler has not replied yet — so the two wait
+// on each other. It cost a CI run: pkg/fuseserver wedged until the test
+// binary was killed at six minutes, with only the mount goroutine
+// visible in the dump.
+//
+// Detaching it means the invalidation is asynchronous, which is what it
+// already was — the notification is written to /dev/fuse and processed
+// on the kernel's own schedule, so this bounds staleness rather than
+// eliminating it either way.
+//
+// A negative offset is FUSE's "attributes only" form of
+// NOTIFY_INVAL_INODE; (0, 0) means "invalidate zero bytes of data",
+// which is a no-op.
+func notifyAttrsInvalid(child *fs.Inode) {
+	if child == nil {
+		return
+	}
+	go func() { _ = child.NotifyContent(-1, -1) }()
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
