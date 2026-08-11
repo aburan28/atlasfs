@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -70,6 +71,12 @@ type Params struct {
 	// persisted class regardless of what's passed here. Empty means
 	// ClassImmutable.
 	Class string
+
+	// ChunkSize is DESIGN.md §14.3's other per-subtree policy, and like
+	// Class it is a hint used only when repoDir holds no repo yet —
+	// see repo.OpenWithPolicy for why it cannot change on reopen. Zero
+	// means the design's 4 MiB default.
+	ChunkSize int
 }
 
 // Open opens repoDir's local metadata store and points its object
@@ -100,7 +107,7 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 		if err != nil {
 			return nil, err
 		}
-		return repo.OpenWithClass(repoDir, backend, region, class)
+		return repo.OpenWithPolicy(repoDir, backend, region, class, p.ChunkSize)
 	case "s3":
 		if p.S3Bucket == "" {
 			return nil, fmt.Errorf("repoopen: s3 backend requires a bucket")
@@ -137,7 +144,7 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("repoopen: open s3 backend: %w", err)
 		}
-		return repo.OpenWithClass(repoDir, backend, region, class)
+		return repo.OpenWithPolicy(repoDir, backend, region, class, p.ChunkSize)
 	case "gcs":
 		if p.GCSBucket == "" {
 			return nil, fmt.Errorf("repoopen: gcs backend requires a bucket")
@@ -146,7 +153,7 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("repoopen: open gcs backend: %w", err)
 		}
-		return repo.OpenWithClass(repoDir, backend, region, class)
+		return repo.OpenWithPolicy(repoDir, backend, region, class, p.ChunkSize)
 	case "azure":
 		if p.AzureServiceURL == "" || p.AzureContainer == "" {
 			return nil, fmt.Errorf("repoopen: azure backend requires a service URL and a container")
@@ -155,7 +162,7 @@ func Open(ctx context.Context, repoDir string, p Params) (*repo.Repo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("repoopen: open azure backend: %w", err)
 		}
-		return repo.OpenWithClass(repoDir, backend, region, class)
+		return repo.OpenWithPolicy(repoDir, backend, region, class, p.ChunkSize)
 	default:
 		return nil, fmt.Errorf("repoopen: unknown backend %q (want local|s3|gcs|azure)", p.Backend)
 	}
@@ -257,6 +264,9 @@ const (
 
 	KeyRegion = "region"
 	KeyClass  = "class"
+	// KeyChunkSize is DESIGN.md §22's "the StorageClass's class, chunk
+	// size, and placement" — the chunk-size half. Decimal bytes.
+	KeyChunkSize = "chunkSize"
 )
 
 // ParamsFromMap reads repoDir and Params out of a generic string map —
@@ -288,6 +298,13 @@ func ParamsFromMap(m map[string]string) (repoDir string, p Params, err error) {
 
 		Region: m[KeyRegion],
 		Class:  m[KeyClass],
+	}
+	if v := m[KeyChunkSize]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return "", Params{}, fmt.Errorf("repoopen: %s=%q: want a non-negative byte count", KeyChunkSize, v)
+		}
+		p.ChunkSize = n
 	}
 	return repoDir, p, nil
 }

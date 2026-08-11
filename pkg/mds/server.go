@@ -347,7 +347,7 @@ const defaultRegion = "local"
 // PutLocator registers a chunk's placement after the client has sealed
 // its container to object storage.
 func (s *Server) PutLocator(ctx context.Context, req *PutLocatorRequest) (*PutLocatorResponse, error) {
-	if err := s.db.PutLocator(s.region, req.ChunkID, req.Locator); err != nil {
+	if err := s.db.PutLocator(s.region, req.ChunkID, req.Locator, time.Now()); err != nil {
 		return nil, toStatus(err)
 	}
 	return &PutLocatorResponse{}, nil

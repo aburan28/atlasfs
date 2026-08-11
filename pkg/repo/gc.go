@@ -186,6 +186,18 @@ func (r *Repo) Sweep(ctx context.Context, graceDuration time.Duration) (collecte
 		}
 	}
 
+	// Orphans: chunks no longer reachable from anywhere, which the
+	// graveyard walk above cannot reach because no inode was ever
+	// deleted. Overwriting a file is the ordinary way to make one — the
+	// inode is repointed at new content and the old chunks are left
+	// referenced by nothing — and a workload that rewrites the same file
+	// repeatedly produces one per commit. Without this phase they
+	// accumulate forever: §27's fsx soak grew a 256 KB file's repo to
+	// 21 GB and no amount of GC would have reclaimed a byte of it.
+	if err := r.sweepOrphans(cutoff, live, removed); err != nil {
+		return len(removed), err
+	}
+
 	// Deleting locators frees nothing on its own: the bytes are still
 	// sitting inside sealed container objects. Compact is what turns a
 	// sweep into an actual reclaim.
@@ -347,7 +359,7 @@ func (r *Repo) rewriteContainer(ctx context.Context, entries []metadb.LocatorEnt
 		return fmt.Errorf("repo: compact: seal replacement container: %w", err)
 	}
 	for id, loc := range newLocs {
-		if err := r.DB.PutLocator(r.Region, id, loc); err != nil {
+		if err := r.DB.PutLocator(r.Region, id, loc, r.Clock.Now()); err != nil {
 			return err
 		}
 	}
@@ -402,6 +414,60 @@ func (r *Repo) reapDeadContainers(ctx context.Context, cutoff time.Time) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// sweepOrphans deletes the locator of every chunk the mark phase did not
+// reach and whose container is past grace, adding each to removed.
+//
+// The grace gate is DESIGN.md §19.1's own — "its container was sealed
+// before V − T_grace" — and it is what makes this phase safe in the face
+// of a concurrent writer. A write session seals its chunks and registers
+// their locators *before* committing the inode that references them, so
+// between those two steps the chunks are unreachable and would otherwise
+// look exactly like garbage. Invariant GC-1 sizes T_grace to exceed
+// T_write_max precisely so that window closes long before a sweep can
+// see it.
+//
+// A container with no recorded seal time is left alone rather than
+// guessed at. That can only be one written before seal times were
+// tracked, and the conservative reading costs some already-leaked bytes
+// in an old repo; the other reading would risk deleting a chunk whose
+// age cannot be established, which is not a trade a filesystem should
+// make.
+func (r *Repo) sweepOrphans(cutoff time.Time, live map[chunk.ID]struct{}, removed map[chunk.ID]struct{}) error {
+	entries, err := r.DB.ListLocators(r.Region)
+	if err != nil {
+		return err
+	}
+	// One lookup per distinct container rather than per chunk: a
+	// container holds many chunks, and this runs over every locator in
+	// the repo.
+	sealed := map[string]time.Time{}
+	known := map[string]bool{}
+	for _, e := range entries {
+		if _, ok := live[e.ChunkID]; ok {
+			continue
+		}
+		if _, done := removed[e.ChunkID]; done {
+			continue
+		}
+		c := e.Locator.Container
+		if _, seen := known[c]; !seen {
+			at, ok, err := r.DB.ContainerSealedAt(c)
+			if err != nil {
+				return err
+			}
+			sealed[c], known[c] = at, ok
+		}
+		if !known[c] || sealed[c].After(cutoff) {
+			continue
+		}
+		if err := r.DB.DeleteLocator(r.Region, e.ChunkID); err != nil {
+			return err
+		}
+		removed[e.ChunkID] = struct{}{}
 	}
 	return nil
 }

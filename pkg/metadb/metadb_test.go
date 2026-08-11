@@ -369,7 +369,7 @@ func TestDeleteLocatorIsIdempotent(t *testing.T) {
 	if err := db.DeleteLocator("local", id); err != nil {
 		t.Fatalf("expected deleting an absent locator to be a no-op, got %v", err)
 	}
-	if err := db.PutLocator("local", id, pack.Locator{Container: "c", Length: 1}); err != nil {
+	if err := db.PutLocator("local", id, pack.Locator{Container: "c", Length: 1}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.DeleteLocator("local", id); err != nil {
@@ -391,7 +391,7 @@ func TestLocatorPutGetHas(t *testing.T) {
 		t.Fatalf("expected no locator yet, found=%v err=%v", found, err)
 	}
 	loc := pack.Locator{Container: "atlas/c/local/aa/c1", Offset: 10, Length: 20}
-	if err := db.PutLocator("local", id, loc); err != nil {
+	if err := db.PutLocator("local", id, loc, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	got, found, err := db.GetLocator("local", id)

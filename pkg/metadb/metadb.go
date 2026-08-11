@@ -59,13 +59,14 @@ type InodeID uint64
 const RootInode InodeID = 1
 
 var (
-	bucketDentry  = []byte("dentry")    // (dirInode||0x00||name) -> childInode
-	bucketInode   = []byte("inode")     // inodeID -> gob(InodeRecord)
-	bucketLocator = []byte("locator")   // (region||0x00||chunkID) -> gob(pack.Locator)
-	bucketMeta    = []byte("meta")      // "next_inode" -> uint64
-	bucketQuota   = []byte("quota")     // "root" -> gob(quotaRecord), see package doc
-	bucketGravey  = []byte("graveyard") // (deleteTsNano||inodeID) -> empty, see package doc
-	bucketDeadCnt = []byte("deadcontainer")
+	bucketDentry    = []byte("dentry")    // (dirInode||0x00||name) -> childInode
+	bucketInode     = []byte("inode")     // inodeID -> gob(InodeRecord)
+	bucketLocator   = []byte("locator")   // (region||0x00||chunkID) -> gob(pack.Locator)
+	bucketMeta      = []byte("meta")      // "next_inode" -> uint64
+	bucketQuota     = []byte("quota")     // "root" -> gob(quotaRecord), see package doc
+	bucketGravey    = []byte("graveyard") // (deleteTsNano||inodeID) -> empty, see package doc
+	bucketDeadCnt   = []byte("deadcontainer")
+	bucketContainer = []byte("container") // containerKey -> gob(sealedAt), see PutLocator
 )
 
 // MaxNameLen is NAME_MAX: the longest single path component. POSIX
@@ -209,7 +210,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("metadb: open: %w", err)
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey, bucketDeadCnt} {
+		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey, bucketDeadCnt, bucketContainer} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -231,6 +232,7 @@ func Open(path string) (*DB, error) {
 func (db *DB) Close() error { return db.bolt.Close() }
 
 var metaKeyClass = []byte("class")
+var metaKeyChunkSize = []byte("chunk_size")
 
 // EnsureClass persists class as the repo's consistency class if none is
 // stored yet (a brand-new repo), or returns whatever class was already
@@ -248,6 +250,34 @@ func (db *DB) EnsureClass(class string) (string, error) {
 		}
 		result = class
 		return b.Put(metaKeyClass, []byte(class))
+	})
+	return result, err
+}
+
+// EnsureChunkSize persists this repo's chunk size on first use and
+// returns whatever was already stored thereafter — the same
+// first-writer-wins shape as EnsureClass, and for a stronger reason.
+//
+// DESIGN.md §14.3 makes chunk_size a per-subtree policy ("there is no
+// single right answer, so it is a per-subtree policy with defaults
+// chosen per workload"), but it has to be stable *within* a repo:
+// re-chunking the same bytes at a different size yields entirely
+// different chunk IDs, so every commit after a change would dedup
+// against nothing and store a fresh copy of every file it touched. A
+// per-repo setting that a later caller could override would silently
+// turn dedup off.
+func (db *DB) EnsureChunkSize(size int) (int, error) {
+	var result int
+	err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		if v := b.Get(metaKeyChunkSize); v != nil {
+			result = int(binary.BigEndian.Uint64(v))
+			return nil
+		}
+		result = size
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(size))
+		return b.Put(metaKeyChunkSize, buf[:])
 	})
 	return result, err
 }
@@ -923,13 +953,59 @@ func locatorKey(region string, id chunk.ID) []byte {
 // the one write DESIGN.md §7.5 calls commutative and safe without a
 // home-region authority: two writers racing to add the same binding are
 // both correct.
-func (db *DB) PutLocator(region string, id chunk.ID, loc pack.Locator) error {
+//
+// sealedAt is when the chunk's container was sealed, and is what makes
+// DESIGN.md §19.1's grace gate work for a chunk that no graveyard entry
+// covers: "its container was sealed before V − T_grace". The first
+// writer to mention a container wins, because that is the moment the
+// bytes became visible — a later chunk landing in the same container
+// must not reset its age and make the whole container un-collectable.
+func (db *DB) PutLocator(region string, id chunk.ID, loc pack.Locator, sealedAt time.Time) error {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(loc); err != nil {
 		return err
 	}
+	var sealBuf bytes.Buffer
+	if err := gob.NewEncoder(&sealBuf).Encode(sealedAt); err != nil {
+		return err
+	}
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucketLocator).Put(locatorKey(region, id), buf.Bytes())
+		if err := tx.Bucket(bucketLocator).Put(locatorKey(region, id), buf.Bytes()); err != nil {
+			return err
+		}
+		b := tx.Bucket(bucketContainer)
+		key := []byte(loc.Container)
+		if b.Get(key) != nil {
+			return nil // first mention wins; see above
+		}
+		return b.Put(key, sealBuf.Bytes())
+	})
+}
+
+// ContainerSealedAt reports when a container was first recorded, and
+// whether it is known at all. Unknown means the container predates seal-
+// time tracking; Sweep treats that as "do not collect" rather than
+// guessing an age (see pkg/repo's orphan sweep).
+func (db *DB) ContainerSealedAt(container string) (time.Time, bool, error) {
+	var at time.Time
+	found := false
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		v := tx.Bucket(bucketContainer).Get([]byte(container))
+		if v == nil {
+			return nil
+		}
+		found = true
+		return gob.NewDecoder(bytes.NewReader(v)).Decode(&at)
+	})
+	return at, found, err
+}
+
+// ForgetContainer drops a container's seal record. Called when
+// compaction retires a container, so the bucket does not accumulate an
+// entry per container ever written.
+func (db *DB) ForgetContainer(container string) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketContainer).Delete([]byte(container))
 	})
 }
 

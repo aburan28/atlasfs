@@ -32,8 +32,9 @@ type backendFlags struct {
 	dragonflyTag   string
 	gdsAlign       bool
 
-	region string
-	class  string
+	region    string
+	class     string
+	chunkSize int
 }
 
 func addBackendFlags(fs *flag.FlagSet, bf *backendFlags) {
@@ -55,6 +56,8 @@ func addBackendFlags(fs *flag.FlagSet, bf *backendFlags) {
 	fs.StringVar(&bf.region, "region", repo.DefaultRegion, "AtlasFS region label for chunk locators (DESIGN.md §7.5) — not the cloud provider's region")
 	fs.StringVar(&bf.class, "class", string(repo.ClassImmutable),
 		"consistency class for a brand-new repo (DESIGN.md §8): immutable|relaxed|session. Ignored when repo-dir already holds a repo — its persisted class always wins. posix is served by atlas-mds, not by a local mount.")
+	fs.IntVar(&bf.chunkSize, "chunk-size", 0,
+		"chunk size in bytes for a brand-new repo (DESIGN.md §14.3), 0 for the 4 MiB default. Fixed at creation like -class, because re-chunking at a different size changes every chunk ID and disables dedup. Set it below the typical file size for a repo whose workload rewrites files in place: a commit re-chunks the whole file, so with the default every rewrite of a smaller file stores a complete new copy.")
 }
 
 // openRepo opens repoDir's metadata locally and points its object
@@ -98,7 +101,8 @@ func (bf backendFlags) params() repoopen.Params {
 		DragonflyProxy: bf.dragonflyProxy,
 		DragonflyTag:   bf.dragonflyTag,
 
-		Region: bf.region,
-		Class:  bf.class,
+		Region:    bf.region,
+		Class:     bf.class,
+		ChunkSize: bf.chunkSize,
 	}
 }

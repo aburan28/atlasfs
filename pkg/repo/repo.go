@@ -205,6 +205,25 @@ func OpenRemote(dir string, backend store.Backend, region string) (*Repo, error)
 // caller asked for here. That is what lets Open(dir), which always
 // hints ClassImmutable, correctly reopen a `relaxed` repo as `relaxed`.
 func OpenWithClass(dir string, backend store.Backend, region string, class Class) (*Repo, error) {
+	return OpenWithPolicy(dir, backend, region, class, 0)
+}
+
+// OpenWithPolicy is OpenWithClass plus DESIGN.md §14.3's other
+// per-subtree policy, chunk size. Like the class it is fixed at creation
+// and a reopen returns whatever was persisted, because re-chunking the
+// same bytes at a different size changes every chunk ID and would
+// silently disable dedup for the whole repo. chunkSize <= 0 means
+// chunk.DefaultSize.
+//
+// It is worth setting for a repo whose workload rewrites files in place.
+// A commit re-chunks the whole file and stores whatever the locator
+// index does not already have, so the unit of write amplification is the
+// chunk: with the 4 MiB default, every rewrite of a file smaller than
+// that stores a complete new copy. Measured over 200 rewrites of a
+// 256 KiB file, changing 4 KiB each time — 50 MiB stored at the default,
+// 4.2 MiB at 16 KiB chunks, because only the touched chunk is new and
+// the rest dedup away.
+func OpenWithPolicy(dir string, backend store.Backend, region string, class Class, chunkSize int) (*Repo, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -219,13 +238,22 @@ func OpenWithClass(dir string, backend store.Backend, region string, class Class
 	}
 	actualClass := Class(persisted)
 
+	if chunkSize <= 0 {
+		chunkSize = chunk.DefaultSize
+	}
+	actualChunkSize, err := db.EnsureChunkSize(chunkSize)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	r := &Repo{
 		Dir:                   dir,
 		DB:                    db,
 		Backend:               backend,
 		Region:                region,
 		Class:                 actualClass,
-		ChunkSize:             chunk.DefaultSize,
+		ChunkSize:             actualChunkSize,
 		SingleObjectThreshold: pack.SingleObjectThreshold,
 		Clock:                 coherence.RealClock{},
 		OpenHandles:           NewOpenHandles(),
@@ -485,7 +513,12 @@ func (r *Repo) storeContent(ctx context.Context, rd io.Reader, size int64) (cont
 // match on it.
 func publishBindErr(name string, err error) error {
 	if errors.Is(err, metadb.ErrExists) {
-		return fmt.Errorf("repo: %q already published in this directory (immutable class: republish under a new path or version)", name)
+		// Not a class rule: Publish binds new names and never replaces
+		// one, on every class. Saying "immutable class" here was wrong
+		// on a relaxed or session repo, where writing the same path
+		// through a mount is perfectly legal and only this bulk-ingest
+		// path refuses.
+		return fmt.Errorf("repo: %q already published in this directory (publish never replaces an existing name: use a new path or version, or write through a mount on a mutable class)", name)
 	}
 	return err
 }
@@ -506,7 +539,7 @@ func (r *Repo) storeChunk(ctx context.Context, c chunk.Chunk, singleObject bool)
 		if err != nil {
 			return err
 		}
-		return r.DB.PutLocator(r.Region, c.ID, loc)
+		return r.DB.PutLocator(r.Region, c.ID, loc, r.Clock.Now())
 	}
 	r.packer.Add(c)
 	if r.packer.Full() {
@@ -521,7 +554,7 @@ func (r *Repo) flushPacker(ctx context.Context) error {
 		return err
 	}
 	for id, loc := range locs {
-		if err := r.DB.PutLocator(r.Region, id, loc); err != nil {
+		if err := r.DB.PutLocator(r.Region, id, loc, r.Clock.Now()); err != nil {
 			return err
 		}
 	}
