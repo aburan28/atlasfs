@@ -135,7 +135,19 @@ var (
 	_ fs.FileFlusher  = (*writeHandle)(nil)
 	_ fs.FileReleaser = (*writeHandle)(nil)
 	_ fs.FileFsyncer  = (*writeHandle)(nil)
+
+	_ fs.FileAllocater = (*writeHandle)(nil)
 )
+
+// Allocate is fallocate(2). The semantics live in pkg/repo so this mount
+// and the in-process one share one implementation and cannot drift —
+// a caller must not get different fallocate behaviour from
+// `atlas mount` and `atlas mount -mds`.
+func (h *writeHandle) Allocate(ctx context.Context, off uint64, size uint64, mode uint32) syscall.Errno {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sess.allocate(off, size, mode)
+}
 
 // Fsync commits the buffered content — DESIGN.md §16.2's "durable in the
 // home region": chunks in the object store, manifest committed at the
@@ -254,7 +266,39 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if n.cfg.ReadOnly {
 		return syscall.EROFS
 	}
-	return errnoFor(n.cfg.Client.Unlink(mutating(ctx), n.ino, name))
+	child := n.GetChild(name)
+	if errno := errnoFor(n.cfg.Client.Unlink(mutating(ctx), n.ino, name)); errno != 0 {
+		return errno
+	}
+	invalidateKernelAttrs(child)
+	return 0
+}
+
+// invalidateKernelAttrs tells the kernel to drop its cached attributes
+// for an inode whose link count just changed.
+//
+// The kernel is a cache holder like any other (DESIGN.md §10), with one
+// difference that matters: it cannot be recalled, only invalidated, and
+// it has no reason to re-read attributes for an inode whose *name* it
+// saw removed — it already knows that dentry is gone. So a descriptor
+// still open on the inode kept reporting the pre-unlink nlink for a full
+// attribute timeout, 30 seconds on the relaxed class.
+//
+// It runs on its own goroutine, and that is a correctness requirement
+// rather than an optimisation: NOTIFY_INVAL_INODE from inside a request
+// handler is a documented FUSE deadlock — the kernel can hold the inode
+// lock for the very unlink being served while it processes the
+// notification, and this handler has not replied yet. See
+// pkg/fuseserver's notifyAttrsInvalid, where it cost a wedged CI run.
+//
+// A negative offset is FUSE's "attributes only" form of
+// NOTIFY_INVAL_INODE; (0, 0) means "invalidate zero bytes of data",
+// which is a no-op.
+func invalidateKernelAttrs(child *fs.Inode) {
+	if child == nil {
+		return
+	}
+	go func() { _ = child.NotifyContent(-1, -1) }()
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

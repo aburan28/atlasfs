@@ -241,13 +241,12 @@ func unixOrZero(t time.Time) uint64 {
 // caller it is safe to delete the last name when it is not. Records
 // written before link counts were tracked read back as 0 and mean one
 // link.
+// nlinkOf reports the link count to advertise. A file's stored 0 is
+// meaningful and is passed through: metadb writes it when the last name
+// goes (dropLinkTx), and POSIX wants fstat on a descriptor held across
+// the unlink to see 0. Directories never store 0, so theirs is the
+// "never set" case and gets the conventional 2.
 func nlinkOf(rec metadb.InodeRecord) uint32 {
-	if rec.NLink == 0 {
-		if rec.IsDir {
-			return 2 // "." plus the parent's entry
-		}
-		return 1
-	}
 	return uint32(rec.NLink)
 }
 
@@ -442,16 +441,23 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if !n.repo.Class.Mutable() {
 			return nil, 0, syscall.EROFS
 		}
-		wh := &writeFileHandle{repo: n.repo, parent: n.parent, name: n.name, node: n}
+		// The pin is taken before anything that can fail, and dropped on
+		// every failure path: a handle that never reaches the caller has
+		// no Release to drop it, and a leaked pin makes an inode
+		// permanently uncollectable.
+		release := n.repo.OpenHandles.Acquire(n.ino)
+		wh := &writeFileHandle{repo: n.repo, parent: n.parent, name: n.name, node: n, release: release}
 		if flags&syscall.O_TRUNC != 0 {
 			wh.dirty = true // truncate must commit even with zero further writes
 		} else if rec.Size > 0 {
 			fr, err := n.repo.OpenFile(ctx, rec)
 			if err != nil {
+				release()
 				return nil, 0, syscall.EIO
 			}
 			data, err := fr.ReadAll()
 			if err != nil {
+				release()
 				return nil, 0, syscall.EIO
 			}
 			wh.buf = append([]byte(nil), data...)
@@ -466,7 +472,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
-	return &fileHandle{fr: fr}, fuse.FOPEN_KEEP_CACHE, 0
+	return &fileHandle{fr: fr, release: n.repo.OpenHandles.Acquire(n.ino)}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // Create makes a new, empty file and returns a writable handle for it.
@@ -499,8 +505,12 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if err != nil {
 		return nil, nil, 0, errnoFor(err)
 	}
+	// The pin can only be taken once the inode exists, which for create
+	// is after the commit — hence not alongside the handle above.
+	fh.release = n.repo.OpenHandles.Acquire(id)
 	rec, err := n.repo.DB.GetInode(id)
 	if err != nil {
+		fh.release()
 		return nil, nil, 0, syscall.EIO
 	}
 
@@ -516,7 +526,46 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 }
 
 func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
-	return errnoFor(n.repo.Unlink(n.ino, name))
+	child := n.GetChild(name)
+	if errno := errnoFor(n.repo.Unlink(n.ino, name)); errno != 0 {
+		return errno
+	}
+	notifyAttrsInvalid(child)
+	return 0
+}
+
+// notifyAttrsInvalid tells the kernel to drop its cached attributes for
+// an inode whose link count just changed.
+//
+// The kernel is a cache holder like any other (DESIGN.md §10) with one
+// difference that matters: it cannot be recalled, only invalidated, and
+// it has no reason to re-read attributes for an inode whose *name* it
+// just saw removed — it already knows that dentry is gone. Without this,
+// a descriptor still open on the inode reports the pre-unlink nlink for
+// a full attribute timeout.
+//
+// It runs on its own goroutine, and that is a correctness requirement
+// rather than an optimisation: NOTIFY_INVAL_INODE from inside a request
+// handler is a documented FUSE deadlock. The kernel can be holding the
+// inode lock for the very unlink being served while it processes the
+// notification, and this handler has not replied yet — so the two wait
+// on each other. It cost a CI run: pkg/fuseserver wedged until the test
+// binary was killed at six minutes, with only the mount goroutine
+// visible in the dump.
+//
+// Detaching it means the invalidation is asynchronous, which is what it
+// already was — the notification is written to /dev/fuse and processed
+// on the kernel's own schedule, so this bounds staleness rather than
+// eliminating it either way.
+//
+// A negative offset is FUSE's "attributes only" form of
+// NOTIFY_INVAL_INODE; (0, 0) means "invalidate zero bytes of data",
+// which is a no-op.
+func notifyAttrsInvalid(child *fs.Inode) {
+	if child == nil {
+		return
+	}
+	go func() { _ = child.NotifyContent(-1, -1) }()
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -807,12 +856,27 @@ func errnoFor(err error) syscall.Errno {
 // ask to write).
 type fileHandle struct {
 	fr *repo.FileReader
+	// release drops this handle's §19.3 pin on the inode. Held for the
+	// life of the handle so GC cannot reclaim a file that was unlinked
+	// while this descriptor was still open.
+	release func()
 }
 
 var (
-	_ fs.FileReader  = (*fileHandle)(nil)
-	_ fs.FileFsyncer = (*fileHandle)(nil)
+	_ fs.FileReader   = (*fileHandle)(nil)
+	_ fs.FileFsyncer  = (*fileHandle)(nil)
+	_ fs.FileReleaser = (*fileHandle)(nil)
 )
+
+// Release drops the open-handle pin. RELEASE being asynchronous relative
+// to close(2) is fine here — unpinning late only delays a reclaim, while
+// unpinning early is the use-after-free this pin exists to prevent.
+func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
+	if h.release != nil {
+		h.release()
+	}
+	return 0
+}
 
 // Fsync on a read-only handle has nothing to flush, but must still
 // succeed: fsync(2) on an O_RDONLY fd is legal, and returning ENOSYS
@@ -846,6 +910,8 @@ type writeFileHandle struct {
 	mode    uint32
 	modeSet bool
 	node    *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
+	// release drops this handle's §19.3 pin — see fileHandle.release.
+	release func()
 
 	mu    sync.Mutex
 	buf   []byte
@@ -853,12 +919,31 @@ type writeFileHandle struct {
 }
 
 var (
-	_ fs.FileWriter   = (*writeFileHandle)(nil)
-	_ fs.FileReader   = (*writeFileHandle)(nil)
-	_ fs.FileFlusher  = (*writeFileHandle)(nil)
-	_ fs.FileReleaser = (*writeFileHandle)(nil)
-	_ fs.FileFsyncer  = (*writeFileHandle)(nil)
+	_ fs.FileWriter    = (*writeFileHandle)(nil)
+	_ fs.FileReader    = (*writeFileHandle)(nil)
+	_ fs.FileFlusher   = (*writeFileHandle)(nil)
+	_ fs.FileReleaser  = (*writeFileHandle)(nil)
+	_ fs.FileFsyncer   = (*writeFileHandle)(nil)
+	_ fs.FileAllocater = (*writeFileHandle)(nil)
 )
+
+// Allocate is fallocate(2). The semantics live in pkg/repo so both
+// mounts share one implementation and cannot drift apart — see
+// repo.ApplyFallocate for what each mode means against a buffered write
+// path, and what it deliberately does not do.
+func (h *writeFileHandle) Allocate(ctx context.Context, off uint64, size uint64, mode uint32) syscall.Errno {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	buf, changed, errno := repo.ApplyFallocate(h.buf, off, size, mode)
+	if errno != 0 {
+		return errno
+	}
+	h.buf = buf
+	if changed {
+		h.dirty = true
+	}
+	return 0
+}
 
 // Fsync commits whatever is buffered, which is exactly DESIGN.md §16.2's
 // contract for it: durable in the home region — chunks in the object
@@ -886,6 +971,24 @@ func (h *writeFileHandle) target() (metadb.InodeID, string) {
 		}
 	}
 	return h.parent, h.name
+}
+
+// detachedFrom reports this handle's inode and whether (parent, name) no
+// longer resolves to it — the file was unlinked, or the name now belongs
+// to some other inode. Either way the commit must not touch the dentry.
+//
+// A handle with no node cannot be checked (Create's, before its child
+// exists), and is treated as attached: that path has just bound the name
+// itself, so there is nothing to have been detached from.
+func (h *writeFileHandle) detachedFrom(parent metadb.InodeID, name string) (metadb.InodeID, bool) {
+	if h.node == nil || h.node.ino == 0 {
+		return 0, false
+	}
+	bound, err := h.repo.DB.Lookup(parent, name)
+	if err != nil || bound != h.node.ino {
+		return h.node.ino, true
+	}
+	return h.node.ino, false
 }
 
 // size is the in-flight length of the file this handle is writing,
@@ -964,6 +1067,11 @@ func (h *writeFileHandle) Release(ctx context.Context) syscall.Errno {
 		}
 		h.node.mu.Unlock()
 	}
+	// After the commit, never before: the pin has to outlive the write
+	// that is still using the inode's chunks.
+	if h.release != nil {
+		h.release()
+	}
 	return errno
 }
 
@@ -997,6 +1105,24 @@ func (h *writeFileHandle) commitIfDirty(ctx context.Context) syscall.Errno {
 	if _, err := wh.Write(h.buf); err != nil {
 		return syscall.EIO
 	}
+
+	// A file unlinked while this handle was open must not come back.
+	// The ordinary commit binds (parent, name) and would recreate the
+	// dentry the unlink removed, so writes go straight to the inode
+	// instead — which is what POSIX says happens to an unlinked-but-open
+	// file (§19.3). detachedFrom also covers the name having been taken
+	// over by a different inode in the meantime; committing then would
+	// clobber a file this handle never opened.
+	if id, detached := h.detachedFrom(parent, name); detached {
+		if err := wh.CommitDetached(ctx, id); err != nil {
+			return errnoFor(err)
+		}
+		if rec, err := h.repo.DB.GetInode(id); err == nil {
+			h.node.setCached(rec)
+		}
+		return 0
+	}
+
 	id, err := wh.Commit(ctx)
 	if err != nil {
 		return errnoFor(err)

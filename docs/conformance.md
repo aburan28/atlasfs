@@ -5,12 +5,14 @@ aspiration, and names three suites: pjdfstest, `fsx`, and xfstests. Until now
 none of them had been run — the README said so, which is better than silence
 but is not the same as evidence. This records runs of the first two.
 
-This document records those runs: how they were set up, what they scored, and
-what each remaining failure is. §27 asks for "100% pass within `posix`
-subtrees, documented enumerated exceptions only, each with a rationale." The
-enumeration below is that list — one entry, plus pjdfstest's own known Linux
-deviations. It is not 100%, and the gap is a feature this build has never
-claimed to have.
+This document records those runs: how they were set up and what they scored.
+§27 asks for "100% pass within `posix` subtrees, documented enumerated
+exceptions only, each with a rationale."
+
+**pjdfstest now meets that bar exactly: 8798 / 8798, with no exceptions
+left to enumerate.** That is one of §27's three suites. `fsx` and xfstests
+are covered further down and neither is at §27's stated depth, so the
+gating criterion as a whole is not met — see "What has not been run".
 
 ## What was run
 
@@ -54,13 +56,18 @@ misleading results before they were understood:
 | + atime/ctime and mode 0 | 8731 / 8798 | 99.24% |
 | + NAME_MAX and directory timestamps | 8788 / 8798 | 99.89% |
 | + subsecond times, directory nlink, truncate bound | 8794 / 8798 | 99.95% |
-| **+ in-flight size while a write is open** (found by `fsx`) | **8796 / 8798** | **99.98%** |
+| + in-flight size while a write is open (found by `fsx`) | 8796 / 8798 | 99.98% |
+| **+ open-but-unlinked: nlink 0, and no resurrection on flush** | **8798 / 8798** | **100%** |
 
 The assertion count differs between rows because pjdfstest runs more
 assertions as more of them get far enough to matter.
 
-The two remaining failures are both in `unlink/14`, the single exception
-enumerated below. Nothing else in the suite fails.
+**Nothing in the suite fails.** `prove -r` reports `Files=238, Tests=8798,
+Result: PASS` against a `posix`-class mount served by a separate
+`atlas-mds` process. The only annotated lines are seven `TODO passed` in
+`chown/00.t` — pjdfstest's own markers for Linux SGID/SUID behaviour it
+expects to fail, which pass here; TAP counts an unexpected pass as a
+pass, not a failure.
 
 The jump from 58% to 98% is almost entirely `mknod`. It is worth understanding
 why one missing call cost that much: a large number of the chmod, chown,
@@ -111,26 +118,50 @@ interrupted request. All three are in the commit history.
 
 ## Enumerated exceptions
 
-These remain. Each is a real limitation with a reason, not an unexplained
-skip — §27's standard is that "a skip list nobody has justified is
-indistinguishable from a failure list."
+**There are none.** §27's standard is that "a skip list nobody has
+justified is indistinguishable from a failure list", so the two entries
+this section used to hold are kept below as history rather than deleted —
+what they were, and what closing them actually took.
 
-### 1. Open-but-unlinked files are not kept alive (`unlink/14`, 2 assertions)
+### 1. Open-but-unlinked files — closed
 
-POSIX requires an unlinked file to stay readable through an already-open
-descriptor until the last one closes. This build graves an inode as soon as
-its last *name* goes, without waiting for open handles — the gap
-`pkg/repo/gc.go` has documented since GC was written, and §19.3's
-leased-open-handle registry is what would close it. It needs open-handle
-tracking across process boundaries, which is authority work rather than a
-mount-local fix.
+This listed `unlink/14` (2 assertions) as an accepted exception, on the
+reasoning that keeping an unlinked inode alive needed cross-process
+open-handle tracking and so was authority work. Reproducing it directly
+showed three separate defects hiding behind that one sentence, and none
+of them was the one described.
 
-### 2. pjdfstest's own Linux deviations
+`fstat` on a descriptor held across the unlink reported `nlink`
+1 instead of 0 — reads and writes through it already worked, because the
+graveyard retains the inode record. The second gap was that a flush
+*resurrected the name*: writes commit on close (§16.1), and the commit
+bound (dir, name) unconditionally, so a file unlinked while open for
+write reappeared in a directory the user had emptied. pjdfstest sees
+that only as an rmdir returning ENOTEMPTY, several steps from the cause.
+
+The third gap was not a conformance failure at all: GC could reclaim a
+file that was still open. Grace does not cover it — Invariant GC-1 sizes
+`T_grace` against `T_write_max`, the age of an uncommitted *write
+session*, whereas a descriptor may stay open for as long as its process
+lives. `Repo.OpenHandles` now pins an inode while any descriptor is open
+on it, and both phases of the sweep honour the pin.
+
+That registry is per-process, which is sufficient rather than a
+simplification for the in-process mount: metadb's bbolt file takes an
+exclusive inter-process lock, so no second process can open the repo
+while a mount holds it and any `Sweep` necessarily runs inside the
+mount's own process. Verified rather than assumed — a second opener
+blocks and times out. §19.3's *leased* handles remain the answer for the
+authority-backed mount, where nothing needs them yet because `pkg/mds`
+exposes no sweep.
+
+### 2. pjdfstest's own Linux deviations — no longer failing
 
 Several `chown` cases are marked `# TODO Linux doesn't clear the SGID/SUID
-bits for directories, despite the description noted` in pjdfstest itself.
-These fail on ext4 too. They are counted as expected failures by the harness,
-not by us.
+bits for directories, despite the description noted` in pjdfstest itself,
+and fail on ext4 too. They now *pass* here and are reported as `TODO
+passed`, which TAP counts as a pass. Nothing is being suppressed: the
+suite's overall result is `PASS` with zero failures.
 
 ## fsx
 
@@ -157,12 +188,41 @@ smaller hole. With it fixed:
 That is 170,000 operations with mmap reads and writes enabled, against both
 mount implementations, with three of the runs concurrent against one mount.
 
-`fsx` also reports what the filesystem does not support, which is a useful
+Since then `fallocate` has been implemented on both mounts, so most of
+that inventory is no longer a gap — see "fallocate" below.
+
+`fsx` also reported what the filesystem did not support, which was a useful
 inventory in itself: `FALLOC_FL_KEEP_SIZE`, `PUNCH_HOLE`, `ZERO_RANGE`,
 `COLLAPSE_RANGE`, `INSERT_RANGE`, `UNSHARE_RANGE`, dontcache I/O, and
-`O_DIRECT` (which atomic writes need). `fallocate` in general is
-unimplemented; a content-addressed store has no preallocation to do, but
-`PUNCH_HOLE` is a real gap for a sparse-file workload.
+`O_DIRECT` (which atomic writes need).
+
+### fallocate
+
+`FALLOC_FL_KEEP_SIZE`, `PUNCH_HOLE` and `ZERO_RANGE` are now implemented
+on both mounts, along with plain allocate. The write path buffers a
+file's whole content and commits it as a unit (§16.1), so there is no
+block allocator and "preallocate" has no meaning — every mode reduces to
+arranging bytes in that buffer, and the observable contract of all four
+is the same: which bytes read as zeros, and whether the length moves.
+
+Two things that are worth being explicit about rather than letting a
+caller discover:
+
+- **`PUNCH_HOLE` does not save space.** Zeroing is the honest
+  implementation here because there is no sparse representation to
+  exploit, but reclaiming storage is usually the whole reason to punch a
+  hole. Correct data, no reclaim.
+- **`COLLAPSE_RANGE` and `INSERT_RANGE` return `EOPNOTSUPP`** rather than
+  being faked. Both are defined on filesystem block boundaries and this
+  build has no block size to expose — and a caller that gets `EOPNOTSUPP`
+  can fall back, while one that gets success has silently lost the
+  operation.
+
+The semantics live in `pkg/repo` rather than in either mount, so the two
+mounts cannot drift: `atlas mount` and `atlas mount -mds` share one
+implementation.
+
+`O_DIRECT` and dontcache remain unimplemented.
 
 **This is not §27's bar.** §27 asks for a 24-hour soak; these runs take
 minutes. What they establish is that the write path survives sustained
@@ -215,11 +275,52 @@ skip:
 | other | 7 |
 
 The block-device ones are structurally N/A for a filesystem with no block
-device; the `fpunch`/`fzero` ones are the `fallocate` gap named above.
+device. The eleven `fpunch`/`fzero` skips were the largest *closable*
+group, and they are what motivated implementing `fallocate`: `generic/008`
+was `[not run] xfs_io fpunch failed` and now runs and passes. `generic/009`
+still does not run, but for an unrelated reason — `xfs_io fiemap failed`,
+the extent-mapping ioctl, which is a separate gap.
 
-**This is not §27's bar either.** §27 asks for "the `generic/` groups
-applicable to a network filesystem", which is hundreds of tests. What ran
-here is a handful plus a partial quick group.
+### What broader coverage found
+
+Pushing past that handful turned up two real failures, one of which was a
+genuine bug:
+
+- **`generic/035` — fixed.** Renaming onto an existing name drops that
+  inode's last link, and a descriptor still open on it must report
+  `nlink` 0. It reported the pre-rename count instead. This is §10.5
+  again, exactly as `generic/002` found in `Unlink`: nlink lives in the
+  *inode's* lease domain, and `Rename` bumped only the two directories,
+  so a holder with the displaced inode cached kept serving a stale count
+  until its lease lapsed — thirty seconds on the `relaxed` class.
+  Diagnosed by watching it resolve: 1 immediately, 1 after two seconds, 0
+  after thirty-three. The metadata was right the whole time; the cache in
+  front of it was not.
+
+- **`generic/003` — two real bugs behind the "by design" answer.** The
+  test is about the `noatime`/`relatime`/`strictatime` mount options,
+  which this build does not implement at all: it never advances `atime`
+  on read, deliberately, because doing so turns every read into a
+  metadata write — the reason real filesystems ship `relatime`. It would
+  have been easy to file the whole failure under that and move on. Two of
+  its complaints turned out to be unrelated defects:
+
+  - **`atime` moved on write.** `atime` fell back to `mtime` whenever it
+    was unset, so the two aliased and every write looked like an access.
+    It is now stamped at creation and carried across overwrites.
+  - **`ctime` did not move on rename.** POSIX requires it — the inode's
+    metadata changed even though its content did not. This needed two
+    fixes, and the second is the same §10.5 lesson a third time: storing
+    the new `ctime` is not enough, because `ctime` is in the *inode's*
+    lease domain and `Rename` bumped only the two directories, so the
+    mount kept serving the pre-rename record from cache.
+
+  What remains is the mount options themselves, which is what the test is
+  actually for.
+
+**This is still not §27's bar.** §27 asks for "the `generic/` groups
+applicable to a network filesystem", which is hundreds of tests. What has
+run here is a few dozen.
 
 ## What the long fsx soak found
 
@@ -227,12 +328,81 @@ A one-hour `fsx --duration=3600` run was started and did **not** complete: it
 stopped with `domapwrite: ftruncate: Input/output error` after filling the
 volume. The repo had grown to **21 GB** for a file fsx keeps under 256 KB.
 
-That is not a leak, it is the write path's shape, and it is worth stating
-plainly: every commit rewrites the modified file's chunks, and nothing
-reclaims the superseded ones until §19's GC runs — which nothing runs
-automatically. A long random-write workload therefore grows storage without
-bound. `atlas gc` exists and reclaims it; a mount that never calls it does
-not.
+The first diagnosis written here was wrong, and the correction is the more
+useful finding: this said the superseded chunks were merely waiting for a
+GC nobody ran. **Running GC would not have reclaimed a single byte.**
+
+`Sweep` only ever walked the graveyard, and an overwrite creates no
+graveyard entry — the inode is repointed at new content and the old chunks
+are left referenced by nothing at all. So superseded chunks were invisible
+to both halves of mark-and-sweep and leaked permanently. Reproduced
+directly: 25 overwrites of one file left 25 live locators, and a full GC
+pass freed none of them (`TestRepeatedOverwritesDoNotGrowStorageWithoutBound`).
+That is now fixed — `sweepOrphans` collects every chunk the mark phase
+cannot reach, gated on its container's seal time so an in-flight write is
+never mistaken for garbage.
+
+The leak was the unbounded half. The other half is write amplification,
+and it is a policy gap rather than a bug. A commit re-chunks the whole
+file and stores whatever the locator index lacks, so the unit of
+amplification is the chunk: at the 4 MiB default, **every rewrite of a
+smaller file stores a complete new copy**. Measured over 200 rewrites of a
+256 KiB file changing 4 KiB each time:
+
+| chunk size | stored |
+|---|---|
+| 4 MiB (default) | 50.0 MiB |
+| 64 KiB | 13.3 MiB |
+| 16 KiB | 4.2 MiB |
+
+fsx keeps its file under 256 KB and ran 170k operations, which lands
+squarely on the 21 GB observed. DESIGN.md §14.3 already calls `chunk_size`
+a per-subtree policy "with defaults chosen per workload"; it is now
+persisted at creation and reachable as `atlas -chunk-size`, so a
+rewrite-heavy subtree can be created with a chunk size below its typical
+file size. It is fixed for the repo's lifetime because re-chunking the
+same bytes at a different size changes every chunk ID and would silently
+disable dedup.
+
+Both halves were then measured end to end on a real mount, same seed,
+same 20,000 fsx operations, both runs `All operations completed A-OK`:
+
+| chunk size | backing store after 20,000 fsx ops |
+|---|---|
+| 4 MiB (default) | **2500 MiB** |
+| 16 KiB (`-chunk-size 16384`) | **451 MiB** |
+
+2500 MiB × (170,000 / 20,000) ≈ 21 GB, which is what the original soak
+reached — the diagnosis reproduces to within the noise of a different
+seed.
+
+### The constraint that actually doomed the soak
+
+Even with the leak fixed, the soak could not have been rescued by running
+GC, because **GC cannot run while a mount is up**. metadb's bbolt file
+takes an exclusive inter-process lock, so `atlas gc` on a mounted repo
+blocks for as long as the mount holds it — verified: it hangs until
+killed. A long-running mount therefore never reclaimed anything, by
+construction.
+
+`atlas mount -gc-interval` is the fix. Sweeping from inside the mount's
+own process is also what makes it *correct* rather than merely possible:
+`Repo.OpenHandles` lives there, so the sweep can see which inodes still
+have descriptors open and skip them (§19.3). Verified under load — 15,000
+fsx operations all A-OK with a sweep firing every 20 s against the same
+live repo — and a `-gc-grace` below GC-1's floor is reported on every
+tick rather than silently doing nothing:
+
+```
+atlas: background gc: repo: graceDuration violates DESIGN.md §19.2 invariant GC-1:
+  got 5m0s, need > 1h0m30.5s (T_write_max=1h0m0s + D_max=30s + epsilon=500ms)
+```
+
+What this does **not** claim: a 24-hour soak still has not been run. GC-1
+puts a hard floor just over an hour on `T_grace`, so a grace window's
+worth of garbage is always on disk by design, and at the default chunk
+size that is a large number for a rewrite-heavy workload. A real soak
+wants a chunk size matched to its file size *and* background GC enabled.
 
 The soak also exposed a real errno bug: a full backend surfaced as **EIO**
 rather than **ENOSPC**, which tells an application its data is corrupt when

@@ -206,6 +206,28 @@ func (s *Server) Readdir(ctx context.Context, req *ReaddirRequest) (*ReaddirResp
 func (s *Server) Commit(ctx context.Context, req *CommitRequest) (*CommitResponse, error) {
 	resp := &CommitResponse{}
 
+	// A detached commit touches one inode and no directory, so it skips
+	// both the dentry write and the directory bump. The inode still gets
+	// recalled and bumped: another holder may have this same
+	// unlinked-but-open file open too, and its content just changed.
+	if req.DetachedInode != 0 {
+		if s.posix && s.coh != nil {
+			res, err := s.coh.Recall(ctx, inodeObj(req.DetachedInode), req.Holder, s.drecall)
+			if err != nil {
+				return nil, status.FromContextError(err).Err()
+			}
+			resp.RecalledHolders, resp.TimedOutHolders = res.Acked, res.TimedOut
+		}
+		if err := s.db.UpdateInodeContent(req.DetachedInode, req.Record); err != nil {
+			return nil, toStatus(err)
+		}
+		resp.Inode = req.DetachedInode
+		if s.coh != nil {
+			resp.Version = s.coh.Bump(inodeObj(req.DetachedInode))
+		}
+		return resp, nil
+	}
+
 	if s.posix && s.coh != nil {
 		// Recall before the write, not after. Recalling afterwards would
 		// leave a window in which the authority has already committed
@@ -347,7 +369,7 @@ const defaultRegion = "local"
 // PutLocator registers a chunk's placement after the client has sealed
 // its container to object storage.
 func (s *Server) PutLocator(ctx context.Context, req *PutLocatorRequest) (*PutLocatorResponse, error) {
-	if err := s.db.PutLocator(s.region, req.ChunkID, req.Locator); err != nil {
+	if err := s.db.PutLocator(s.region, req.ChunkID, req.Locator, time.Now()); err != nil {
 		return nil, toStatus(err)
 	}
 	return &PutLocatorResponse{}, nil

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"syscall"
 	"time"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
 	"github.com/aburan28/atlasfs/pkg/manifest"
 	"github.com/aburan28/atlasfs/pkg/metadb"
 	"github.com/aburan28/atlasfs/pkg/pack"
+	"github.com/aburan28/atlasfs/pkg/repo"
 	"github.com/aburan28/atlasfs/pkg/store"
 )
 
@@ -85,6 +87,23 @@ func (w *writeSession) writeAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
+// allocate applies fallocate(2) to the buffered content. bytes.Buffer
+// has no way to replace its contents in place, so the reassembled slice
+// is written back through Reset+Write — cheap next to the commit that
+// follows, and it keeps the one shared implementation of the semantics.
+func (w *writeSession) allocate(off, size uint64, mode uint32) syscall.Errno {
+	buf, changed, errno := repo.ApplyFallocate(w.buf.Bytes(), off, size, mode)
+	if errno != 0 {
+		return errno
+	}
+	if changed {
+		w.buf.Reset()
+		w.buf.Write(buf)
+		w.dirty = true
+	}
+	return 0
+}
+
 func (w *writeSession) resize(n int64) {
 	cur := int64(w.buf.Len())
 	switch {
@@ -131,11 +150,50 @@ func (w *writeSession) commit(ctx context.Context) error {
 	ref.apply(&rec)
 
 	dir, name := w.target()
+
+	// A file unlinked while this session was open must not come back:
+	// Commit binds (dir, name) and would recreate the dentry the unlink
+	// removed, so the content goes straight to the inode instead
+	// (DESIGN.md §19.3). The same applies when the name has since been
+	// taken over by a different inode — committing then would clobber a
+	// file this session never opened.
+	if id, detached := w.detached(ctx, dir, name); detached {
+		if _, err := w.cfg.Client.CommitDetached(ctx, id, rec); err != nil {
+			w.dirty = true
+			return err
+		}
+		return nil
+	}
+
 	if _, err := w.cfg.Client.Commit(ctx, dir, name, rec); err != nil {
 		w.dirty = true
 		return err
 	}
 	return nil
+}
+
+// detached reports this session's inode and whether (dir, name) no
+// longer resolves to it. The lookup goes to the authority rather than a
+// cache: a stale "still bound" answer here recreates a name the user
+// deleted, which is the failure this exists to prevent.
+//
+// A session with no node yet (Create, before its child exists) has just
+// bound the name itself and is never detached.
+func (w *writeSession) detached(ctx context.Context, dir metadb.InodeID, name string) (metadb.InodeID, bool) {
+	if w.node == nil || w.node.ino == 0 {
+		return 0, false
+	}
+	found, id, _, err := w.cfg.Client.LookupUncached(ctx, dir, name)
+	if err != nil {
+		// Cannot establish the binding — treat as attached, which is the
+		// pre-existing behaviour and keeps a transient RPC failure from
+		// silently turning a normal write into a detached one.
+		return w.node.ino, false
+	}
+	if !found || id != w.node.ino {
+		return w.node.ino, true
+	}
+	return w.node.ino, false
 }
 
 // contentRef is the chunk/manifest-shaped part of an inode record —

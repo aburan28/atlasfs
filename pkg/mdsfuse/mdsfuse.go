@@ -34,13 +34,20 @@
 //
 // What it does not do is §16.3's in-place random-access writes: a file's
 // content is buffered and committed as a unit on flush, the same cut
-// pkg/repo/write.go makes. A uid/gid model (§20) is likewise
-// unimplemented on both mounts, and §19.3's open-but-unlinked handle
-// tracking is not there either: an unlink graves the inode once its last
-// name goes, without waiting for open handles to close. Unifying this
-// mount and pkg/fuseserver behind one node
-// implementation remains follow-up work; they are two node types sharing
-// a design, not one shared implementation.
+// pkg/repo/write.go makes.
+//
+// §19.3's open-but-unlinked semantics are here — an unlinked file stays
+// readable and writable through an open descriptor, reports nlink 0, and
+// is not resurrected when the write flushes — but the *leased* open
+// handles §19.3 specifies are not. They would keep a holder that dies
+// from pinning an inode forever, and there is nothing for them to
+// protect yet: pkg/mds exposes no sweep, so GC is not reachable against
+// an authority-served repo at all.
+//
+// Unifying this mount and pkg/fuseserver behind one node implementation
+// remains follow-up work; they are two node types sharing a design, not
+// one shared implementation. What they must not diverge on lives in
+// pkg/repo — fallocate's semantics, for one.
 package mdsfuse
 
 import (
@@ -251,15 +258,12 @@ func unixOrZero(t time.Time) uint64 {
 
 // nlinkOf is the stored link count, never a constant: a hard-linked file
 // reporting 1 would tell a caller it is safe to delete the last name
-// when it is not. A record written before link counts were tracked reads
-// back as 0 and means one link.
+// when it is not. A file's stored 0 is meaningful and passed through —
+// metadb writes it when the last name goes, and POSIX wants fstat on a
+// descriptor held across the unlink to report 0 (§19.3). Directories
+// never store 0, so theirs is the "never set" case and gets the
+// conventional 2.
 func nlinkOf(rec metadb.InodeRecord) uint32 {
-	if rec.NLink == 0 {
-		if rec.IsDir {
-			return 2 // "." plus the parent's entry
-		}
-		return 1
-	}
 	return uint32(rec.NLink)
 }
 

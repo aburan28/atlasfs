@@ -17,19 +17,34 @@
 //     reachable from the live tree or a not-yet-expired graveyard
 //     entry) is never swept regardless of which timestamp gated the
 //     scan.
+//
 //   - §19.3's nlink half *is* implemented: an inode with more than one
 //     name only enters the graveyard when its last name goes (see
 //     metadb's dropLinkTx), so unlinking one of two hard links leaves
 //     the surviving name's chunks reachable by the mark phase.
-//   - §19.3's "open-but-unlinked" guarantee — an inode staying reachable
-//     while any client holds an open handle, via a leased open-handle
-//     registry — is not implemented. This build has no open-file-handle
-//     tracking across process boundaries (single process, so pkg/
-//     fuseserver's Node.activeWrite is the closest thing, and it is not
-//     wired into Sweep). An inode is gravable immediately on unlink;
-//     unlinking a file a FUSE client still has open and then sweeping
-//     it past grace would pull the content out from under that client.
-//     Real remaining scope, stated rather than silently built partial.
+//
+//   - §19.3's "open-but-unlinked" guarantee is implemented for the
+//     in-process mount: Repo.OpenHandles pins an inode for as long as a
+//     descriptor is open on it, the mark phase treats a pinned inode as
+//     reachable, and the sweep phase skips it — so unlinking a file a
+//     client still has open and then sweeping past grace no longer pulls
+//     the content out from under that client. Grace alone cannot cover
+//     this: GC-1 sizes T_grace against T_write_max, and a descriptor may
+//     stay open arbitrarily longer than that.
+//
+//     That per-process registry is sufficient here rather than a
+//     simplification, because metadb's bbolt file takes an exclusive
+//     inter-process lock: a second process cannot open the repo while a
+//     mount holds it, so any Sweep necessarily runs inside the mount's
+//     own process, where the registry lives. (Verified, not assumed —
+//     a second opener blocks and times out.)
+//
+//     What remains is the authority-backed mount, where handles live in
+//     a different process from the metadata: §19.3 specifies *leased*
+//     open handles precisely so a holder that dies cannot pin an inode
+//     forever. That is not built, and there is nothing for it to protect
+//     yet either — pkg/mds exposes no sweep, so GC is not reachable
+//     against an authority-served repo at all.
 //
 // GC-1's other half, the client-side "fail any write session older than
 // T_write_max with ESTALE," is also not implemented: WriteHandle does
@@ -105,7 +120,12 @@ func (r *Repo) Sweep(ctx context.Context, graceDuration time.Duration) (collecte
 	now := r.Clock.Now()
 	cutoff := now.Add(-graceDuration)
 
-	live, err := r.markLive(ctx, cutoff)
+	// One snapshot for the whole run, taken before the mark phase: the
+	// mark and sweep halves must agree about which inodes are pinned, or
+	// an inode could be marked live and then have its record deleted.
+	held := r.OpenHandles.Snapshot()
+
+	live, err := r.markLive(ctx, cutoff, held)
 	if err != nil {
 		return 0, fmt.Errorf("repo: sweep: mark phase: %w", err)
 	}
@@ -119,6 +139,13 @@ func (r *Repo) Sweep(ctx context.Context, graceDuration time.Duration) (collecte
 	for _, e := range entries {
 		if e.DeletedAt.After(cutoff) {
 			continue // not yet past grace: still reachable per §19.1
+		}
+		if _, pinned := held[e.InodeID]; pinned {
+			// §19.3: someone still holds this open. Leave the entry in
+			// the graveyard so a later sweep collects it once the last
+			// descriptor closes — grace has already elapsed, so the very
+			// next sweep after the close will take it.
+			continue
 		}
 
 		rec, err := r.DB.GetInode(e.InodeID)
@@ -157,6 +184,18 @@ func (r *Repo) Sweep(ctx context.Context, graceDuration time.Duration) (collecte
 		if err := r.DB.RemoveGraveyardEntry(e); err != nil {
 			return len(removed), err
 		}
+	}
+
+	// Orphans: chunks no longer reachable from anywhere, which the
+	// graveyard walk above cannot reach because no inode was ever
+	// deleted. Overwriting a file is the ordinary way to make one — the
+	// inode is repointed at new content and the old chunks are left
+	// referenced by nothing — and a workload that rewrites the same file
+	// repeatedly produces one per commit. Without this phase they
+	// accumulate forever: §27's fsx soak grew a 256 KB file's repo to
+	// 21 GB and no amount of GC would have reclaimed a byte of it.
+	if err := r.sweepOrphans(cutoff, live, removed); err != nil {
+		return len(removed), err
 	}
 
 	// Deleting locators frees nothing on its own: the bytes are still
@@ -320,7 +359,7 @@ func (r *Repo) rewriteContainer(ctx context.Context, entries []metadb.LocatorEnt
 		return fmt.Errorf("repo: compact: seal replacement container: %w", err)
 	}
 	for id, loc := range newLocs {
-		if err := r.DB.PutLocator(r.Region, id, loc); err != nil {
+		if err := r.DB.PutLocator(r.Region, id, loc, r.Clock.Now()); err != nil {
 			return err
 		}
 	}
@@ -379,11 +418,65 @@ func (r *Repo) reapDeadContainers(ctx context.Context, cutoff time.Time) error {
 	return nil
 }
 
+// sweepOrphans deletes the locator of every chunk the mark phase did not
+// reach and whose container is past grace, adding each to removed.
+//
+// The grace gate is DESIGN.md §19.1's own — "its container was sealed
+// before V − T_grace" — and it is what makes this phase safe in the face
+// of a concurrent writer. A write session seals its chunks and registers
+// their locators *before* committing the inode that references them, so
+// between those two steps the chunks are unreachable and would otherwise
+// look exactly like garbage. Invariant GC-1 sizes T_grace to exceed
+// T_write_max precisely so that window closes long before a sweep can
+// see it.
+//
+// A container with no recorded seal time is left alone rather than
+// guessed at. That can only be one written before seal times were
+// tracked, and the conservative reading costs some already-leaked bytes
+// in an old repo; the other reading would risk deleting a chunk whose
+// age cannot be established, which is not a trade a filesystem should
+// make.
+func (r *Repo) sweepOrphans(cutoff time.Time, live map[chunk.ID]struct{}, removed map[chunk.ID]struct{}) error {
+	entries, err := r.DB.ListLocators(r.Region)
+	if err != nil {
+		return err
+	}
+	// One lookup per distinct container rather than per chunk: a
+	// container holds many chunks, and this runs over every locator in
+	// the repo.
+	sealed := map[string]time.Time{}
+	known := map[string]bool{}
+	for _, e := range entries {
+		if _, ok := live[e.ChunkID]; ok {
+			continue
+		}
+		if _, done := removed[e.ChunkID]; done {
+			continue
+		}
+		c := e.Locator.Container
+		if _, seen := known[c]; !seen {
+			at, ok, err := r.DB.ContainerSealedAt(c)
+			if err != nil {
+				return err
+			}
+			sealed[c], known[c] = at, ok
+		}
+		if !known[c] || sealed[c].After(cutoff) {
+			continue
+		}
+		if err := r.DB.DeleteLocator(r.Region, e.ChunkID); err != nil {
+			return err
+		}
+		removed[e.ChunkID] = struct{}{}
+	}
+	return nil
+}
+
 // markLive is DESIGN.md §19.1 step 1: the set of chunk IDs reachable at
 // "now" — from every inode still bound in the live namespace, from
-// every graveyard entry not yet past grace (cutoff), and from the
-// packer's not-yet-sealed buffer.
-func (r *Repo) markLive(ctx context.Context, cutoff time.Time) (map[chunk.ID]struct{}, error) {
+// every graveyard entry not yet past grace (cutoff) or still pinned by
+// an open handle (§19.3), and from the packer's not-yet-sealed buffer.
+func (r *Repo) markLive(ctx context.Context, cutoff time.Time, held map[metadb.InodeID]struct{}) (map[chunk.ID]struct{}, error) {
 	live := map[chunk.ID]struct{}{}
 
 	if err := r.markLiveTree(ctx, metadb.RootInode, live); err != nil {
@@ -395,8 +488,9 @@ func (r *Repo) markLive(ctx context.Context, cutoff time.Time) (map[chunk.ID]str
 		return nil, err
 	}
 	for _, e := range entries {
-		if !e.DeletedAt.After(cutoff) {
-			continue // past grace: this is exactly what Sweep may collect
+		_, pinned := held[e.InodeID]
+		if !e.DeletedAt.After(cutoff) && !pinned {
+			continue // past grace and unpinned: exactly what Sweep may collect
 		}
 		rec, err := r.DB.GetInode(e.InodeID)
 		if err != nil {

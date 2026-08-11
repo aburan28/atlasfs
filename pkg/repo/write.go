@@ -252,14 +252,49 @@ func (h *WriteHandle) Commit(ctx context.Context) (metadb.InodeID, error) {
 	return id, nil
 }
 
+// CommitDetached commits this handle's content into an existing inode
+// without binding any name to it — the write path for a file that was
+// unlinked while still open (DESIGN.md §19.3).
+//
+// The ordinary Commit cannot be used for that, and the reason is a bug
+// this fixed: it resolves (dir, name) and calls CommitFile, which
+// *creates* the dentry if it is missing. A file unlinked while open for
+// write therefore came back at flush — the name reappeared in its
+// directory, and an rmdir that should have succeeded returned ENOTEMPTY
+// (pjdfstest unlink/14).
+func (h *WriteHandle) CommitDetached(ctx context.Context, id metadb.InodeID) error {
+	if h.done {
+		return fmt.Errorf("repo: CommitDetached called on an already-committed or discarded handle")
+	}
+	h.done = true
+	r := h.repo
+
+	content, err := r.storeContent(ctx, bytes.NewReader(h.buf.Bytes()), int64(h.buf.Len()))
+	if err != nil {
+		return err
+	}
+	if err := r.flushPacker(ctx); err != nil {
+		return err
+	}
+
+	rec := metadb.InodeRecord{MTime: time.Now()}
+	content.apply(&rec)
+	if err := r.DB.UpdateInodeContent(id, rec); err != nil {
+		return err
+	}
+	if r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(id))
+	}
+	return nil
+}
+
 // Unlink removes name from dir, moving the target inode into the
 // graveyard (DESIGN.md §19.3) rather than reclaiming it immediately —
 // pkg/repo.Sweep is what later collects its chunks, once past the grace
-// period. This build has no open-file-handle tracking across process
-// boundaries (single process only — see gc.go's doc comment), so unlike
-// real §19.3, an inode is gravable immediately on unlink rather than
-// only once its last open handle closes; that gap is stated, not
-// hidden.
+// period *and* once nothing holds the inode open (Repo.OpenHandles).
+// An inode is therefore gravable immediately on unlink, as §19.3
+// intends, without that making it collectable while a descriptor still
+// refers to it.
 func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 	if !r.Class.Mutable() {
 		return ErrReadOnly
@@ -350,8 +385,35 @@ func (r *Repo) Rename(oldDir metadb.InodeID, oldName string, newDir metadb.Inode
 	if !r.Class.Mutable() {
 		return ErrReadOnly
 	}
+	// Resolve the target before the move: renaming onto an existing name
+	// drops that inode's last link, and §10.5 puts nlink in the *inode's*
+	// lease domain, not the directory's. Bumping only the two directories
+	// leaves a holder that already has the displaced inode cached — a
+	// process holding it open, say — serving the pre-rename link count
+	// until its lease lapses. That is the same defect xfstests generic/002
+	// found in Unlink, reached by a different path: generic/035 opens the
+	// target, renames over it, and requires the descriptor's fstat to
+	// report nlink 0.
+	displaced, err := r.DB.Lookup(newDir, newName)
+	haveDisplaced := err == nil
+	if err != nil && !errors.Is(err, metadb.ErrNotFound) {
+		return err
+	}
+	// The inode being moved changes too: POSIX marks its ctime on a
+	// successful rename, and ctime is in the inode's lease domain like
+	// nlink. Resolved before the move, since afterwards oldName is gone.
+	moved, movedErr := r.DB.Lookup(oldDir, oldName)
+
 	if err := r.DB.Rename(oldDir, oldName, newDir, newName, r.Clock.Now()); err != nil {
 		return err
+	}
+	if r.Coherence != nil {
+		if haveDisplaced {
+			r.Coherence.Bump(InodeCoherenceKey(displaced))
+		}
+		if movedErr == nil {
+			r.Coherence.Bump(InodeCoherenceKey(moved))
+		}
 	}
 	r.bumpDirEntries(oldDir)
 	if newDir != oldDir {

@@ -26,14 +26,15 @@
 // the single-node stand-in for §18.3's "the counter can be updated in
 // the same FDB transaction as the mutation using an atomic add."
 //
-// The graveyard (DESIGN.md §19.3) is this build's stand-in for nlink
-// reaching zero: this build has no hardlinks, so RemoveEntry's dentry
-// removal always is the last reference, and it records a
-// (deleteTsNano||inodeID) graveyard entry rather than deleting the
-// inode record outright. pkg/repo.Sweep is the mark-and-sweep
+// The graveyard (DESIGN.md §19.3) is where an inode goes when its link
+// count reaches zero. Hardlinks exist now, so that is a real count and
+// not merely "the dentry went away": dropLinkTx decrements while other
+// names remain and only graves — recording a (deleteTsNano||inodeID)
+// entry, and storing the zero count so an open descriptor's fstat can
+// see it — when the last one goes. pkg/repo.Sweep is the mark-and-sweep
 // implementation (DESIGN.md §19.1) that later reclaims a graveyard
-// entry's chunks once it is past the grace period and deletes the
-// entry and inode record; metadb itself only records and enumerates.
+// entry's chunks once it is past the grace period and nothing holds the
+// inode open; metadb itself only records and enumerates.
 package metadb
 
 import (
@@ -58,13 +59,14 @@ type InodeID uint64
 const RootInode InodeID = 1
 
 var (
-	bucketDentry  = []byte("dentry")    // (dirInode||0x00||name) -> childInode
-	bucketInode   = []byte("inode")     // inodeID -> gob(InodeRecord)
-	bucketLocator = []byte("locator")   // (region||0x00||chunkID) -> gob(pack.Locator)
-	bucketMeta    = []byte("meta")      // "next_inode" -> uint64
-	bucketQuota   = []byte("quota")     // "root" -> gob(quotaRecord), see package doc
-	bucketGravey  = []byte("graveyard") // (deleteTsNano||inodeID) -> empty, see package doc
-	bucketDeadCnt = []byte("deadcontainer")
+	bucketDentry    = []byte("dentry")    // (dirInode||0x00||name) -> childInode
+	bucketInode     = []byte("inode")     // inodeID -> gob(InodeRecord)
+	bucketLocator   = []byte("locator")   // (region||0x00||chunkID) -> gob(pack.Locator)
+	bucketMeta      = []byte("meta")      // "next_inode" -> uint64
+	bucketQuota     = []byte("quota")     // "root" -> gob(quotaRecord), see package doc
+	bucketGravey    = []byte("graveyard") // (deleteTsNano||inodeID) -> empty, see package doc
+	bucketDeadCnt   = []byte("deadcontainer")
+	bucketContainer = []byte("container") // containerKey -> gob(sealedAt), see PutLocator
 )
 
 // MaxNameLen is NAME_MAX: the longest single path component. POSIX
@@ -208,7 +210,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("metadb: open: %w", err)
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
-		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey, bucketDeadCnt} {
+		for _, b := range [][]byte{bucketDentry, bucketInode, bucketLocator, bucketMeta, bucketQuota, bucketGravey, bucketDeadCnt, bucketContainer} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -230,6 +232,7 @@ func Open(path string) (*DB, error) {
 func (db *DB) Close() error { return db.bolt.Close() }
 
 var metaKeyClass = []byte("class")
+var metaKeyChunkSize = []byte("chunk_size")
 
 // EnsureClass persists class as the repo's consistency class if none is
 // stored yet (a brand-new repo), or returns whatever class was already
@@ -247,6 +250,34 @@ func (db *DB) EnsureClass(class string) (string, error) {
 		}
 		result = class
 		return b.Put(metaKeyClass, []byte(class))
+	})
+	return result, err
+}
+
+// EnsureChunkSize persists this repo's chunk size on first use and
+// returns whatever was already stored thereafter — the same
+// first-writer-wins shape as EnsureClass, and for a stronger reason.
+//
+// DESIGN.md §14.3 makes chunk_size a per-subtree policy ("there is no
+// single right answer, so it is a per-subtree policy with defaults
+// chosen per workload"), but it has to be stable *within* a repo:
+// re-chunking the same bytes at a different size yields entirely
+// different chunk IDs, so every commit after a change would dedup
+// against nothing and store a fresh copy of every file it touched. A
+// per-repo setting that a later caller could override would silently
+// turn dedup off.
+func (db *DB) EnsureChunkSize(size int) (int, error) {
+	var result int
+	err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		if v := b.Get(metaKeyChunkSize); v != nil {
+			result = int(binary.BigEndian.Uint64(v))
+			return nil
+		}
+		result = size
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(size))
+		return b.Put(metaKeyChunkSize, buf[:])
 	})
 	return result, err
 }
@@ -481,6 +512,22 @@ func dropLinkTx(tx *bbolt.Tx, id InodeID, rec InodeRecord, deletedAt time.Time) 
 	if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
 		return err
 	}
+	// Record the count reaching zero rather than leaving the last count
+	// in place. POSIX requires fstat through a descriptor held across the
+	// unlink to report nlink 0, which is how a program distinguishes
+	// "unlinked but still open" from "still has a name" — the check
+	// pjdfstest's unlink/14 and xfstests' generic/035 both make, for
+	// files and for directories respectively.
+	//
+	// A stored 0 is therefore meaningful for both kinds, and cannot be
+	// confused with "never set": every live directory this build creates
+	// stores at least 2 (mkdir writes it, adjustDirLinksTx clamps to it),
+	// and every live file at least 1.
+	rec.NLink = 0
+	rec.CTime = deletedAt
+	if err := putInode(tx, id, rec); err != nil {
+		return err
+	}
 	return addToGraveyardTx(tx, id, deletedAt)
 }
 
@@ -621,6 +668,15 @@ func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName str
 			if err := adjustDirLinksTx(tx, newDir, +1); err != nil {
 				return err
 			}
+		}
+		// POSIX: a successful rename marks the renamed inode's ctime.
+		// Only ctime — the file's *contents* did not change, so mtime
+		// must not move, and xfstests generic/003 checks exactly that
+		// asymmetry (it expects "no atime, no mtime, yes ctime" across a
+		// rename).
+		srcRec.CTime = deletedAt
+		if err := putInode(tx, srcID, srcRec); err != nil {
+			return err
 		}
 		return setDentryTx(tx, newDir, newName, srcID)
 	})
@@ -909,13 +965,88 @@ func locatorKey(region string, id chunk.ID) []byte {
 // the one write DESIGN.md §7.5 calls commutative and safe without a
 // home-region authority: two writers racing to add the same binding are
 // both correct.
-func (db *DB) PutLocator(region string, id chunk.ID, loc pack.Locator) error {
+//
+// sealedAt is when the chunk's container was sealed, and is what makes
+// DESIGN.md §19.1's grace gate work for a chunk that no graveyard entry
+// covers: "its container was sealed before V − T_grace". The first
+// writer to mention a container wins, because that is the moment the
+// bytes became visible — a later chunk landing in the same container
+// must not reset its age and make the whole container un-collectable.
+func (db *DB) PutLocator(region string, id chunk.ID, loc pack.Locator, sealedAt time.Time) error {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(loc); err != nil {
 		return err
 	}
+	var sealBuf bytes.Buffer
+	if err := gob.NewEncoder(&sealBuf).Encode(sealedAt); err != nil {
+		return err
+	}
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(bucketLocator).Put(locatorKey(region, id), buf.Bytes())
+		if err := tx.Bucket(bucketLocator).Put(locatorKey(region, id), buf.Bytes()); err != nil {
+			return err
+		}
+		b := tx.Bucket(bucketContainer)
+		key := []byte(loc.Container)
+		if b.Get(key) != nil {
+			return nil // first mention wins; see above
+		}
+		return b.Put(key, sealBuf.Bytes())
+	})
+}
+
+// ContainerSealedAt reports when a container was first recorded, and
+// whether it is known at all. Unknown means the container predates seal-
+// time tracking; Sweep treats that as "do not collect" rather than
+// guessing an age (see pkg/repo's orphan sweep).
+// UpdateInodeContent replaces an inode's content pointer, size and mtime
+// in place, touching no dentry at all. It is what a write to an
+// unlinked-but-open file needs (DESIGN.md §19.3): POSIX says such a
+// write lands in the inode, which is discarded when the last descriptor
+// closes — it must not resurrect the name the unlink removed.
+//
+// Identity is preserved rather than taken from rec: mode, ownership and
+// link count belong to the inode that already exists, and a write does
+// not change them. The link count in particular is zero here, and
+// re-deriving it from rec would quietly un-grave the inode.
+//
+// No quota is charged. The unlink already released this inode's bytes
+// and its inode count, and an unreachable file that only its holders can
+// see should not re-consume a subtree's budget; Sweep reclaims the
+// chunks once the last handle closes.
+func (db *DB) UpdateInodeContent(id InodeID, rec InodeRecord) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		existing, err := getInodeTx(tx, id)
+		if err != nil {
+			return err
+		}
+		existing.Size = rec.Size
+		existing.HasManifest, existing.ManifestID = rec.HasManifest, rec.ManifestID
+		existing.HasInline, existing.InlineChunk = rec.HasInline, rec.InlineChunk
+		existing.MTime, existing.CTime = rec.MTime, rec.MTime
+		return putInode(tx, id, existing)
+	})
+}
+
+func (db *DB) ContainerSealedAt(container string) (time.Time, bool, error) {
+	var at time.Time
+	found := false
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		v := tx.Bucket(bucketContainer).Get([]byte(container))
+		if v == nil {
+			return nil
+		}
+		found = true
+		return gob.NewDecoder(bytes.NewReader(v)).Decode(&at)
+	})
+	return at, found, err
+}
+
+// ForgetContainer drops a container's seal record. Called when
+// compaction retires a container, so the bucket does not accumulate an
+// entry per container ever written.
+func (db *DB) ForgetContainer(container string) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketContainer).Delete([]byte(container))
 	})
 }
 
@@ -1291,12 +1422,26 @@ func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID,
 			rec.NLink, rec.Mode = existingRec.NLink, existingRec.Mode
 			rec.Uid, rec.Gid = existingRec.Uid, existingRec.Gid
 			rec.CTime = time.Now()
+			// Carry the stored access time forward. Writing to a file
+			// does not access it, and leaving this zero would fall back
+			// to mtime (InodeRecord.Atime), making atime appear to jump
+			// every time the file was written — which xfstests
+			// generic/003 sees as "access time has changed after
+			// modifying". The fallback is for records written before
+			// atime was tracked, not a licence to alias the two.
+			rec.ATime = existingRec.ATime
 		case isNew:
 			newID, err := allocInodeTx(tx)
 			if err != nil {
 				return err
 			}
 			id = newID
+			// Stamp atime at creation so it stops tracking mtime from
+			// the first write onwards. A newly created file has just
+			// been accessed, so "now" is also the accurate answer.
+			if rec.ATime.IsZero() {
+				rec.ATime = rec.MTime
+			}
 		default:
 			return lookupErr
 		}
