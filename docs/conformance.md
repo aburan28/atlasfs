@@ -5,12 +5,14 @@ aspiration, and names three suites: pjdfstest, `fsx`, and xfstests. Until now
 none of them had been run — the README said so, which is better than silence
 but is not the same as evidence. This records runs of the first two.
 
-This document records those runs: how they were set up, what they scored, and
-what each remaining failure is. §27 asks for "100% pass within `posix`
-subtrees, documented enumerated exceptions only, each with a rationale." The
-enumeration below is that list — one entry, plus pjdfstest's own known Linux
-deviations. It is not 100%, and the gap is a feature this build has never
-claimed to have.
+This document records those runs: how they were set up and what they scored.
+§27 asks for "100% pass within `posix` subtrees, documented enumerated
+exceptions only, each with a rationale."
+
+**pjdfstest now meets that bar exactly: 8798 / 8798, with no exceptions
+left to enumerate.** That is one of §27's three suites. `fsx` and xfstests
+are covered further down and neither is at §27's stated depth, so the
+gating criterion as a whole is not met — see "What has not been run".
 
 ## What was run
 
@@ -54,13 +56,18 @@ misleading results before they were understood:
 | + atime/ctime and mode 0 | 8731 / 8798 | 99.24% |
 | + NAME_MAX and directory timestamps | 8788 / 8798 | 99.89% |
 | + subsecond times, directory nlink, truncate bound | 8794 / 8798 | 99.95% |
-| **+ in-flight size while a write is open** (found by `fsx`) | **8796 / 8798** | **99.98%** |
+| + in-flight size while a write is open (found by `fsx`) | 8796 / 8798 | 99.98% |
+| **+ open-but-unlinked: nlink 0, and no resurrection on flush** | **8798 / 8798** | **100%** |
 
 The assertion count differs between rows because pjdfstest runs more
 assertions as more of them get far enough to matter.
 
-The two remaining failures are both in `unlink/14`, the single exception
-enumerated below. Nothing else in the suite fails.
+**Nothing in the suite fails.** `prove -r` reports `Files=238, Tests=8798,
+Result: PASS` against a `posix`-class mount served by a separate
+`atlas-mds` process. The only annotated lines are seven `TODO passed` in
+`chown/00.t` — pjdfstest's own markers for Linux SGID/SUID behaviour it
+expects to fail, which pass here; TAP counts an unexpected pass as a
+pass, not a failure.
 
 The jump from 58% to 98% is almost entirely `mknod`. It is worth understanding
 why one missing call cost that much: a large number of the chmod, chown,
@@ -111,31 +118,33 @@ interrupted request. All three are in the commit history.
 
 ## Enumerated exceptions
 
-These remain. Each is a real limitation with a reason, not an unexplained
-skip — §27's standard is that "a skip list nobody has justified is
-indistinguishable from a failure list."
+**There are none.** §27's standard is that "a skip list nobody has
+justified is indistinguishable from a failure list", so the two entries
+this section used to hold are kept below as history rather than deleted —
+what they were, and what closing them actually took.
 
-### 1. Open-but-unlinked files — fixed since this table was written
+### 1. Open-but-unlinked files — closed
 
 This listed `unlink/14` (2 assertions) as an accepted exception, on the
 reasoning that keeping an unlinked inode alive needed cross-process
 open-handle tracking and so was authority work. Reproducing it directly
-showed that was two separate gaps, only one of which was as described.
+showed three separate defects hiding behind that one sentence, and none
+of them was the one described.
 
-Reads and writes through a descriptor held across the unlink *already*
-worked — the graveyard retains the inode record, so the data was there.
-What failed was narrower: `fstat` reported `nlink` 1 instead of 0.
-`dropLinkTx` graved the inode without ever storing the count reaching
-zero, and both mounts read a stored 0 as "never set" and substituted 1.
-That substitution is correct for directories, which never store 0, and
-wrong for files now that a 0 is written deliberately.
+`fstat` on a descriptor held across the unlink reported `nlink`
+1 instead of 0 — reads and writes through it already worked, because the
+graveyard retains the inode record. The second gap was that a flush
+*resurrected the name*: writes commit on close (§16.1), and the commit
+bound (dir, name) unconditionally, so a file unlinked while open for
+write reappeared in a directory the user had emptied. pjdfstest sees
+that only as an rmdir returning ENOTEMPTY, several steps from the cause.
 
-The gap the exception did not name was worse than a conformance failure:
-GC could reclaim a file that was still open. Grace does not cover it —
-Invariant GC-1 sizes `T_grace` against `T_write_max`, the age of an
-uncommitted *write session*, whereas a descriptor may stay open for as
-long as its process lives. `Repo.OpenHandles` now pins an inode while any
-descriptor is open on it, and both phases of the sweep honour the pin.
+The third gap was not a conformance failure at all: GC could reclaim a
+file that was still open. Grace does not cover it — Invariant GC-1 sizes
+`T_grace` against `T_write_max`, the age of an uncommitted *write
+session*, whereas a descriptor may stay open for as long as its process
+lives. `Repo.OpenHandles` now pins an inode while any descriptor is open
+on it, and both phases of the sweep honour the pin.
 
 That registry is per-process, which is sufficient rather than a
 simplification for the in-process mount: metadb's bbolt file takes an
@@ -146,12 +155,13 @@ blocks and times out. §19.3's *leased* handles remain the answer for the
 authority-backed mount, where nothing needs them yet because `pkg/mds`
 exposes no sweep.
 
-### 2. pjdfstest's own Linux deviations
+### 2. pjdfstest's own Linux deviations — no longer failing
 
 Several `chown` cases are marked `# TODO Linux doesn't clear the SGID/SUID
-bits for directories, despite the description noted` in pjdfstest itself.
-These fail on ext4 too. They are counted as expected failures by the harness,
-not by us.
+bits for directories, despite the description noted` in pjdfstest itself,
+and fail on ext4 too. They now *pass* here and are reported as `TODO
+passed`, which TAP counts as a pass. Nothing is being suppressed: the
+suite's overall result is `PASS` with zero failures.
 
 ## fsx
 
