@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"syscall"
 	"time"
 
 	"github.com/aburan28/atlasfs/pkg/chunk"
 	"github.com/aburan28/atlasfs/pkg/manifest"
 	"github.com/aburan28/atlasfs/pkg/metadb"
 	"github.com/aburan28/atlasfs/pkg/pack"
+	"github.com/aburan28/atlasfs/pkg/repo"
 	"github.com/aburan28/atlasfs/pkg/store"
 )
 
@@ -83,6 +85,23 @@ func (w *writeSession) writeAt(p []byte, off int64) (int, error) {
 	copy(w.buf.Bytes()[off:], p)
 	w.dirty = true
 	return len(p), nil
+}
+
+// allocate applies fallocate(2) to the buffered content. bytes.Buffer
+// has no way to replace its contents in place, so the reassembled slice
+// is written back through Reset+Write — cheap next to the commit that
+// follows, and it keeps the one shared implementation of the semantics.
+func (w *writeSession) allocate(off, size uint64, mode uint32) syscall.Errno {
+	buf, changed, errno := repo.ApplyFallocate(w.buf.Bytes(), off, size, mode)
+	if errno != 0 {
+		return errno
+	}
+	if changed {
+		w.buf.Reset()
+		w.buf.Write(buf)
+		w.dirty = true
+	}
+	return 0
 }
 
 func (w *writeSession) resize(n int64) {

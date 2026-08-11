@@ -135,7 +135,19 @@ var (
 	_ fs.FileFlusher  = (*writeHandle)(nil)
 	_ fs.FileReleaser = (*writeHandle)(nil)
 	_ fs.FileFsyncer  = (*writeHandle)(nil)
+
+	_ fs.FileAllocater = (*writeHandle)(nil)
 )
+
+// Allocate is fallocate(2). The semantics live in pkg/repo so this mount
+// and the in-process one share one implementation and cannot drift —
+// a caller must not get different fallocate behaviour from
+// `atlas mount` and `atlas mount -mds`.
+func (h *writeHandle) Allocate(ctx context.Context, off uint64, size uint64, mode uint32) syscall.Errno {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sess.allocate(off, size, mode)
+}
 
 // Fsync commits the buffered content — DESIGN.md §16.2's "durable in the
 // home region": chunks in the object store, manifest committed at the

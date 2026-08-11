@@ -883,12 +883,31 @@ type writeFileHandle struct {
 }
 
 var (
-	_ fs.FileWriter   = (*writeFileHandle)(nil)
-	_ fs.FileReader   = (*writeFileHandle)(nil)
-	_ fs.FileFlusher  = (*writeFileHandle)(nil)
-	_ fs.FileReleaser = (*writeFileHandle)(nil)
-	_ fs.FileFsyncer  = (*writeFileHandle)(nil)
+	_ fs.FileWriter    = (*writeFileHandle)(nil)
+	_ fs.FileReader    = (*writeFileHandle)(nil)
+	_ fs.FileFlusher   = (*writeFileHandle)(nil)
+	_ fs.FileReleaser  = (*writeFileHandle)(nil)
+	_ fs.FileFsyncer   = (*writeFileHandle)(nil)
+	_ fs.FileAllocater = (*writeFileHandle)(nil)
 )
+
+// Allocate is fallocate(2). The semantics live in pkg/repo so both
+// mounts share one implementation and cannot drift apart — see
+// repo.ApplyFallocate for what each mode means against a buffered write
+// path, and what it deliberately does not do.
+func (h *writeFileHandle) Allocate(ctx context.Context, off uint64, size uint64, mode uint32) syscall.Errno {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	buf, changed, errno := repo.ApplyFallocate(h.buf, off, size, mode)
+	if errno != 0 {
+		return errno
+	}
+	h.buf = buf
+	if changed {
+		h.dirty = true
+	}
+	return 0
+}
 
 // Fsync commits whatever is buffered, which is exactly DESIGN.md §16.2's
 // contract for it: durable in the home region — chunks in the object
