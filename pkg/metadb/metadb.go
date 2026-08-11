@@ -512,18 +512,21 @@ func dropLinkTx(tx *bbolt.Tx, id InodeID, rec InodeRecord, deletedAt time.Time) 
 	if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
 		return err
 	}
-	// Record the count reaching zero rather than leaving the last 1 in
-	// place. POSIX requires fstat through a descriptor held across the
+	// Record the count reaching zero rather than leaving the last count
+	// in place. POSIX requires fstat through a descriptor held across the
 	// unlink to report nlink 0, which is how a program distinguishes
 	// "unlinked but still open" from "still has a name" — the check
-	// pjdfstest's unlink/14 makes. Directories keep their conventional 2
-	// (see above), so a stored 0 unambiguously means graved.
-	if !rec.IsDir {
-		rec.NLink = 0
-		rec.CTime = deletedAt
-		if err := putInode(tx, id, rec); err != nil {
-			return err
-		}
+	// pjdfstest's unlink/14 and xfstests' generic/035 both make, for
+	// files and for directories respectively.
+	//
+	// A stored 0 is therefore meaningful for both kinds, and cannot be
+	// confused with "never set": every live directory this build creates
+	// stores at least 2 (mkdir writes it, adjustDirLinksTx clamps to it),
+	// and every live file at least 1.
+	rec.NLink = 0
+	rec.CTime = deletedAt
+	if err := putInode(tx, id, rec); err != nil {
+		return err
 	}
 	return addToGraveyardTx(tx, id, deletedAt)
 }

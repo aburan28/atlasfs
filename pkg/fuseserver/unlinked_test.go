@@ -3,6 +3,7 @@ package fuseserver
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -174,6 +175,63 @@ func TestFlushAfterTheNameWasReusedDoesNotClobberTheNewFile(t *testing.T) {
 	}
 	if string(got) != replacement {
 		t.Fatalf("flushing a handle whose name was reused overwrote the new file: got %q, want %q", got, replacement)
+	}
+}
+
+// Renaming onto an existing name drops that inode's last link, so a
+// descriptor still open on it must see nlink 0 — xfstests generic/035.
+//
+// It failed for a reason worth keeping in view: DESIGN.md §10.5 puts
+// nlink in the *inode's* lease domain, and Rename bumped only the two
+// directories. The displaced inode's own lease stayed valid, so this
+// mount kept serving the pre-rename count until it lapsed — 30 seconds
+// on the relaxed class. Exactly the defect xfstests generic/002 found in
+// Unlink, reached by a different path.
+func TestRenameOverAnOpenFileReportsNlinkZero(t *testing.T) {
+	_, mnt := mountWritable(t)
+
+	for _, tc := range []struct {
+		name   string
+		create func(t *testing.T, path string)
+	}{
+		{"regular file", func(t *testing.T, p string) {
+			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", func(t *testing.T, p string) {
+			if err := os.Mkdir(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := filepath.Join(mnt, "src-"+strings.ReplaceAll(tc.name, " ", "-"))
+			dst := filepath.Join(mnt, "dst-"+strings.ReplaceAll(tc.name, " ", "-"))
+			tc.create(t, src)
+			tc.create(t, dst)
+
+			// Open the target before it is displaced.
+			f, err := os.Open(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			// syscall.Rename, not os.Rename: Go's wrapper Lstats the
+			// target and returns its own EEXIST for a directory, so it
+			// never issues the rename(2) this test is about.
+			if err := syscall.Rename(src, dst); err != nil {
+				t.Fatalf("rename: %v", err)
+			}
+			var st syscall.Stat_t
+			if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+				t.Fatalf("fstat the displaced inode: %v", err)
+			}
+			if st.Nlink != 0 {
+				t.Fatalf("nlink of an inode displaced by rename = %d, want 0", st.Nlink)
+			}
+		})
 	}
 }
 

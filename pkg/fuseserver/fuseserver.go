@@ -247,9 +247,6 @@ func unixOrZero(t time.Time) uint64 {
 // the unlink to see 0. Directories never store 0, so theirs is the
 // "never set" case and gets the conventional 2.
 func nlinkOf(rec metadb.InodeRecord) uint32 {
-	if rec.NLink == 0 && rec.IsDir {
-		return 2 // "." plus the parent's entry
-	}
 	return uint32(rec.NLink)
 }
 

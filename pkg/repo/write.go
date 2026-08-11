@@ -386,8 +386,26 @@ func (r *Repo) Rename(oldDir metadb.InodeID, oldName string, newDir metadb.Inode
 	if !r.Class.Mutable() {
 		return ErrReadOnly
 	}
+	// Resolve the target before the move: renaming onto an existing name
+	// drops that inode's last link, and §10.5 puts nlink in the *inode's*
+	// lease domain, not the directory's. Bumping only the two directories
+	// leaves a holder that already has the displaced inode cached — a
+	// process holding it open, say — serving the pre-rename link count
+	// until its lease lapses. That is the same defect xfstests generic/002
+	// found in Unlink, reached by a different path: generic/035 opens the
+	// target, renames over it, and requires the descriptor's fstat to
+	// report nlink 0.
+	displaced, err := r.DB.Lookup(newDir, newName)
+	haveDisplaced := err == nil
+	if err != nil && !errors.Is(err, metadb.ErrNotFound) {
+		return err
+	}
+
 	if err := r.DB.Rename(oldDir, oldName, newDir, newName, r.Clock.Now()); err != nil {
 		return err
+	}
+	if haveDisplaced && r.Coherence != nil {
+		r.Coherence.Bump(InodeCoherenceKey(displaced))
 	}
 	r.bumpDirEntries(oldDir)
 	if newDir != oldDir {
