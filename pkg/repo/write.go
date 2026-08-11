@@ -400,12 +400,21 @@ func (r *Repo) Rename(oldDir metadb.InodeID, oldName string, newDir metadb.Inode
 	if err != nil && !errors.Is(err, metadb.ErrNotFound) {
 		return err
 	}
+	// The inode being moved changes too: POSIX marks its ctime on a
+	// successful rename, and ctime is in the inode's lease domain like
+	// nlink. Resolved before the move, since afterwards oldName is gone.
+	moved, movedErr := r.DB.Lookup(oldDir, oldName)
 
 	if err := r.DB.Rename(oldDir, oldName, newDir, newName, r.Clock.Now()); err != nil {
 		return err
 	}
-	if haveDisplaced && r.Coherence != nil {
-		r.Coherence.Bump(InodeCoherenceKey(displaced))
+	if r.Coherence != nil {
+		if haveDisplaced {
+			r.Coherence.Bump(InodeCoherenceKey(displaced))
+		}
+		if movedErr == nil {
+			r.Coherence.Bump(InodeCoherenceKey(moved))
+		}
 	}
 	r.bumpDirEntries(oldDir)
 	if newDir != oldDir {

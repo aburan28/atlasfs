@@ -669,6 +669,15 @@ func (db *DB) Rename(oldDir InodeID, oldName string, newDir InodeID, newName str
 				return err
 			}
 		}
+		// POSIX: a successful rename marks the renamed inode's ctime.
+		// Only ctime — the file's *contents* did not change, so mtime
+		// must not move, and xfstests generic/003 checks exactly that
+		// asymmetry (it expects "no atime, no mtime, yes ctime" across a
+		// rename).
+		srcRec.CTime = deletedAt
+		if err := putInode(tx, srcID, srcRec); err != nil {
+			return err
+		}
 		return setDentryTx(tx, newDir, newName, srcID)
 	})
 }
@@ -1413,12 +1422,26 @@ func (db *DB) CommitFile(dir InodeID, name string, rec InodeRecord) (id InodeID,
 			rec.NLink, rec.Mode = existingRec.NLink, existingRec.Mode
 			rec.Uid, rec.Gid = existingRec.Uid, existingRec.Gid
 			rec.CTime = time.Now()
+			// Carry the stored access time forward. Writing to a file
+			// does not access it, and leaving this zero would fall back
+			// to mtime (InodeRecord.Atime), making atime appear to jump
+			// every time the file was written — which xfstests
+			// generic/003 sees as "access time has changed after
+			// modifying". The fallback is for records written before
+			// atime was tracked, not a licence to alias the two.
+			rec.ATime = existingRec.ATime
 		case isNew:
 			newID, err := allocInodeTx(tx)
 			if err != nil {
 				return err
 			}
 			id = newID
+			// Stamp atime at creation so it stops tracking mtime from
+			// the first write onwards. A newly created file has just
+			// been accessed, so "now" is also the accurate answer.
+			if rec.ATime.IsZero() {
+				rec.ATime = rec.MTime
+			}
 		default:
 			return lookupErr
 		}

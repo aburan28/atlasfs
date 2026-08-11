@@ -297,11 +297,26 @@ genuine bug:
   after thirty-three. The metadata was right the whole time; the cache in
   front of it was not.
 
-- **`generic/003` — not fixed, and mostly by design.** It checks that
-  `atime` advances on access. This build never updates `atime` on read,
-  deliberately: doing so turns every read into a metadata write, which is
-  why real filesystems ship `relatime`. The test also reports a `ctime`
-  case that deserves a closer look, and that has not been done.
+- **`generic/003` — two real bugs behind the "by design" answer.** The
+  test is about the `noatime`/`relatime`/`strictatime` mount options,
+  which this build does not implement at all: it never advances `atime`
+  on read, deliberately, because doing so turns every read into a
+  metadata write — the reason real filesystems ship `relatime`. It would
+  have been easy to file the whole failure under that and move on. Two of
+  its complaints turned out to be unrelated defects:
+
+  - **`atime` moved on write.** `atime` fell back to `mtime` whenever it
+    was unset, so the two aliased and every write looked like an access.
+    It is now stamped at creation and carried across overwrites.
+  - **`ctime` did not move on rename.** POSIX requires it — the inode's
+    metadata changed even though its content did not. This needed two
+    fixes, and the second is the same §10.5 lesson a third time: storing
+    the new `ctime` is not enough, because `ctime` is in the *inode's*
+    lease domain and `Rename` bumped only the two directories, so the
+    mount kept serving the pre-rename record from cache.
+
+  What remains is the mount options themselves, which is what the test is
+  actually for.
 
 **This is still not §27's bar.** §27 asks for "the `generic/` groups
 applicable to a network filesystem", which is hundreds of tests. What has
