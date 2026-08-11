@@ -251,14 +251,14 @@ func unixOrZero(t time.Time) uint64 {
 
 // nlinkOf is the stored link count, never a constant: a hard-linked file
 // reporting 1 would tell a caller it is safe to delete the last name
-// when it is not. A record written before link counts were tracked reads
-// back as 0 and means one link.
+// when it is not. A file's stored 0 is meaningful and passed through —
+// metadb writes it when the last name goes, and POSIX wants fstat on a
+// descriptor held across the unlink to report 0 (§19.3). Directories
+// never store 0, so theirs is the "never set" case and gets the
+// conventional 2.
 func nlinkOf(rec metadb.InodeRecord) uint32 {
-	if rec.NLink == 0 {
-		if rec.IsDir {
-			return 2 // "." plus the parent's entry
-		}
-		return 1
+	if rec.NLink == 0 && rec.IsDir {
+		return 2 // "." plus the parent's entry
 	}
 	return uint32(rec.NLink)
 }

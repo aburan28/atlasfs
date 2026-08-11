@@ -164,6 +164,13 @@ type Repo struct {
 	// (see pkg/coherence's tests) to exercise a grace period without
 	// sleeping for real hours.
 	Clock coherence.Clock
+
+	// OpenHandles pins inodes that some caller still has open, so Sweep
+	// cannot reclaim a file that was unlinked while a descriptor was
+	// still using it (DESIGN.md §19.3). Mounts acquire on open and
+	// release on close; a repo used purely as a library has an empty
+	// registry and behaves exactly as before.
+	OpenHandles *OpenHandles
 }
 
 // Open opens (or initializes) a repo rooted at dir: dir/meta.db for
@@ -221,6 +228,7 @@ func OpenWithClass(dir string, backend store.Backend, region string, class Class
 		ChunkSize:             chunk.DefaultSize,
 		SingleObjectThreshold: pack.SingleObjectThreshold,
 		Clock:                 coherence.RealClock{},
+		OpenHandles:           NewOpenHandles(),
 	}
 	if d := actualClass.leaseDuration(); d > 0 {
 		r.Coherence = coherence.New(coherence.RealClock{}, d)

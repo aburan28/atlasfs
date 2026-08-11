@@ -26,14 +26,15 @@
 // the single-node stand-in for §18.3's "the counter can be updated in
 // the same FDB transaction as the mutation using an atomic add."
 //
-// The graveyard (DESIGN.md §19.3) is this build's stand-in for nlink
-// reaching zero: this build has no hardlinks, so RemoveEntry's dentry
-// removal always is the last reference, and it records a
-// (deleteTsNano||inodeID) graveyard entry rather than deleting the
-// inode record outright. pkg/repo.Sweep is the mark-and-sweep
+// The graveyard (DESIGN.md §19.3) is where an inode goes when its link
+// count reaches zero. Hardlinks exist now, so that is a real count and
+// not merely "the dentry went away": dropLinkTx decrements while other
+// names remain and only graves — recording a (deleteTsNano||inodeID)
+// entry, and storing the zero count so an open descriptor's fstat can
+// see it — when the last one goes. pkg/repo.Sweep is the mark-and-sweep
 // implementation (DESIGN.md §19.1) that later reclaims a graveyard
-// entry's chunks once it is past the grace period and deletes the
-// entry and inode record; metadb itself only records and enumerates.
+// entry's chunks once it is past the grace period and nothing holds the
+// inode open; metadb itself only records and enumerates.
 package metadb
 
 import (
@@ -480,6 +481,19 @@ func dropLinkTx(tx *bbolt.Tx, id InodeID, rec InodeRecord, deletedAt time.Time) 
 	}
 	if err := applyQuotaDeltaTx(tx, -int64(rec.Size), -1); err != nil {
 		return err
+	}
+	// Record the count reaching zero rather than leaving the last 1 in
+	// place. POSIX requires fstat through a descriptor held across the
+	// unlink to report nlink 0, which is how a program distinguishes
+	// "unlinked but still open" from "still has a name" — the check
+	// pjdfstest's unlink/14 makes. Directories keep their conventional 2
+	// (see above), so a stored 0 unambiguously means graved.
+	if !rec.IsDir {
+		rec.NLink = 0
+		rec.CTime = deletedAt
+		if err := putInode(tx, id, rec); err != nil {
+			return err
+		}
 	}
 	return addToGraveyardTx(tx, id, deletedAt)
 }

@@ -241,12 +241,14 @@ func unixOrZero(t time.Time) uint64 {
 // caller it is safe to delete the last name when it is not. Records
 // written before link counts were tracked read back as 0 and mean one
 // link.
+// nlinkOf reports the link count to advertise. A file's stored 0 is
+// meaningful and is passed through: metadb writes it when the last name
+// goes (dropLinkTx), and POSIX wants fstat on a descriptor held across
+// the unlink to see 0. Directories never store 0, so theirs is the
+// "never set" case and gets the conventional 2.
 func nlinkOf(rec metadb.InodeRecord) uint32 {
-	if rec.NLink == 0 {
-		if rec.IsDir {
-			return 2 // "." plus the parent's entry
-		}
-		return 1
+	if rec.NLink == 0 && rec.IsDir {
+		return 2 // "." plus the parent's entry
 	}
 	return uint32(rec.NLink)
 }
@@ -442,16 +444,23 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if !n.repo.Class.Mutable() {
 			return nil, 0, syscall.EROFS
 		}
-		wh := &writeFileHandle{repo: n.repo, parent: n.parent, name: n.name, node: n}
+		// The pin is taken before anything that can fail, and dropped on
+		// every failure path: a handle that never reaches the caller has
+		// no Release to drop it, and a leaked pin makes an inode
+		// permanently uncollectable.
+		release := n.repo.OpenHandles.Acquire(n.ino)
+		wh := &writeFileHandle{repo: n.repo, parent: n.parent, name: n.name, node: n, release: release}
 		if flags&syscall.O_TRUNC != 0 {
 			wh.dirty = true // truncate must commit even with zero further writes
 		} else if rec.Size > 0 {
 			fr, err := n.repo.OpenFile(ctx, rec)
 			if err != nil {
+				release()
 				return nil, 0, syscall.EIO
 			}
 			data, err := fr.ReadAll()
 			if err != nil {
+				release()
 				return nil, 0, syscall.EIO
 			}
 			wh.buf = append([]byte(nil), data...)
@@ -466,7 +475,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
-	return &fileHandle{fr: fr}, fuse.FOPEN_KEEP_CACHE, 0
+	return &fileHandle{fr: fr, release: n.repo.OpenHandles.Acquire(n.ino)}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // Create makes a new, empty file and returns a writable handle for it.
@@ -499,8 +508,12 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if err != nil {
 		return nil, nil, 0, errnoFor(err)
 	}
+	// The pin can only be taken once the inode exists, which for create
+	// is after the commit — hence not alongside the handle above.
+	fh.release = n.repo.OpenHandles.Acquire(id)
 	rec, err := n.repo.DB.GetInode(id)
 	if err != nil {
+		fh.release()
 		return nil, nil, 0, syscall.EIO
 	}
 
@@ -807,12 +820,27 @@ func errnoFor(err error) syscall.Errno {
 // ask to write).
 type fileHandle struct {
 	fr *repo.FileReader
+	// release drops this handle's §19.3 pin on the inode. Held for the
+	// life of the handle so GC cannot reclaim a file that was unlinked
+	// while this descriptor was still open.
+	release func()
 }
 
 var (
-	_ fs.FileReader  = (*fileHandle)(nil)
-	_ fs.FileFsyncer = (*fileHandle)(nil)
+	_ fs.FileReader   = (*fileHandle)(nil)
+	_ fs.FileFsyncer  = (*fileHandle)(nil)
+	_ fs.FileReleaser = (*fileHandle)(nil)
 )
+
+// Release drops the open-handle pin. RELEASE being asynchronous relative
+// to close(2) is fine here — unpinning late only delays a reclaim, while
+// unpinning early is the use-after-free this pin exists to prevent.
+func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
+	if h.release != nil {
+		h.release()
+	}
+	return 0
+}
 
 // Fsync on a read-only handle has nothing to flush, but must still
 // succeed: fsync(2) on an O_RDONLY fd is legal, and returning ENOSYS
@@ -846,6 +874,8 @@ type writeFileHandle struct {
 	mode    uint32
 	modeSet bool
 	node    *Node // refreshed in place on commit so subsequent Getattr/Open reflect it immediately
+	// release drops this handle's §19.3 pin — see fileHandle.release.
+	release func()
 
 	mu    sync.Mutex
 	buf   []byte
@@ -963,6 +993,11 @@ func (h *writeFileHandle) Release(ctx context.Context) syscall.Errno {
 			h.node.activeWrite = nil
 		}
 		h.node.mu.Unlock()
+	}
+	// After the commit, never before: the pin has to outlive the write
+	// that is still using the inode's chunks.
+	if h.release != nil {
+		h.release()
 	}
 	return errno
 }
