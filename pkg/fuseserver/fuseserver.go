@@ -526,7 +526,26 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 }
 
 func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
-	return errnoFor(n.repo.Unlink(n.ino, name))
+	child := n.GetChild(name)
+	if errno := errnoFor(n.repo.Unlink(n.ino, name)); errno != 0 {
+		return errno
+	}
+	// The kernel is a cache holder like any other (DESIGN.md §10) with one
+	// difference that matters: it cannot be recalled, only invalidated,
+	// and it has no reason to re-read attributes for an inode whose *name*
+	// it just saw removed — it already knows that dentry is gone. Without
+	// this, a descriptor still open on the inode reports the pre-unlink
+	// nlink for a full attribute timeout. Reproduced on the
+	// authority-backed mount, whose test stats the file through its other
+	// hard link first and so leaves the kernel holding a cached count.
+	//
+	// A negative offset is FUSE's "attributes only" form of
+	// NOTIFY_INVAL_INODE; (0, 0) means "invalidate zero bytes of data",
+	// which is a no-op.
+	if child != nil {
+		_ = child.NotifyContent(-1, -1)
+	}
+	return 0
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

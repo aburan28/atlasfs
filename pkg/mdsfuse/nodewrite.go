@@ -266,7 +266,31 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if n.cfg.ReadOnly {
 		return syscall.EROFS
 	}
-	return errnoFor(n.cfg.Client.Unlink(mutating(ctx), n.ino, name))
+	child := n.GetChild(name)
+	if errno := errnoFor(n.cfg.Client.Unlink(mutating(ctx), n.ino, name)); errno != 0 {
+		return errno
+	}
+	invalidateKernelAttrs(child)
+	return 0
+}
+
+// invalidateKernelAttrs tells the kernel to drop its cached attributes
+// for an inode whose link count just changed.
+//
+// The kernel is a cache holder like any other (DESIGN.md §10), with one
+// difference that matters: it cannot be recalled, only invalidated, and
+// it has no reason to re-read attributes for an inode whose *name* it
+// saw removed — it already knows that dentry is gone. So a descriptor
+// still open on the inode kept reporting the pre-unlink nlink for a full
+// attribute timeout, 30 seconds on the relaxed class.
+//
+// A negative offset is FUSE's "attributes only" form of
+// NOTIFY_INVAL_INODE; (0, 0) means "invalidate zero bytes of data",
+// which is a no-op.
+func invalidateKernelAttrs(child *fs.Inode) {
+	if child != nil {
+		_ = child.NotifyContent(-1, -1)
+	}
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

@@ -96,13 +96,26 @@ func TestNlinkCountsDownToZeroThroughAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Awaited rather than asserted immediately, and the distinction is
+	// the point. The descriptor is open on `first`, but the count was
+	// last read through `second` — so the kernel is holding a cached
+	// attribute for this inode, and the unlink it saw was of a *different*
+	// dentry. Dropping that cache takes a NOTIFY_INVAL_INODE from the
+	// mount, which is written to /dev/fuse and processed asynchronously:
+	// an fstat issued in the same breath can beat it.
+	//
+	// That is bounded staleness, which is what §10 promises, not a bug —
+	// and it is why this waits the same way the push-invalidation tests
+	// do. The immediate guarantee only holds when the unlink names the
+	// dentry the descriptor was opened on, which is the case pjdfstest's
+	// unlink/14 checks and the test above asserts without waiting.
 	var st syscall.Stat_t
-	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
-		t.Fatalf("fstat after the last name went: %v", err)
-	}
-	if st.Nlink != 0 {
-		t.Fatalf("nlink after the last name went = %d, want 0", st.Nlink)
-	}
+	awaitOrFail(t, "nlink never reached 0 after the last name was removed", func() bool {
+		if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+			return false
+		}
+		return st.Nlink == 0
+	})
 }
 
 // A file unlinked while open for write must not come back when the
