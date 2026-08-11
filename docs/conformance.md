@@ -188,12 +188,41 @@ smaller hole. With it fixed:
 That is 170,000 operations with mmap reads and writes enabled, against both
 mount implementations, with three of the runs concurrent against one mount.
 
-`fsx` also reports what the filesystem does not support, which is a useful
+Since then `fallocate` has been implemented on both mounts, so most of
+that inventory is no longer a gap — see "fallocate" below.
+
+`fsx` also reported what the filesystem did not support, which was a useful
 inventory in itself: `FALLOC_FL_KEEP_SIZE`, `PUNCH_HOLE`, `ZERO_RANGE`,
 `COLLAPSE_RANGE`, `INSERT_RANGE`, `UNSHARE_RANGE`, dontcache I/O, and
-`O_DIRECT` (which atomic writes need). `fallocate` in general is
-unimplemented; a content-addressed store has no preallocation to do, but
-`PUNCH_HOLE` is a real gap for a sparse-file workload.
+`O_DIRECT` (which atomic writes need).
+
+### fallocate
+
+`FALLOC_FL_KEEP_SIZE`, `PUNCH_HOLE` and `ZERO_RANGE` are now implemented
+on both mounts, along with plain allocate. The write path buffers a
+file's whole content and commits it as a unit (§16.1), so there is no
+block allocator and "preallocate" has no meaning — every mode reduces to
+arranging bytes in that buffer, and the observable contract of all four
+is the same: which bytes read as zeros, and whether the length moves.
+
+Two things that are worth being explicit about rather than letting a
+caller discover:
+
+- **`PUNCH_HOLE` does not save space.** Zeroing is the honest
+  implementation here because there is no sparse representation to
+  exploit, but reclaiming storage is usually the whole reason to punch a
+  hole. Correct data, no reclaim.
+- **`COLLAPSE_RANGE` and `INSERT_RANGE` return `EOPNOTSUPP`** rather than
+  being faked. Both are defined on filesystem block boundaries and this
+  build has no block size to expose — and a caller that gets `EOPNOTSUPP`
+  can fall back, while one that gets success has silently lost the
+  operation.
+
+The semantics live in `pkg/repo` rather than in either mount, so the two
+mounts cannot drift: `atlas mount` and `atlas mount -mds` share one
+implementation.
+
+`O_DIRECT` and dontcache remain unimplemented.
 
 **This is not §27's bar.** §27 asks for a 24-hour soak; these runs take
 minutes. What they establish is that the write path survives sustained
@@ -246,7 +275,11 @@ skip:
 | other | 7 |
 
 The block-device ones are structurally N/A for a filesystem with no block
-device; the `fpunch`/`fzero` ones are the `fallocate` gap named above.
+device. The eleven `fpunch`/`fzero` skips were the largest *closable*
+group, and they are what motivated implementing `fallocate`: `generic/008`
+was `[not run] xfs_io fpunch failed` and now runs and passes. `generic/009`
+still does not run, but for an unrelated reason — `xfs_io fiemap failed`,
+the extent-mapping ioctl, which is a separate gap.
 
 **This is not §27's bar either.** §27 asks for "the `generic/` groups
 applicable to a network filesystem", which is hundreds of tests. What ran
