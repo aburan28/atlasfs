@@ -291,11 +291,10 @@ func (h *WriteHandle) CommitDetached(ctx context.Context, id metadb.InodeID) err
 // Unlink removes name from dir, moving the target inode into the
 // graveyard (DESIGN.md §19.3) rather than reclaiming it immediately —
 // pkg/repo.Sweep is what later collects its chunks, once past the grace
-// period. This build has no open-file-handle tracking across process
-// boundaries (single process only — see gc.go's doc comment), so unlike
-// real §19.3, an inode is gravable immediately on unlink rather than
-// only once its last open handle closes; that gap is stated, not
-// hidden.
+// period *and* once nothing holds the inode open (Repo.OpenHandles).
+// An inode is therefore gravable immediately on unlink, as §19.3
+// intends, without that making it collectable while a descriptor still
+// refers to it.
 func (r *Repo) Unlink(dir metadb.InodeID, name string) error {
 	if !r.Class.Mutable() {
 		return ErrReadOnly
